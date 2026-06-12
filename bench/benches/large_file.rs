@@ -1,12 +1,15 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use onda_core::{Document, Transaction};
 
 fn bench_rope_char_to_line(c: &mut Criterion) {
     // Build a large document
-    let text: String = (0..100_000).map(|i| format!("Line {i:08}: content here\n")).collect();
+    let text: String = (0..100_000)
+        .map(|i| format!("Line {i:08}: content here\n"))
+        .collect();
     let mut doc = Document::new_empty();
-    let cs =
-        onda_core::transaction::ChangeSetBuilder::new(0).insert(text.clone()).build();
+    let cs = onda_core::transaction::ChangeSetBuilder::new(0)
+        .insert(text.clone())
+        .build();
     doc.apply(&Transaction::new(cs)).unwrap();
 
     let len = doc.len_chars();
@@ -20,10 +23,13 @@ fn bench_rope_char_to_line(c: &mut Criterion) {
 }
 
 fn bench_line_to_char(c: &mut Criterion) {
-    let text: String = (0..100_000).map(|i| format!("Line {i:08}: content here\n")).collect();
+    let text: String = (0..100_000)
+        .map(|i| format!("Line {i:08}: content here\n"))
+        .collect();
     let mut doc = Document::new_empty();
-    let cs =
-        onda_core::transaction::ChangeSetBuilder::new(0).insert(text).build();
+    let cs = onda_core::transaction::ChangeSetBuilder::new(0)
+        .insert(text)
+        .build();
     doc.apply(&Transaction::new(cs)).unwrap();
 
     let mid_line = doc.len_lines() / 2;

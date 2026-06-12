@@ -260,9 +260,7 @@ impl Document {
         }
         let last = self.rope.line(line).char(len - 1);
         if last == '\n' {
-            len.saturating_sub(if len >= 2
-                && self.rope.line(line).char(len - 2) == '\r'
-            {
+            len.saturating_sub(if len >= 2 && self.rope.line(line).char(len - 2) == '\r' {
                 2
             } else {
                 1
@@ -299,12 +297,13 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use tempfile::NamedTempFile;
 
     fn doc_from_str(s: &str) -> Document {
         let mut d = Document::new_empty();
-        let cs = crate::transaction::ChangeSetBuilder::new(0).insert(s).build();
+        let cs = crate::transaction::ChangeSetBuilder::new(0)
+            .insert(s)
+            .build();
         let tx = Transaction::new(cs);
         d.apply(&tx).unwrap();
         d.modified = false;
@@ -341,7 +340,9 @@ mod tests {
     fn modified_flag() {
         let mut doc = Document::new_empty();
         assert!(!doc.is_modified());
-        let cs = crate::transaction::ChangeSetBuilder::new(0).insert("x").build();
+        let cs = crate::transaction::ChangeSetBuilder::new(0)
+            .insert("x")
+            .build();
         doc.apply(&Transaction::new(cs)).unwrap();
         assert!(doc.is_modified());
         doc.mark_saved();
@@ -351,7 +352,9 @@ mod tests {
     #[test]
     fn apply_and_undo() {
         let mut doc = Document::new_empty();
-        let cs = crate::transaction::ChangeSetBuilder::new(0).insert("hello").build();
+        let cs = crate::transaction::ChangeSetBuilder::new(0)
+            .insert("hello")
+            .build();
         let inv = doc.apply(&Transaction::new(cs)).unwrap();
         assert_eq!(doc.rope().to_string(), "hello");
 

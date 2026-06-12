@@ -37,7 +37,11 @@ pub struct ChangeSet {
 impl ChangeSet {
     /// Create an identity changeset for a document of the given length.
     pub fn new(len: usize) -> Self {
-        Self { ops: Vec::new(), len_before: len, len_after: len }
+        Self {
+            ops: Vec::new(),
+            len_before: len,
+            len_after: len,
+        }
     }
 
     pub fn len_before(&self) -> usize {
@@ -162,7 +166,10 @@ impl ChangeSet {
     ///
     /// Panics in debug if `self.len_after != other.len_before`.
     pub fn compose(&self, other: &ChangeSet) -> ChangeSet {
-        debug_assert_eq!(self.len_after, other.len_before, "changeset lengths don't match");
+        debug_assert_eq!(
+            self.len_after, other.len_before,
+            "changeset lengths don't match"
+        );
 
         let mut result = ChangeSet::new(self.len_before);
         result.len_before = self.len_before;
@@ -205,12 +212,7 @@ impl ChangeSet {
 }
 
 /// Compose two op sequences. This is the O(m+n) algorithm.
-fn compose_ops(
-    a_ops: &[Op],
-    a_len_before: usize,
-    b_ops: &[Op],
-    _b_len_before: usize,
-) -> Vec<Op> {
+fn compose_ops(a_ops: &[Op], _a_len_before: usize, b_ops: &[Op], _b_len_before: usize) -> Vec<Op> {
     let mut result: Vec<Op> = Vec::new();
 
     // After applying A, we have a document of length A.len_after.
@@ -399,7 +401,6 @@ fn compose_ops(
                 a_offset = 0;
             }
             (Op::Insert(_), _) | (_, Op::Insert(_)) => unreachable!("handled above"),
-            (Op::Retain(_), Op::Retain(_)) => unreachable!(),
         }
     }
 
@@ -413,7 +414,9 @@ pub struct ChangeSetBuilder {
 
 impl ChangeSetBuilder {
     pub fn new(len: usize) -> Self {
-        Self { cs: ChangeSet::new(len) }
+        Self {
+            cs: ChangeSet::new(len),
+        }
     }
 
     pub fn retain(mut self, n: usize) -> Self {
@@ -451,7 +454,10 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn new(changes: ChangeSet) -> Self {
-        Self { changes, selection: None }
+        Self {
+            changes,
+            selection: None,
+        }
     }
 
     pub fn with_selection(mut self, sel: Selection) -> Self {
@@ -462,7 +468,10 @@ impl Transaction {
     /// Invert this transaction to produce its undo counterpart.
     pub fn invert(&self, original: &Rope) -> Transaction {
         let inv_changes = self.changes.invert(original);
-        Transaction { changes: inv_changes, selection: None }
+        Transaction {
+            changes: inv_changes,
+            selection: None,
+        }
     }
 }
 
@@ -490,7 +499,11 @@ mod tests {
     #[test]
     fn apply_replace() {
         let mut rope = Rope::from_str("foo bar");
-        let cs = ChangeSetBuilder::new(7).delete(3).insert("baz").retain(4).build();
+        let cs = ChangeSetBuilder::new(7)
+            .delete(3)
+            .insert("baz")
+            .retain(4)
+            .build();
         cs.apply(&mut rope).unwrap();
         assert_eq!(rope.to_string(), "baz bar");
     }
@@ -498,7 +511,11 @@ mod tests {
     #[test]
     fn invert_roundtrip() {
         let original = Rope::from_str("hello world");
-        let cs = ChangeSetBuilder::new(11).retain(6).delete(5).insert("earth").build();
+        let cs = ChangeSetBuilder::new(11)
+            .retain(6)
+            .delete(5)
+            .insert("earth")
+            .build();
         let mut rope = original.clone();
         cs.apply(&mut rope).unwrap();
         assert_eq!(rope.to_string(), "hello earth");
@@ -510,7 +527,11 @@ mod tests {
 
     #[test]
     fn map_pos_retain() {
-        let cs = ChangeSetBuilder::new(10).retain(5).insert("XX").retain(5).build();
+        let cs = ChangeSetBuilder::new(10)
+            .retain(5)
+            .insert("XX")
+            .retain(5)
+            .build();
         // pos 0..5 unchanged
         assert_eq!(cs.map_pos(3, Assoc::After), 3);
         // pos 5: before the insert
@@ -523,7 +544,11 @@ mod tests {
 
     #[test]
     fn map_pos_delete() {
-        let cs = ChangeSetBuilder::new(10).retain(3).delete(4).retain(3).build();
+        let cs = ChangeSetBuilder::new(10)
+            .retain(3)
+            .delete(4)
+            .retain(3)
+            .build();
         assert_eq!(cs.map_pos(2, Assoc::After), 2);
         assert_eq!(cs.map_pos(4, Assoc::After), 3); // deleted → land at deletion
         assert_eq!(cs.map_pos(7, Assoc::After), 3);

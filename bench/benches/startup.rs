@@ -3,7 +3,9 @@ use onda_core::{Document, Selection, Transaction};
 
 fn bench_document_open(c: &mut Criterion) {
     // Create an in-memory document with 10k lines for the criterion benchmark
-    let text: String = (0..10_000).map(|i| format!("Line {:08}: hello world\n", i)).collect();
+    let text: String = (0..10_000)
+        .map(|i| format!("Line {:08}: hello world\n", i))
+        .collect();
 
     c.bench_function("document_open_10k_lines", |b| {
         b.iter(|| {
@@ -19,9 +21,12 @@ fn bench_document_open(c: &mut Criterion) {
 
 fn bench_document_apply_insert(c: &mut Criterion) {
     let mut doc = Document::new_empty();
-    let text: String = (0..1000).map(|i| format!("Line {i}: hello world\n")).collect();
-    let cs =
-        onda_core::transaction::ChangeSetBuilder::new(0).insert(text).build();
+    let text: String = (0..1000)
+        .map(|i| format!("Line {i}: hello world\n"))
+        .collect();
+    let cs = onda_core::transaction::ChangeSetBuilder::new(0)
+        .insert(text)
+        .build();
     doc.apply(&Transaction::new(cs)).unwrap();
 
     c.bench_function("document_insert_middle", |b| {
@@ -56,5 +61,10 @@ fn bench_selection_map(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_document_open, bench_document_apply_insert, bench_selection_map);
+criterion_group!(
+    benches,
+    bench_document_open,
+    bench_document_apply_insert,
+    bench_selection_map
+);
 criterion_main!(benches);

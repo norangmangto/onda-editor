@@ -14,17 +14,64 @@ pub enum CommandError {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExCommand {
     Write(Option<String>),
-    Quit { force: bool },
+    Quit {
+        force: bool,
+    },
     WriteQuit,
     Edit(String),
     NextBuffer,
     PrevBuffer,
+    /// `:sp [file]` — horizontal split.
+    Split(Option<String>),
+    /// `:vsp [file]` — vertical split.
+    VSplit(Option<String>),
+    /// `:noh` — clear search highlight.
+    NoHighlight,
+    /// `:set option [value]`.
+    Set(String, Option<String>),
+    /// `:[%]s/pattern/replacement/[flags]`
+    Substitute {
+        range_all: bool,
+        pattern: String,
+        replacement: String,
+        flags_global: bool,
+        flags_case_insensitive: bool,
+    },
 }
 
 impl ExCommand {
     /// Parse a command-line string (without the leading `:`).
     pub fn parse(input: &str) -> Result<Self, CommandError> {
         let input = input.trim();
+
+        // Check for substitute: [%]s/pat/rep/[flags]
+        {
+            let (range_all, rest) = if let Some(without_pct) = input.strip_prefix('%') {
+                (true, without_pct)
+            } else {
+                (false, input)
+            };
+            if let Some(after_s) = rest.strip_prefix('s') {
+                if let Some(delim) = after_s.chars().next() {
+                    let parts: Vec<&str> = after_s[delim.len_utf8()..].splitn(3, delim).collect();
+                    if parts.len() >= 2 {
+                        let pattern = parts[0].to_string();
+                        let replacement = parts[1].to_string();
+                        let flags = parts.get(2).copied().unwrap_or("");
+                        let flags_global = flags.contains('g');
+                        let flags_case_insensitive = flags.contains('i');
+                        return Ok(ExCommand::Substitute {
+                            range_all,
+                            pattern,
+                            replacement,
+                            flags_global,
+                            flags_case_insensitive,
+                        });
+                    }
+                }
+            }
+        }
+
         match input {
             "w" => Ok(ExCommand::Write(None)),
             "q" => Ok(ExCommand::Quit { force: false }),
@@ -32,6 +79,51 @@ impl ExCommand {
             "wq" | "x" => Ok(ExCommand::WriteQuit),
             "bn" => Ok(ExCommand::NextBuffer),
             "bp" => Ok(ExCommand::PrevBuffer),
+            "sp" | "split" => Ok(ExCommand::Split(None)),
+            "vsp" | "vsplit" => Ok(ExCommand::VSplit(None)),
+            "noh" | "nohlsearch" => Ok(ExCommand::NoHighlight),
+            s if s.starts_with("sp ") || s.starts_with("split ") => {
+                let path = s
+                    .split_once(' ')
+                    .map(|(_, r)| r)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if path.is_empty() {
+                    Ok(ExCommand::Split(None))
+                } else {
+                    Ok(ExCommand::Split(Some(path)))
+                }
+            }
+            s if s.starts_with("vsp ") || s.starts_with("vsplit ") => {
+                let path = s
+                    .split_once(' ')
+                    .map(|(_, r)| r)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if path.is_empty() {
+                    Ok(ExCommand::VSplit(None))
+                } else {
+                    Ok(ExCommand::VSplit(Some(path)))
+                }
+            }
+            s if s.starts_with("set ") => {
+                let rest = s[4..].trim();
+                if let Some((key, val)) = rest.split_once('=') {
+                    Ok(ExCommand::Set(
+                        key.trim().to_string(),
+                        Some(val.trim().to_string()),
+                    ))
+                } else if let Some((key, val)) = rest.split_once(' ') {
+                    Ok(ExCommand::Set(
+                        key.trim().to_string(),
+                        Some(val.trim().to_string()),
+                    ))
+                } else {
+                    Ok(ExCommand::Set(rest.to_string(), None))
+                }
+            }
             s if s.starts_with("w ") => {
                 let path = s[2..].trim().to_string();
                 if path.is_empty() {
@@ -123,8 +215,14 @@ mod tests {
 
     #[test]
     fn parse_quit() {
-        assert_eq!(ExCommand::parse("q").unwrap(), ExCommand::Quit { force: false });
-        assert_eq!(ExCommand::parse("q!").unwrap(), ExCommand::Quit { force: true });
+        assert_eq!(
+            ExCommand::parse("q").unwrap(),
+            ExCommand::Quit { force: false }
+        );
+        assert_eq!(
+            ExCommand::parse("q!").unwrap(),
+            ExCommand::Quit { force: true }
+        );
     }
 
     #[test]

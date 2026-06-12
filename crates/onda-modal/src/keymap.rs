@@ -2,6 +2,29 @@ use std::collections::HashMap;
 
 use crate::{key::Key, mode::Mode, motion::Motion, operator::Operator};
 
+/// Text object selector for operator+textobj commands (e.g. `diw`, `ca"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextObj {
+    InnerWord,
+    OuterWord,
+    InnerBigWord,
+    OuterBigWord,
+    InnerParens,
+    OuterParens,
+    InnerBrackets,
+    OuterBrackets,
+    InnerBraces,
+    OuterBraces,
+    InnerDoubleQuote,
+    OuterDoubleQuote,
+    InnerSingleQuote,
+    OuterSingleQuote,
+    InnerBacktick,
+    OuterBacktick,
+    InnerParagraph,
+    OuterParagraph,
+}
+
 /// All actions that can be triggered by a keymap entry.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -15,6 +38,7 @@ pub enum Action {
     EnterNormal,
     EnterVisual,
     EnterVisualLine,
+    EnterVisualBlock,
     EnterCommand,
 
     // Motion (move cursor, no edit)
@@ -22,6 +46,9 @@ pub enum Action {
 
     // Operator + motion composed (e.g. dw, c3j)
     ApplyOperatorMotion(Operator, Motion),
+
+    // Operator + text object (e.g. diw, ca")
+    ApplyOperatorTextObj(Operator, TextObj),
 
     // Pending operator (waits for a motion key)
     PendingOperator(Operator),
@@ -45,9 +72,51 @@ pub enum Action {
     // Undo/redo
     Undo,
     Redo,
+    UndoOlder,
+    UndoNewer,
 
     // Visual mode
     SwapAnchorHead,
+
+    // Marks
+    SetMark(char),
+    JumpToMark(char),
+    JumpToMarkLine(char),
+
+    // Jump list
+    JumpOlder,
+    JumpNewer,
+
+    // Search
+    SearchForward,
+    SearchBackward,
+    SearchNext,
+    SearchPrev,
+    SearchWordUnder,
+    SearchWordUnderBack,
+    ClearSearch,
+
+    // Macros / dot-repeat
+    StartRecordMacro(char),
+    StopRecordMacro,
+    PlayMacro(char),
+    PlayLastMacro,
+    DotRepeat,
+
+    // Register selection
+    SetRegister(char),
+
+    // Window / split management
+    SplitHorizontal,
+    SplitVertical,
+    FocusWindowNext,
+    FocusWindowPrev,
+    CloseWindow,
+    OnlyWindow,
+
+    // Picker
+    OpenFilePicker,
+    OpenBufferPicker,
 
     // Command-line operations (dispatched to app)
     WriteFile,
@@ -90,6 +159,7 @@ impl Keymap {
         leaf!(Key::char('O'), Action::EnterInsertNewLineAbove);
         leaf!(Key::char('v'), Action::EnterVisual);
         leaf!(Key::char('V'), Action::EnterVisualLine);
+        leaf!(Key::ctrl('v'), Action::EnterVisualBlock);
         leaf!(Key::char(':'), Action::EnterCommand);
 
         // Motions
@@ -118,11 +188,24 @@ impl Keymap {
         leaf!(Key::PageUp, Action::Move(Motion::HalfPageUp));
         leaf!(Key::char('G'), Action::Move(Motion::DocumentEnd));
 
-        // 'g' prefix → 'gg'
+        // 'g' prefix → 'gg', 'g-', 'g+'
         {
             let mut g: HashMap<Key, KeymapNode> = HashMap::new();
-            g.insert(Key::char('g'), KeymapNode::Leaf(Action::Move(Motion::DocumentStart)));
+            g.insert(
+                Key::char('g'),
+                KeymapNode::Leaf(Action::Move(Motion::DocumentStart)),
+            );
+            g.insert(Key::char('-'), KeymapNode::Leaf(Action::UndoOlder));
+            g.insert(Key::char('+'), KeymapNode::Leaf(Action::UndoNewer));
             m.insert(Key::char('g'), KeymapNode::Node(g));
+        }
+
+        // Space prefix → pickers and window commands
+        {
+            let mut sp: HashMap<Key, KeymapNode> = HashMap::new();
+            sp.insert(Key::char('f'), KeymapNode::Leaf(Action::OpenFilePicker));
+            sp.insert(Key::char('b'), KeymapNode::Leaf(Action::OpenBufferPicker));
+            m.insert(Key::char(' '), KeymapNode::Node(sp));
         }
 
         // Operator prefixes: d/c/y trigger PendingOperator.
@@ -144,14 +227,39 @@ impl Keymap {
         leaf!(Key::char('u'), Action::Undo);
         leaf!(Key::ctrl('r'), Action::Redo);
 
+        // Search
+        leaf!(Key::char('/'), Action::SearchForward);
+        leaf!(Key::char('?'), Action::SearchBackward);
+        leaf!(Key::char('n'), Action::SearchNext);
+        leaf!(Key::char('N'), Action::SearchPrev);
+        leaf!(Key::char('*'), Action::SearchWordUnder);
+        leaf!(Key::char('#'), Action::SearchWordUnderBack);
+
+        // Dot-repeat
+        leaf!(Key::char('.'), Action::DotRepeat);
+
+        // '@', 'q', '"', 'm', '`', '\'' are handled in KeymapState::process() via
+        // pending_play_reg / pending_macro_reg / pending_set_reg / pending_mark_* paths.
+        // No trie entry needed for those single-char-prefix keys.
+
+        // Window splits
+        leaf!(Key::ctrl('w'), Action::FocusWindowNext);
+
         m
     }
 
     fn build_visual() -> HashMap<Key, KeymapNode> {
         let mut m = Self::build_normal();
         // In visual mode operators apply to selection
-        for (ch, op) in [('d', Operator::Delete), ('c', Operator::Change), ('y', Operator::Yank)] {
-            m.insert(Key::char(ch), KeymapNode::Leaf(Action::OperatorSelection(op)));
+        for (ch, op) in [
+            ('d', Operator::Delete),
+            ('c', Operator::Change),
+            ('y', Operator::Yank),
+        ] {
+            m.insert(
+                Key::char(ch),
+                KeymapNode::Leaf(Action::OperatorSelection(op)),
+            );
         }
         m.insert(Key::char('o'), KeymapNode::Leaf(Action::SwapAnchorHead));
         m.insert(Key::Esc, KeymapNode::Leaf(Action::EnterNormal));
@@ -159,13 +267,16 @@ impl Keymap {
     }
 
     pub fn new() -> Self {
-        Self { normal: Self::build_normal(), visual: Self::build_visual() }
+        Self {
+            normal: Self::build_normal(),
+            visual: Self::build_visual(),
+        }
     }
 
     fn root(&self, mode: Mode) -> Option<&HashMap<Key, KeymapNode>> {
         match mode {
             Mode::Normal => Some(&self.normal),
-            Mode::Visual | Mode::VisualLine => Some(&self.visual),
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock => Some(&self.visual),
             Mode::Insert | Mode::Command => None,
         }
     }
@@ -192,6 +303,22 @@ pub struct KeymapState {
     pending_find: Option<FindKind>,
     /// Pending 'r' replace, waiting for the replacement char.
     pending_replace: bool,
+    /// Pending macro record register: `q` was pressed, waiting for register char.
+    pending_macro_reg: bool,
+    /// Pending macro play register: `@` was pressed (not `@@`), waiting for register char.
+    pending_play_reg: bool,
+    /// Pending register selection: `"` was pressed, waiting for register char.
+    pending_set_reg: bool,
+    /// Pending mark set: `m` was pressed, waiting for mark char.
+    pending_mark_set: bool,
+    /// Pending mark jump (exact pos): backtick was pressed, waiting for mark char.
+    pending_mark_jump: bool,
+    /// Pending mark jump (line): `'` was pressed, waiting for mark char.
+    pending_mark_jump_line: bool,
+    /// Pending text-object inner: operator was set and `i` was pressed.
+    pending_textobj_inner: bool,
+    /// Pending text-object outer: operator was set and `a` was pressed.
+    pending_textobj_outer: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +348,14 @@ impl KeymapState {
         self.pending_operator = None;
         self.pending_find = None;
         self.pending_replace = false;
+        self.pending_macro_reg = false;
+        self.pending_play_reg = false;
+        self.pending_set_reg = false;
+        self.pending_mark_set = false;
+        self.pending_mark_jump = false;
+        self.pending_mark_jump_line = false;
+        self.pending_textobj_inner = false;
+        self.pending_textobj_outer = false;
     }
 
     /// Process one key in the given mode. Returns what should happen.
@@ -237,6 +372,137 @@ impl KeymapState {
 
         // In insert/command mode we don't use the trie
         if matches!(mode, Mode::Insert | Mode::Command) {
+            return PendingResult::NoMatch;
+        }
+
+        // Handle pending macro record (q{char})
+        if self.pending_macro_reg {
+            self.pending_macro_reg = false;
+            if let Key::Char(c, _) = key {
+                return PendingResult::Action(Action::StartRecordMacro(*c), 1);
+            }
+            self.reset();
+            return PendingResult::NoMatch;
+        }
+
+        // Handle pending macro play (@{char}; @@ → PlayLastMacro)
+        if self.pending_play_reg {
+            self.pending_play_reg = false;
+            if let Key::Char(c, _) = key {
+                if *c == '@' {
+                    return PendingResult::Action(Action::PlayLastMacro, 1);
+                }
+                return PendingResult::Action(Action::PlayMacro(*c), 1);
+            }
+            self.reset();
+            return PendingResult::NoMatch;
+        }
+
+        // Handle pending register select ("{char})
+        if self.pending_set_reg {
+            self.pending_set_reg = false;
+            if let Key::Char(c, _) = key {
+                return PendingResult::Action(Action::SetRegister(*c), 1);
+            }
+            self.reset();
+            return PendingResult::NoMatch;
+        }
+
+        // Handle pending mark set (m{char})
+        if self.pending_mark_set {
+            self.pending_mark_set = false;
+            if let Key::Char(c, _) = key {
+                return PendingResult::Action(Action::SetMark(*c), 1);
+            }
+            self.reset();
+            return PendingResult::NoMatch;
+        }
+
+        // Handle pending mark jump exact (backtick{char})
+        if self.pending_mark_jump {
+            self.pending_mark_jump = false;
+            if let Key::Char(c, _) = key {
+                return PendingResult::Action(Action::JumpToMark(*c), 1);
+            }
+            self.reset();
+            return PendingResult::NoMatch;
+        }
+
+        // Handle pending mark jump line ('{char})
+        if self.pending_mark_jump_line {
+            self.pending_mark_jump_line = false;
+            if let Key::Char(c, _) = key {
+                return PendingResult::Action(Action::JumpToMarkLine(*c), 1);
+            }
+            self.reset();
+            return PendingResult::NoMatch;
+        }
+
+        // Handle pending text-object inner (operator i{char})
+        if self.pending_textobj_inner {
+            self.pending_textobj_inner = false;
+            let op = match self.pending_operator.take() {
+                Some(op) => op,
+                None => {
+                    self.reset();
+                    return PendingResult::NoMatch;
+                }
+            };
+            let count = self.count.unwrap_or(1);
+            self.count = None;
+            if let Key::Char(c, _) = key {
+                let textobj = match c {
+                    'w' => TextObj::InnerWord,
+                    'W' => TextObj::InnerBigWord,
+                    '(' | ')' | 'b' => TextObj::InnerParens,
+                    '[' | ']' => TextObj::InnerBrackets,
+                    '{' | '}' | 'B' => TextObj::InnerBraces,
+                    '"' => TextObj::InnerDoubleQuote,
+                    '\'' => TextObj::InnerSingleQuote,
+                    '`' => TextObj::InnerBacktick,
+                    'p' => TextObj::InnerParagraph,
+                    _ => {
+                        self.reset();
+                        return PendingResult::NoMatch;
+                    }
+                };
+                return PendingResult::Action(Action::ApplyOperatorTextObj(op, textobj), count);
+            }
+            self.reset();
+            return PendingResult::NoMatch;
+        }
+
+        // Handle pending text-object outer (operator a{char})
+        if self.pending_textobj_outer {
+            self.pending_textobj_outer = false;
+            let op = match self.pending_operator.take() {
+                Some(op) => op,
+                None => {
+                    self.reset();
+                    return PendingResult::NoMatch;
+                }
+            };
+            let count = self.count.unwrap_or(1);
+            self.count = None;
+            if let Key::Char(c, _) = key {
+                let textobj = match c {
+                    'w' => TextObj::OuterWord,
+                    'W' => TextObj::OuterBigWord,
+                    '(' | ')' | 'b' => TextObj::OuterParens,
+                    '[' | ']' => TextObj::OuterBrackets,
+                    '{' | '}' | 'B' => TextObj::OuterBraces,
+                    '"' => TextObj::OuterDoubleQuote,
+                    '\'' => TextObj::OuterSingleQuote,
+                    '`' => TextObj::OuterBacktick,
+                    'p' => TextObj::OuterParagraph,
+                    _ => {
+                        self.reset();
+                        return PendingResult::NoMatch;
+                    }
+                };
+                return PendingResult::Action(Action::ApplyOperatorTextObj(op, textobj), count);
+            }
+            self.reset();
             return PendingResult::NoMatch;
         }
 
@@ -285,6 +551,20 @@ impl KeymapState {
 
         // Handle pending operator waiting for motion
         if let Some(op) = self.pending_operator {
+            // i{char} or a{char} → text object
+            match key {
+                Key::Char('i', _) => {
+                    self.pending_textobj_inner = true;
+                    // keep pending_operator set so the textobj handler can read it
+                    return PendingResult::NeedMore;
+                }
+                Key::Char('a', _) => {
+                    self.pending_textobj_outer = true;
+                    return PendingResult::NeedMore;
+                }
+                _ => {}
+            }
+
             // f/t/F/T — need another char
             match key {
                 Key::Char('f', _) => {
@@ -307,12 +587,12 @@ impl KeymapState {
             }
 
             // Operator doubling (dd, cc, yy)
-            let is_double = match (op, key) {
-                (Operator::Delete, Key::Char('d', _)) => true,
-                (Operator::Change, Key::Char('c', _)) => true,
-                (Operator::Yank, Key::Char('y', _)) => true,
-                _ => false,
-            };
+            let is_double = matches!(
+                (op, key),
+                (Operator::Delete, Key::Char('d', _))
+                    | (Operator::Change, Key::Char('c', _))
+                    | (Operator::Yank, Key::Char('y', _))
+            );
             if is_double {
                 self.pending_operator = None;
                 self.count = None;
@@ -330,7 +610,7 @@ impl KeymapState {
             return PendingResult::NoMatch;
         }
 
-        // f/t/F/T in motion context
+        // f/t/F/T and other single-char pending keys in motion context
         match key {
             Key::Char('f', _) => {
                 self.pending_find = Some(FindKind::Find);
@@ -350,6 +630,31 @@ impl KeymapState {
             }
             Key::Char('r', _) => {
                 self.pending_replace = true;
+                return PendingResult::NeedMore;
+            }
+            Key::Char('q', _) => {
+                self.pending_macro_reg = true;
+                return PendingResult::NeedMore;
+            }
+            Key::Char('@', _) => {
+                // '@' alone → need next char: either '@' (PlayLastMacro) or register char
+                self.pending_play_reg = true;
+                return PendingResult::NeedMore;
+            }
+            Key::Char('"', _) => {
+                self.pending_set_reg = true;
+                return PendingResult::NeedMore;
+            }
+            Key::Char('m', _) => {
+                self.pending_mark_set = true;
+                return PendingResult::NeedMore;
+            }
+            Key::Char('`', _) => {
+                self.pending_mark_jump = true;
+                return PendingResult::NeedMore;
+            }
+            Key::Char('\'', _) => {
+                self.pending_mark_jump_line = true;
                 return PendingResult::NeedMore;
             }
             _ => {}
@@ -407,6 +712,14 @@ impl KeymapState {
             || !self.pending_keys.is_empty()
             || self.pending_find.is_some()
             || self.pending_replace
+            || self.pending_macro_reg
+            || self.pending_play_reg
+            || self.pending_set_reg
+            || self.pending_mark_set
+            || self.pending_mark_jump
+            || self.pending_mark_jump_line
+            || self.pending_textobj_inner
+            || self.pending_textobj_outer
     }
 }
 
@@ -452,33 +765,56 @@ mod tests {
     #[test]
     fn count_then_motion() {
         let (mut st, km) = state();
-        assert!(matches!(st.process(&Key::char('3'), Mode::Normal, &km), PendingResult::NeedMore));
-        assert!(matches!(st.process(&Key::char('w'), Mode::Normal, &km),
-            PendingResult::Action(Action::Move(Motion::WordForward), 3)));
+        assert!(matches!(
+            st.process(&Key::char('3'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('w'), Mode::Normal, &km),
+            PendingResult::Action(Action::Move(Motion::WordForward), 3)
+        ));
     }
 
     #[test]
     fn gg_sequence() {
         let (mut st, km) = state();
-        assert!(matches!(st.process(&Key::char('g'), Mode::Normal, &km), PendingResult::NeedMore));
-        assert!(matches!(st.process(&Key::char('g'), Mode::Normal, &km),
-            PendingResult::Action(Action::Move(Motion::DocumentStart), 1)));
+        assert!(matches!(
+            st.process(&Key::char('g'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('g'), Mode::Normal, &km),
+            PendingResult::Action(Action::Move(Motion::DocumentStart), 1)
+        ));
     }
 
     #[test]
     fn dd_linewise_delete() {
         let (mut st, km) = state();
-        assert!(matches!(st.process(&Key::char('d'), Mode::Normal, &km), PendingResult::NeedMore));
-        assert!(matches!(st.process(&Key::char('d'), Mode::Normal, &km),
-            PendingResult::Action(Action::OperatorLine(Operator::Delete), 1)));
+        assert!(matches!(
+            st.process(&Key::char('d'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('d'), Mode::Normal, &km),
+            PendingResult::Action(Action::OperatorLine(Operator::Delete), 1)
+        ));
     }
 
     #[test]
     fn dw_composed() {
         let (mut st, km) = state();
-        assert!(matches!(st.process(&Key::char('d'), Mode::Normal, &km), PendingResult::NeedMore));
-        assert!(matches!(st.process(&Key::char('w'), Mode::Normal, &km),
-            PendingResult::Action(Action::ApplyOperatorMotion(Operator::Delete, Motion::WordForward), 1)));
+        assert!(matches!(
+            st.process(&Key::char('d'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('w'), Mode::Normal, &km),
+            PendingResult::Action(
+                Action::ApplyOperatorMotion(Operator::Delete, Motion::WordForward),
+                1
+            )
+        ));
     }
 
     #[test]
@@ -492,16 +828,26 @@ mod tests {
     #[test]
     fn find_char_sequence() {
         let (mut st, km) = state();
-        assert!(matches!(st.process(&Key::char('f'), Mode::Normal, &km), PendingResult::NeedMore));
-        assert!(matches!(st.process(&Key::char('x'), Mode::Normal, &km),
-            PendingResult::Action(Action::Move(Motion::FindChar('x')), 1)));
+        assert!(matches!(
+            st.process(&Key::char('f'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('x'), Mode::Normal, &km),
+            PendingResult::Action(Action::Move(Motion::FindChar('x')), 1)
+        ));
     }
 
     #[test]
     fn replace_char_sequence() {
         let (mut st, km) = state();
-        assert!(matches!(st.process(&Key::char('r'), Mode::Normal, &km), PendingResult::NeedMore));
-        assert!(matches!(st.process(&Key::char('z'), Mode::Normal, &km),
-            PendingResult::Action(Action::ReplaceChar('z'), 1)));
+        assert!(matches!(
+            st.process(&Key::char('r'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('z'), Mode::Normal, &km),
+            PendingResult::Action(Action::ReplaceChar('z'), 1)
+        ));
     }
 }

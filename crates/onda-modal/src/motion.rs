@@ -13,25 +13,25 @@ pub enum Motion {
     Right,
     Up,
     Down,
-    WordForward,       // w
-    WordBackward,      // b
-    WordEnd,           // e
-    BigWordForward,    // W
-    BigWordBackward,   // B
-    BigWordEnd,        // E
-    LineStart,         // 0
-    LineFirstNonBlank, // ^
-    LineEnd,           // $
-    DocumentStart,     // gg
-    DocumentEnd,       // G
-    FindChar(char),    // f<char>
-    TillChar(char),    // t<char>
+    WordForward,        // w
+    WordBackward,       // b
+    WordEnd,            // e
+    BigWordForward,     // W
+    BigWordBackward,    // B
+    BigWordEnd,         // E
+    LineStart,          // 0
+    LineFirstNonBlank,  // ^
+    LineEnd,            // $
+    DocumentStart,      // gg
+    DocumentEnd,        // G
+    FindChar(char),     // f<char>
+    TillChar(char),     // t<char>
     FindCharBack(char), // F<char>
     TillCharBack(char), // T<char>
-    ParagraphForward,  // }
-    ParagraphBackward, // {
-    HalfPageDown,      // Ctrl-d
-    HalfPageUp,        // Ctrl-u
+    ParagraphForward,   // }
+    ParagraphBackward,  // {
+    HalfPageDown,       // Ctrl-d
+    HalfPageUp,         // Ctrl-u
 }
 
 impl Motion {
@@ -52,9 +52,7 @@ impl Motion {
             Motion::Left => (move_left(rope, range, count), None),
             Motion::Right => (move_right(rope, range, count), None),
             Motion::Up => move_vertical(rope, range, -(count as isize), goal_col, viewport_height),
-            Motion::Down => {
-                move_vertical(rope, range, count as isize, goal_col, viewport_height)
-            }
+            Motion::Down => move_vertical(rope, range, count as isize, goal_col, viewport_height),
             Motion::WordForward => (word_forward(rope, range, count, false), None),
             Motion::WordBackward => (word_backward(rope, range, count, false), None),
             Motion::WordEnd => (word_end(rope, range, count, false), None),
@@ -117,6 +115,7 @@ impl Motion {
 
 // ── Primitive movement functions ──────────────────────────────────────────────
 
+#[allow(dead_code)]
 fn clamp_char(rope: &Rope, pos: usize) -> usize {
     pos.min(rope.len_chars().saturating_sub(1))
 }
@@ -177,7 +176,10 @@ fn move_vertical(
     let target_col = goal.min(target_max_grapheme(rope, target_line, target_line_max_col));
     let new_pos = grapheme_col_to_char(rope, target_line_start, target_col);
 
-    (Range::point(new_pos.min(rope.len_chars().saturating_sub(1))), Some(goal))
+    (
+        Range::point(new_pos.min(rope.len_chars().saturating_sub(1))),
+        Some(goal),
+    )
 }
 
 /// Count grapheme clusters from `line_start` to `char_pos`.
@@ -238,7 +240,7 @@ fn line_end(rope: &Rope, range: Range, _count: usize) -> Range {
     Range::point(line_end_char(rope, line))
 }
 
-fn doc_start(range: Range) -> Range {
+fn doc_start(_range: Range) -> Range {
     Range::point(0)
 }
 
@@ -276,7 +278,8 @@ fn word_forward(rope: &Rope, range: Range, count: usize, big: bool) -> Range {
             }
         } else if !ch.is_whitespace() {
             // Skip current punctuation run
-            while pos < len && !is_word_char(rope.char(pos), big) && !rope.char(pos).is_whitespace() {
+            while pos < len && !is_word_char(rope.char(pos), big) && !rope.char(pos).is_whitespace()
+            {
                 pos += 1;
             }
         }
@@ -334,14 +337,25 @@ fn word_end(rope: &Rope, range: Range, count: usize, big: bool) -> Range {
     Range::point(pos.min(len.saturating_sub(1)))
 }
 
-fn find_char(rope: &Rope, range: Range, target: char, count: usize, till: bool, back: bool) -> Range {
+fn find_char(
+    rope: &Rope,
+    range: Range,
+    target: char,
+    count: usize,
+    till: bool,
+    back: bool,
+) -> Range {
     let pos = range.head;
     let len = rope.len_chars();
 
     if back {
         let mut found = pos;
         let mut hits = 0;
-        let start = if pos == 0 { return range; } else { pos - 1 };
+        let start = if pos == 0 {
+            return range;
+        } else {
+            pos - 1
+        };
         let mut i = start;
         loop {
             if rope.char(i) == target {
@@ -351,7 +365,9 @@ fn find_char(rope: &Rope, range: Range, target: char, count: usize, till: bool, 
                     break;
                 }
             }
-            if i == 0 { break; }
+            if i == 0 {
+                break;
+            }
             i -= 1;
         }
         Range::point(found)
@@ -405,7 +421,6 @@ fn paragraph_backward(rope: &Rope, range: Range, count: usize) -> Range {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onda_core::Selection;
     use ropey::Rope;
 
     fn rope(s: &str) -> Rope {

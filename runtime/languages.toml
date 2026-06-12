@@ -1,0 +1,15 @@
+[[language]]
+name = "rust"
+extensions = ["rs"]
+
+[[language]]
+name = "python"
+extensions = ["py", "pyw"]
+
+[[language]]
+name = "json"
+extensions = ["json", "jsonl"]
+
+[[language]]
+name = "toml"
+extensions = ["toml"]

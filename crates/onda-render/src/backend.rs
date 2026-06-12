@@ -1,16 +1,13 @@
 use std::io::{self, BufWriter, Write};
 
 use crossterm::{
-    cursor,
-    event::{DisableMouseCapture, EnableMouseCapture},
-    execute, queue,
+    cursor, execute, queue,
     style::{
         Attribute as CAttribute, Color as CColor, Print, ResetColor, SetAttribute,
         SetBackgroundColor, SetForegroundColor,
     },
     terminal::{
-        self, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
-        disable_raw_mode, enable_raw_mode,
+        self, disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
     },
 };
 use thiserror::Error;
@@ -63,7 +60,11 @@ pub struct TerminalBackend {
 impl TerminalBackend {
     pub fn new() -> Result<Self, RenderError> {
         let (width, height) = terminal::size()?;
-        Ok(Self { out: BufWriter::with_capacity(64 * 1024, io::stdout()), width, height })
+        Ok(Self {
+            out: BufWriter::with_capacity(64 * 1024, io::stdout()),
+            width,
+            height,
+        })
     }
 
     /// Enter raw mode + alternate screen. Also registers a panic hook to restore
@@ -126,10 +127,16 @@ impl TerminalBackend {
     fn apply_style(&mut self, style: &Style) -> io::Result<()> {
         queue!(self.out, ResetColor)?;
         if style.fg != Color::Reset {
-            queue!(self.out, SetForegroundColor(Self::crossterm_color(style.fg)))?;
+            queue!(
+                self.out,
+                SetForegroundColor(Self::crossterm_color(style.fg))
+            )?;
         }
         if style.bg != Color::Reset {
-            queue!(self.out, SetBackgroundColor(Self::crossterm_color(style.bg)))?;
+            queue!(
+                self.out,
+                SetBackgroundColor(Self::crossterm_color(style.bg))
+            )?;
         }
         if style.attrs.contains(Attribute::BOLD) {
             queue!(self.out, SetAttribute(CAttribute::Bold))?;

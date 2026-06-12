@@ -90,7 +90,11 @@ pub struct Cell {
 
 impl Default for Cell {
     fn default() -> Self {
-        Self { grapheme: " ".to_string(), width: 1, style: Style::RESET }
+        Self {
+            grapheme: " ".to_string(),
+            width: 1,
+            style: Style::RESET,
+        }
     }
 }
 
@@ -98,11 +102,19 @@ impl Cell {
     pub fn new(grapheme: impl Into<String>, style: Style) -> Self {
         let grapheme = grapheme.into();
         let width = grapheme.width().max(1) as u8;
-        Self { grapheme, width, style }
+        Self {
+            grapheme,
+            width,
+            style,
+        }
     }
 
     pub fn blank(style: Style) -> Self {
-        Self { grapheme: " ".to_string(), width: 1, style }
+        Self {
+            grapheme: " ".to_string(),
+            width: 1,
+            style,
+        }
     }
 
     pub fn set_grapheme(&mut self, g: impl Into<String>) {
@@ -123,7 +135,11 @@ pub struct Grid {
 impl Grid {
     pub fn new(width: u16, height: u16) -> Self {
         let cells = vec![Cell::default(); (width as usize) * (height as usize)];
-        Self { width, height, cells }
+        Self {
+            width,
+            height,
+            cells,
+        }
     }
 
     pub fn width(&self) -> u16 {
@@ -172,11 +188,27 @@ impl Grid {
                 break;
             }
             let w = ch.width().unwrap_or(1);
-            self.set(x, row, Cell { grapheme: ch.to_string(), width: w as u8, style });
+            self.set(
+                x,
+                row,
+                Cell {
+                    grapheme: ch.to_string(),
+                    width: w as u8,
+                    style,
+                },
+            );
             x += w as u16;
             // Fill wide char's second column with a blank
             if w == 2 && x < self.width {
-                self.set(x - 1 + 1, row, Cell { grapheme: " ".to_string(), width: 1, style });
+                self.set(
+                    x - 1 + 1,
+                    row,
+                    Cell {
+                        grapheme: " ".to_string(),
+                        width: 1,
+                        style,
+                    },
+                );
             }
         }
         x
@@ -195,7 +227,8 @@ impl Grid {
     pub fn resize(&mut self, width: u16, height: u16) {
         self.width = width;
         self.height = height;
-        self.cells.resize((width as usize) * (height as usize), Cell::default());
+        self.cells
+            .resize((width as usize) * (height as usize), Cell::default());
     }
 
     pub fn cells(&self) -> &[Cell] {
@@ -207,15 +240,22 @@ impl Grid {
         let w = self.width as usize;
         let h = self.height as usize;
         let prev_cells = &previous.cells;
-        self.cells.iter().enumerate().filter_map(move |(idx, cell)| {
-            let col = (idx % w) as u16;
-            let row = (idx / w) as u16;
-            if row >= h as u16 {
-                return None;
-            }
-            let prev = prev_cells.get(idx)?;
-            if cell != prev { Some((col, row, cell)) } else { None }
-        })
+        self.cells
+            .iter()
+            .enumerate()
+            .filter_map(move |(idx, cell)| {
+                let col = (idx % w) as u16;
+                let row = (idx / w) as u16;
+                if row >= h as u16 {
+                    return None;
+                }
+                let prev = prev_cells.get(idx)?;
+                if cell != prev {
+                    Some((col, row, cell))
+                } else {
+                    None
+                }
+            })
     }
 }
 
@@ -228,7 +268,10 @@ pub struct DoubleBuffer {
 
 impl DoubleBuffer {
     pub fn new(width: u16, height: u16) -> Self {
-        Self { current: Grid::new(width, height), previous: Grid::new(width, height) }
+        Self {
+            current: Grid::new(width, height),
+            previous: Grid::new(width, height),
+        }
     }
 
     pub fn current(&self) -> &Grid {
@@ -244,7 +287,11 @@ impl DoubleBuffer {
     /// Fills `previous` with a sentinel that differs from any real drawn cell so
     /// `diff()` reports every position as changed.
     pub fn invalidate(&mut self) {
-        let sentinel = Cell { grapheme: "\x00".to_string(), width: 1, style: Style::RESET };
+        let sentinel = Cell {
+            grapheme: "\x00".to_string(),
+            width: 1,
+            style: Style::RESET,
+        };
         for cell in self.previous.cells.iter_mut() {
             cell.clone_from(&sentinel);
         }

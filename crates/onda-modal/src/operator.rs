@@ -1,4 +1,6 @@
-use onda_core::{transaction::ChangeSetBuilder, ChangeSet, Document, Range, Selection, Transaction};
+use onda_core::{transaction::ChangeSetBuilder, ChangeSet, Document, Selection, Transaction};
+
+use crate::register::{Register, RegisterKind};
 
 /// The operator type: what we do with a motion's range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8,40 +10,11 @@ pub enum Operator {
     Yank,
 }
 
-/// Register content kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegisterKind {
-    Charwise,
-    Linewise,
-}
-
-/// The register (unnamed only in Phase 0).
-#[derive(Debug, Clone, Default)]
-pub struct Register {
-    pub text: String,
-    pub kind: RegisterKind,
-}
-
-impl Default for RegisterKind {
-    fn default() -> Self {
-        Self::Charwise
-    }
-}
-
-impl Register {
-    pub fn new(text: String, kind: RegisterKind) -> Self {
-        Self { text, kind }
-    }
-}
-
 /// Apply a delete operation to the selection in the document.
 ///
 /// Returns (Transaction, yanked_text) — the transaction can be applied to the document,
 /// and the yanked text goes into the register.
-pub fn delete(
-    doc: &Document,
-    sel: &Selection,
-) -> (Transaction, Register) {
+pub fn delete(doc: &Document, sel: &Selection) -> (Transaction, Register) {
     let len = doc.len_chars();
     let rope = doc.rope();
 
@@ -97,7 +70,7 @@ pub fn paste_after(doc: &Document, sel: &Selection, reg: &Register) -> Transacti
         return Transaction::new(ChangeSet::new(doc.len_chars()));
     }
     match reg.kind {
-        RegisterKind::Charwise => {
+        RegisterKind::Charwise | RegisterKind::Blockwise => {
             let pos = sel.primary().head + 1;
             let pos = pos.min(doc.len_chars());
             let changes = ChangeSetBuilder::new(doc.len_chars())
@@ -135,7 +108,7 @@ pub fn paste_before(doc: &Document, sel: &Selection, reg: &Register) -> Transact
         return Transaction::new(ChangeSet::new(doc.len_chars()));
     }
     match reg.kind {
-        RegisterKind::Charwise => {
+        RegisterKind::Charwise | RegisterKind::Blockwise => {
             let pos = sel.primary().head;
             let changes = ChangeSetBuilder::new(doc.len_chars())
                 .retain(pos)
@@ -216,7 +189,7 @@ pub fn insert_char(doc: &Document, sel: &Selection, c: char) -> Transaction {
 
 /// Delete the character before the cursor (backspace).
 pub fn delete_before_cursor(doc: &Document, sel: &Selection) -> Transaction {
-    let len = doc.len_chars();
+    let _len = doc.len_chars();
     let ranges: Vec<(usize, usize)> = sel
         .ranges()
         .iter()
@@ -264,13 +237,10 @@ pub fn open_line(doc: &Document, sel: &Selection, above: bool) -> (Transaction, 
 
     let insert_pos = if above {
         doc.line_to_char(line)
+    } else if line + 1 < doc.len_lines() {
+        doc.line_to_char(line + 1)
     } else {
-        let next = if line + 1 < doc.len_lines() {
-            doc.line_to_char(line + 1)
-        } else {
-            len
-        };
-        next
+        len
     };
 
     let changes = ChangeSetBuilder::new(len)
@@ -340,7 +310,7 @@ pub fn replace_char(doc: &Document, sel: &Selection, c: char) -> Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onda_core::{Document, Selection, Transaction};
+    use onda_core::{Document, Range, Selection, Transaction};
 
     fn doc(s: &str) -> Document {
         let mut d = Document::new_empty();
@@ -396,4 +366,3 @@ mod tests {
         assert_eq!(d.rope().to_string(), "hello world");
     }
 }
-

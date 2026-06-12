@@ -27,7 +27,10 @@ impl Range {
     /// Create a cursor (zero-width range) at the given position.
     #[inline]
     pub fn point(pos: usize) -> Self {
-        Self { anchor: pos, head: pos }
+        Self {
+            anchor: pos,
+            head: pos,
+        }
     }
 
     /// Create a range from `anchor` to `head`.
@@ -69,7 +72,10 @@ impl Range {
     /// Flip anchor and head.
     #[inline]
     pub fn flip(&self) -> Range {
-        Range { anchor: self.head, head: self.anchor }
+        Range {
+            anchor: self.head,
+            head: self.anchor,
+        }
     }
 
     /// Collapse the range to a cursor at the head position.
@@ -118,7 +124,10 @@ pub struct Selection {
 impl Selection {
     /// Create a selection with a single cursor.
     pub fn point(pos: usize) -> Self {
-        Self { ranges: SmallVec::from_buf([Range::point(pos)]), primary: 0 }
+        Self {
+            ranges: SmallVec::from_buf([Range::point(pos)]),
+            primary: 0,
+        }
     }
 
     /// Create a selection from a non-empty list of ranges.
@@ -157,6 +166,12 @@ impl Selection {
         self.ranges.len()
     }
 
+    /// `true` if there are no ranges (should not occur in valid state).
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
     /// `true` if there is only one range.
     #[inline]
     pub fn is_single(&self) -> bool {
@@ -165,8 +180,11 @@ impl Selection {
 
     /// Map all ranges through a changeset.
     pub fn map(&self, cs: &ChangeSet) -> Selection {
-        let ranges: SmallVec<[Range; 1]> =
-            self.ranges.iter().map(|r| r.map(cs, Assoc::After)).collect();
+        let ranges: SmallVec<[Range; 1]> = self
+            .ranges
+            .iter()
+            .map(|r| r.map(cs, Assoc::After))
+            .collect();
         let primary = self.primary;
         // After mapping, ranges may overlap/reorder — normalize
         let mut sel = Selection { ranges, primary };
@@ -178,7 +196,10 @@ impl Selection {
     pub fn collapse_to_head(&self) -> Selection {
         let ranges: SmallVec<[Range; 1]> =
             self.ranges.iter().map(Range::collapse_to_head).collect();
-        let mut sel = Selection { ranges, primary: self.primary };
+        let mut sel = Selection {
+            ranges,
+            primary: self.primary,
+        };
         sel.normalize();
         sel
     }
@@ -189,7 +210,10 @@ impl Selection {
         F: Fn(Range) -> Range,
     {
         let ranges: SmallVec<[Range; 1]> = self.ranges.iter().copied().map(f).collect();
-        let mut sel = Selection { ranges, primary: self.primary };
+        let mut sel = Selection {
+            ranges,
+            primary: self.primary,
+        };
         sel.normalize();
         sel
     }
@@ -232,9 +256,7 @@ impl Selection {
             .ranges
             .iter()
             .enumerate()
-            .min_by_key(|(_, r)| {
-                (r.head as isize - primary_range.head as isize).unsigned_abs()
-            })
+            .min_by_key(|(_, r)| (r.head as isize - primary_range.head as isize).unsigned_abs())
             .map(|(i, _)| i)
             .unwrap_or(0);
     }

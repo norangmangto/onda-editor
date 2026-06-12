@@ -9,10 +9,12 @@ name = "onda"
 path = "src/main.rs"
 
 [dependencies]
+ropey.workspace = true
 onda-core.workspace = true
 onda-render.workspace = true
 onda-modal.workspace = true
 onda-config.workspace = true
+onda-syntax.workspace = true
 crossterm.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -20,6 +22,11 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+regex.workspace = true
+toml.workspace = true
+nucleo-matcher.workspace = true
+ignore.workspace = true
+notify.workspace = true
 
 [features]
 default = []

@@ -5,6 +5,7 @@ members = [
     "crates/onda-modal",
     "crates/onda-render",
     "crates/onda-config",
+    "crates/onda-syntax",
     "xtask",
     "bench",
 ]
@@ -53,11 +54,33 @@ tempfile = "3"
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
 
+# Syntax / parsing
+tree-sitter = "0.22"
+tree-sitter-rust = "0.21"
+tree-sitter-python = "0.21"
+tree-sitter-json = "0.21"
+
+# Regex
+regex = "1"
+
+# TOML parsing
+toml = "0.8"
+
+# Fuzzy matching
+nucleo-matcher = "0.3"
+
+# File-system watching
+notify = "6"
+
+# Gitignore-aware directory traversal
+ignore = "0.4"
+
 # Crate cross-references
 onda-core = { path = "crates/onda-core" }
 onda-render = { path = "crates/onda-render" }
 onda-modal = { path = "crates/onda-modal" }
 onda-config = { path = "crates/onda-config" }
+onda-syntax = { path = "crates/onda-syntax" }
 
 [profile.release]
 opt-level = 3

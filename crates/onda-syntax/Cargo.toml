@@ -1,17 +1,16 @@
 [package]
-name = "onda-modal"
+name = "onda-syntax"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 onda-core.workspace = true
-crossterm.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-json.workspace = true
 thiserror.workspace = true
-unicode-segmentation.workspace = true
 tracing.workspace = true
-smallvec.workspace = true
+tokio.workspace = true
 ropey.workspace = true
-regex.workspace = true
-nucleo-matcher.workspace = true
-ignore.workspace = true
