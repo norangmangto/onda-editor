@@ -17,6 +17,8 @@ pub enum ExCommand {
     Quit {
         force: bool,
     },
+    /// `:wqa` / `:wqall` — write all and quit (triggers session auto-save).
+    WriteQuitAll,
     WriteQuit,
     Edit(String),
     NextBuffer,
@@ -37,12 +39,54 @@ pub enum ExCommand {
         flags_global: bool,
         flags_case_insensitive: bool,
     },
+    // ── Phase 2 commands ──────────────────────────────────────────────────────
+    /// `:terminal` — open a terminal pane.
+    Terminal,
+    /// `:session save [name]` — save a session.
+    SessionSave(Option<String>),
+    /// `:session restore [name]` — restore a session.
+    SessionRestore(Option<String>),
+    /// `:Format` — format the current buffer via LSP.
+    Format,
+    /// `:lnext` — go to next diagnostic.
+    LspNext,
+    /// `:lprev` — go to previous diagnostic.
+    LspPrev,
+    /// `:messages` — show message history.
+    Messages,
+    /// `:GrammarFetch` — fetch tree-sitter grammars.
+    GrammarFetch,
+    /// `:ls` — list buffers.
+    ListBuffers,
+    /// Custom command registered by a Lua plugin.
+    LuaCommand(String, Vec<String>),
 }
 
 impl ExCommand {
     /// Parse a command-line string (without the leading `:`).
     pub fn parse(input: &str) -> Result<Self, CommandError> {
         let input = input.trim();
+
+        // Check session commands before substitute (both start with 's')
+        if input.starts_with("session") {
+            if let Some(rest) = input.strip_prefix("session save") {
+                let name = rest.trim();
+                return Ok(ExCommand::SessionSave(if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                }));
+            }
+            if let Some(rest) = input.strip_prefix("session restore") {
+                let name = rest.trim();
+                return Ok(ExCommand::SessionRestore(if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                }));
+            }
+            return Ok(ExCommand::SessionSave(None));
+        }
 
         // Check for substitute: [%]s/pat/rep/[flags]
         {
@@ -53,20 +97,25 @@ impl ExCommand {
             };
             if let Some(after_s) = rest.strip_prefix('s') {
                 if let Some(delim) = after_s.chars().next() {
-                    let parts: Vec<&str> = after_s[delim.len_utf8()..].splitn(3, delim).collect();
-                    if parts.len() >= 2 {
-                        let pattern = parts[0].to_string();
-                        let replacement = parts[1].to_string();
-                        let flags = parts.get(2).copied().unwrap_or("");
-                        let flags_global = flags.contains('g');
-                        let flags_case_insensitive = flags.contains('i');
-                        return Ok(ExCommand::Substitute {
-                            range_all,
-                            pattern,
-                            replacement,
-                            flags_global,
-                            flags_case_insensitive,
-                        });
+                    // Only treat as substitute if delimiter is a punctuation char, not a letter
+                    // (to avoid matching 'sp', 'split', 'session', etc.)
+                    if !delim.is_alphabetic() && !delim.is_whitespace() {
+                        let parts: Vec<&str> =
+                            after_s[delim.len_utf8()..].splitn(3, delim).collect();
+                        if parts.len() >= 2 {
+                            let pattern = parts[0].to_string();
+                            let replacement = parts[1].to_string();
+                            let flags = parts.get(2).copied().unwrap_or("");
+                            let flags_global = flags.contains('g');
+                            let flags_case_insensitive = flags.contains('i');
+                            return Ok(ExCommand::Substitute {
+                                range_all,
+                                pattern,
+                                replacement,
+                                flags_global,
+                                flags_case_insensitive,
+                            });
+                        }
                     }
                 }
             }
@@ -77,11 +126,19 @@ impl ExCommand {
             "q" => Ok(ExCommand::Quit { force: false }),
             "q!" => Ok(ExCommand::Quit { force: true }),
             "wq" | "x" => Ok(ExCommand::WriteQuit),
+            "wqa" | "wqall" => Ok(ExCommand::WriteQuitAll),
             "bn" => Ok(ExCommand::NextBuffer),
             "bp" => Ok(ExCommand::PrevBuffer),
             "sp" | "split" => Ok(ExCommand::Split(None)),
             "vsp" | "vsplit" => Ok(ExCommand::VSplit(None)),
             "noh" | "nohlsearch" => Ok(ExCommand::NoHighlight),
+            "terminal" | "term" => Ok(ExCommand::Terminal),
+            "Format" | "format" => Ok(ExCommand::Format),
+            "lnext" => Ok(ExCommand::LspNext),
+            "lprev" => Ok(ExCommand::LspPrev),
+            "messages" | "mes" => Ok(ExCommand::Messages),
+            "GrammarFetch" | "grammars" => Ok(ExCommand::GrammarFetch),
+            "ls" | "buffers" => Ok(ExCommand::ListBuffers),
             s if s.starts_with("sp ") || s.starts_with("split ") => {
                 let path = s
                     .split_once(' ')
@@ -141,7 +198,6 @@ impl ExCommand {
                 }
             }
             s if s.starts_with("e!") => {
-                // Force re-read
                 let path = s[2..].trim().to_string();
                 if path.is_empty() {
                     Err(CommandError::NoFileName)
@@ -222,6 +278,18 @@ mod tests {
         assert_eq!(
             ExCommand::parse("q!").unwrap(),
             ExCommand::Quit { force: true }
+        );
+        assert_eq!(ExCommand::parse("wqa").unwrap(), ExCommand::WriteQuitAll);
+    }
+
+    #[test]
+    fn parse_phase2_commands() {
+        assert_eq!(ExCommand::parse("terminal").unwrap(), ExCommand::Terminal);
+        assert_eq!(ExCommand::parse("Format").unwrap(), ExCommand::Format);
+        assert_eq!(ExCommand::parse("lnext").unwrap(), ExCommand::LspNext);
+        assert_eq!(
+            ExCommand::parse("session save myproject").unwrap(),
+            ExCommand::SessionSave(Some("myproject".to_string()))
         );
     }
 

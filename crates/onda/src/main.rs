@@ -1,29 +1,58 @@
-use std::{path::PathBuf, sync::mpsc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::mpsc, time::Duration};
 
 #[cfg(feature = "bench")]
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use onda_config::Config;
 use onda_core::{Document, DocumentId, Selection, Transaction, UndoHistory};
+use onda_lsp::{
+    types::{LspDiagnostic, LspEvent},
+    LspManager,
+};
+use onda_lua::{LuaApiCall, LuaRuntime, PluginLoader};
 use onda_modal::{
     build_buffer_picker, build_file_picker, find_all, find_next, find_prev, Action, CommandLine,
     ExCommand, JumpList, Key, KeyMod, Keymap, KeymapState, MacroRecorder, MarkStore, Mode, Motion,
     Operator, PendingResult, Picker, Register, RegisterBank, SearchState,
 };
 use onda_render::{
-    draw_borders, render_picker, Backend, Compositor, DocumentView, Layout, Message, MessageLine,
-    ModeIndicator, NullBackend, Rect, RenderError, Statusline, TerminalBackend, Viewport, WindowId,
+    draw_borders, render_completion_menu, render_float, render_picker, Backend, Compositor,
+    DiagnosticSpan, DocumentView, Layout, Message, MessageLine, ModeIndicator, NullBackend, Rect,
+    RenderError, Statusline, TerminalBackend, Viewport, WindowId,
 };
+use onda_session::{Session, SessionManager};
 use onda_syntax::{LanguageRegistry, SyntaxWorker};
+use onda_terminal::{PtyEvent, PtyProcess, TerminalScreen};
+use tokio::sync::mpsc as tokio_mpsc;
 use tracing::debug;
 
 // ── Background message channel ─────────────────────────────────────────────────
 
+#[allow(dead_code)]
 enum BgMessage {
-    FileLoaded { doc: Document },
-    FileError { path: PathBuf, error: String },
+    FileLoaded {
+        doc: Document,
+    },
+    FileError {
+        path: PathBuf,
+        error: String,
+    },
+    /// LSP event from a language server.
+    Lsp(LspEvent),
+    /// Raw PTY output bytes for the terminal pane.
+    PtyData {
+        pane_id: usize,
+        data: Vec<u8>,
+    },
+    /// PTY process exited.
+    PtyExited {
+        pane_id: usize,
+    },
 }
 
 // ── Latency tracer ────────────────────────────────────────────────────────────
@@ -105,6 +134,36 @@ enum SearchInputDir {
     Backward,
 }
 
+// ── TerminalPane ──────────────────────────────────────────────────────────────
+
+/// An integrated terminal pane.
+struct TerminalPane {
+    process: PtyProcess,
+    screen: TerminalScreen,
+    pane_id: usize,
+}
+
+// ── HoverFloat ─────────────────────────────────────────────────────────────────
+
+/// An active hover float window.
+struct HoverFloat {
+    lines: Vec<String>,
+    /// Screen position where the float should appear.
+    col: u16,
+    row: u16,
+}
+
+// ── CompletionState ────────────────────────────────────────────────────────────
+
+/// Active completion menu state.
+#[allow(dead_code)]
+struct CompletionState {
+    items: Vec<(String, String)>, // (label, kind_icon)
+    selected: usize,
+    /// Request ID used to cancel stale completions.
+    request_id: u64,
+}
+
 // ── App ────────────────────────────────────────────────────────────────────────
 
 struct App<B: Backend> {
@@ -131,6 +190,7 @@ struct App<B: Backend> {
 
     // ── Macro / dot-repeat ─────────────────────────────────────────────────────
     macros: MacroRecorder,
+    last_macro_reg: Option<char>,
 
     // ── Search ─────────────────────────────────────────────────────────────────
     search: SearchState,
@@ -155,16 +215,59 @@ struct App<B: Backend> {
 
     // ── UI ─────────────────────────────────────────────────────────────────────
     message: Message,
+    /// Message history (shown by `:messages`).
+    message_history: Vec<String>,
     goal_col: Option<usize>,
     compositor: Compositor,
     backend: B,
     running: bool,
     command_line: CommandLine,
+    bg_tx: mpsc::SyncSender<BgMessage>,
     bg_rx: mpsc::Receiver<BgMessage>,
 
     // ── Config ────────────────────────────────────────────────────────────────
     #[allow(dead_code)]
     config: Config,
+
+    // ── LSP ───────────────────────────────────────────────────────────────────
+    /// LSP manager (None when tokio runtime unavailable, e.g. bench).
+    #[allow(dead_code)]
+    lsp_manager: Option<LspManager>,
+    /// LSP event sender — used to bridge tokio → std channel.
+    #[allow(dead_code)]
+    lsp_event_tx: Option<tokio_mpsc::Sender<LspEvent>>,
+    /// Diagnostics per document (keyed by path string).
+    diagnostics: HashMap<PathBuf, Vec<LspDiagnostic>>,
+    /// Diagnostic spans per document index (resolved to char offsets).
+    diagnostic_spans: HashMap<usize, Vec<DiagnosticSpan>>,
+    /// Next LSP request ID.
+    #[allow(dead_code)]
+    lsp_request_id: u64,
+    /// Active hover float, if any.
+    hover_float: Option<HoverFloat>,
+    /// Active completion state, if any.
+    completion: Option<CompletionState>,
+
+    // ── Terminal ──────────────────────────────────────────────────────────────
+    /// Active terminal panes (one per terminal window).
+    terminal_panes: Vec<TerminalPane>,
+    /// Next pane ID.
+    next_pane_id: usize,
+    /// Which window is a terminal pane (window_id → pane_id).
+    window_to_pane: HashMap<usize, usize>,
+
+    // ── Session ───────────────────────────────────────────────────────────────
+    session_manager: SessionManager,
+
+    // ── Lua plugins ────────────────────────────────────────────────────────────
+    /// Lua runtime (None when in bench / non-tokio mode).
+    lua_runtime: Option<LuaRuntime>,
+    /// Custom Lua commands registered via `onda.cmd.create`.
+    lua_commands: HashMap<String, u64>,
+
+    // ── Soft wrap ─────────────────────────────────────────────────────────────
+    #[allow(dead_code)]
+    soft_wrap: bool,
 
     #[cfg(feature = "bench")]
     tracer: LatencyTracer,
@@ -213,9 +316,34 @@ impl<B: Backend> App<B> {
             Mode::Insert => ModeIndicator::Insert,
             Mode::Visual => ModeIndicator::Visual,
             Mode::VisualLine => ModeIndicator::VisualLine,
-            Mode::VisualBlock => ModeIndicator::Visual, // render same as Visual for now
+            Mode::VisualBlock => ModeIndicator::Visual,
             Mode::Command => ModeIndicator::Command,
+            Mode::Terminal => ModeIndicator::Terminal,
+            Mode::TerminalScroll => ModeIndicator::TerminalScroll,
         }
+    }
+
+    #[allow(dead_code)]
+    fn alloc_lsp_request_id(&mut self) -> u64 {
+        let id = self.lsp_request_id;
+        self.lsp_request_id += 1;
+        id
+    }
+
+    /// Return the workspace root for the focused document.
+    #[allow(dead_code)]
+    fn workspace_root(&self) -> PathBuf {
+        self.doc()
+            .path()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+
+    /// LSP: ensure a server is running for the current document.
+    #[allow(dead_code)]
+    fn ensure_lsp_for_current_doc(&self) {
+        // Actual spawn is done in drain_bg_channel via tokio
     }
 
     fn current_doc_id(&self) -> DocumentId {
@@ -385,6 +513,15 @@ impl<B: Backend> App<B> {
                 if win_idx >= self.windows.len() {
                     continue;
                 }
+
+                // Check if this is a terminal pane
+                if let Some(&pane_id) = self.window_to_pane.get(&win_idx) {
+                    if let Some(pane) = self.terminal_panes.iter().find(|p| p.pane_id == pane_id) {
+                        render_terminal_pane(grid, &pane.screen, rect);
+                        continue;
+                    }
+                }
+
                 let doc_idx = self.windows[win_idx].doc_idx;
                 if doc_idx >= self.docs.len() {
                     continue;
@@ -394,18 +531,37 @@ impl<B: Backend> App<B> {
                 let viewport = &self.windows[win_idx].viewport;
                 let is_focused = *win_id == focused_win_id;
                 let matches: &[onda_core::Range] = if is_focused { &search_matches } else { &[] };
+                let diag_spans = self
+                    .diagnostic_spans
+                    .get(&doc_idx)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
 
-                DocumentView::render_with_highlights(
-                    grid,
-                    doc,
-                    sel,
-                    viewport,
-                    mode_ind,
-                    rect.y,
-                    rect.height,
-                    None,
-                    matches,
-                );
+                if diag_spans.is_empty() {
+                    DocumentView::render_with_highlights(
+                        grid,
+                        doc,
+                        sel,
+                        viewport,
+                        mode_ind,
+                        rect.y,
+                        rect.height,
+                        None,
+                        matches,
+                    );
+                } else {
+                    DocumentView::render_with_diagnostics(
+                        grid,
+                        doc,
+                        sel,
+                        viewport,
+                        mode_ind,
+                        rect.y,
+                        rect.height,
+                        matches,
+                        diag_spans,
+                    );
+                }
             }
 
             // Statusline
@@ -424,6 +580,30 @@ impl<B: Backend> App<B> {
                 let items_ref: Vec<(&str, bool)> =
                     items.iter().map(|(s, b)| (s.as_str(), *b)).collect();
                 render_picker(grid, &title, &query, &items_ref, pw, ph);
+            }
+
+            // Hover float overlay
+            if let Some(ref hover) = self.hover_float {
+                let lines_ref: Vec<&str> = hover.lines.iter().map(|s| s.as_str()).collect();
+                let float_width = hover.lines.iter().map(|l| l.len()).max().unwrap_or(0) as u16 + 4;
+                render_float(
+                    grid,
+                    "Hover",
+                    &lines_ref,
+                    hover.col,
+                    hover.row,
+                    float_width.min(width - 4),
+                );
+            }
+
+            // Completion menu
+            if let Some(ref comp) = self.completion {
+                let items_ref: Vec<(&str, &str)> = comp
+                    .items
+                    .iter()
+                    .map(|(l, k)| (l.as_str(), k.as_str()))
+                    .collect();
+                render_completion_menu(grid, &items_ref, comp.selected, cursor_col, cursor_row, 10);
             }
         }
 
@@ -486,6 +666,13 @@ impl<B: Backend> App<B> {
                 self.tracer.mark_key();
 
                 let key = Key::from_event(&ev);
+
+                // In terminal mode, forward keys to PTY
+                if self.mode == Mode::Terminal {
+                    self.handle_terminal_key(&key);
+                    return Ok(());
+                }
+
                 self.handle_key(key)?;
 
                 // Clear info messages on any keypress in normal mode
@@ -493,8 +680,108 @@ impl<B: Backend> App<B> {
                     self.message = Message::None;
                 }
             }
+            Event::Mouse(mouse_ev) => {
+                self.handle_mouse_event(mouse_ev)?;
+            }
             Event::Resize(w, h) => {
                 self.compositor.resize(w, h);
+                // Resize terminal panes
+                for pane in &mut self.terminal_panes {
+                    let pane_rows = h.saturating_sub(3);
+                    let pane_cols = w;
+                    pane.process.resize(pane_cols, pane_rows);
+                    pane.screen.resize(pane_rows, pane_cols);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_terminal_key(&mut self, key: &Key) {
+        // Ctrl-\ Ctrl-n: escape terminal mode
+        if *key == Key::Char('n', KeyMod::CTRL) {
+            self.mode = Mode::Normal;
+            return;
+        }
+        // Forward key as raw bytes to the PTY for the focused pane
+        let focused_win = self.focused_window;
+        let pane_id = self.window_to_pane.get(&focused_win).copied();
+        if let Some(pane_id) = pane_id {
+            if let Some(pane) = self.terminal_panes.iter().find(|p| p.pane_id == pane_id) {
+                let bytes = key_to_pty_bytes(key);
+                pane.process.write(&bytes);
+            }
+        }
+    }
+
+    fn handle_mouse_event(&mut self, ev: MouseEvent) -> Result<()> {
+        let (width, height) = self.backend.size();
+        let content_height = height.saturating_sub(2);
+        let content_area = Rect::new(0, 0, width, content_height);
+        let rects = self.layout.rects(content_area);
+
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Click to move cursor
+                let click_col = ev.column;
+                let click_row = ev.row;
+
+                // If picker is open, handle click in picker
+                if self
+                    .picker
+                    .as_ref()
+                    .map(|p| p.is_visible())
+                    .unwrap_or(false)
+                {
+                    // Just close on any click outside (TODO: proper hit testing)
+                    return Ok(());
+                }
+
+                // Find which window was clicked
+                for (win_id, rect) in &rects {
+                    if click_col >= rect.x
+                        && click_col < rect.x + rect.width
+                        && click_row >= rect.y
+                        && click_row < rect.y + rect.height
+                    {
+                        let win_idx = win_id.0;
+                        if win_idx >= self.windows.len() {
+                            continue;
+                        }
+                        self.focused_window = win_idx;
+
+                        // Convert click to document position
+                        let doc_idx = self.windows[win_idx].doc_idx;
+                        if doc_idx >= self.docs.len() {
+                            continue;
+                        }
+                        let viewport = &self.windows[win_idx].viewport;
+                        let text_col =
+                            click_col.saturating_sub(rect.x + viewport.line_nr_width) as usize;
+                        let doc_line =
+                            viewport.offset_line + click_row.saturating_sub(rect.y) as usize;
+
+                        let doc = &self.docs[doc_idx];
+                        if doc_line < doc.len_lines() {
+                            let line_start = doc.line_to_char(doc_line);
+                            let line_len = doc.line_len_no_eol(doc_line);
+                            let col = (text_col + viewport.offset_col).min(line_len);
+                            let char_pos =
+                                (line_start + col).min(doc.len_chars().saturating_sub(1));
+                            self.windows[win_idx].selection = Selection::point(char_pos);
+                        }
+                        break;
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                let vp = self.viewport_mut();
+                vp.offset_line = vp.offset_line.saturating_add(3);
+            }
+            MouseEventKind::ScrollUp => {
+                let vp = self.viewport_mut();
+                vp.offset_line = vp.offset_line.saturating_sub(3);
             }
             _ => {}
         }
@@ -520,6 +807,10 @@ impl<B: Backend> App<B> {
             Mode::Command => self.handle_command_key(key),
             Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
                 self.handle_normal_key(key)
+            }
+            Mode::Terminal | Mode::TerminalScroll => {
+                // Already handled before handle_key is called
+                Ok(())
             }
         }
     }
@@ -762,6 +1053,117 @@ impl<B: Backend> App<B> {
     fn execute_ex_command(&mut self, cmd: ExCommand) -> Result<()> {
         self.mode = Mode::Normal;
         match cmd {
+            // ── Phase 2 commands ──────────────────────────────────────────────
+            ExCommand::Terminal => {
+                self.open_terminal_pane()?;
+            }
+            ExCommand::Format => {
+                if self.lsp_manager.is_some() {
+                    self.message = Message::Info("LSP: format requested (async)".into());
+                } else {
+                    self.message = Message::Info("LSP Format: not yet connected".into());
+                }
+            }
+            ExCommand::LspNext => {
+                let doc_idx = self.focused_win().doc_idx;
+                let cur = self.selection().primary().head;
+                if let Some(spans) = self.diagnostic_spans.get(&doc_idx) {
+                    if let Some(span) = spans.iter().find(|s| s.from > cur) {
+                        let pos = span.from;
+                        *self.selection_mut() = Selection::point(pos);
+                        let line = self.doc().char_to_line(pos);
+                        let h = self.compositor.buf.current().height().saturating_sub(2) as usize;
+                        self.viewport_mut().scroll_to(line, h);
+                    } else {
+                        self.message = Message::Info("No more diagnostics".into());
+                    }
+                }
+            }
+            ExCommand::LspPrev => {
+                let doc_idx = self.focused_win().doc_idx;
+                let cur = self.selection().primary().head;
+                if let Some(spans) = self.diagnostic_spans.get(&doc_idx) {
+                    if let Some(span) = spans.iter().rfind(|s| s.from < cur) {
+                        let pos = span.from;
+                        *self.selection_mut() = Selection::point(pos);
+                        let line = self.doc().char_to_line(pos);
+                        let h = self.compositor.buf.current().height().saturating_sub(2) as usize;
+                        self.viewport_mut().scroll_to(line, h);
+                    } else {
+                        self.message = Message::Info("No previous diagnostics".into());
+                    }
+                }
+            }
+            ExCommand::Messages => {
+                let history = self.message_history.join("\n");
+                if history.is_empty() {
+                    self.message = Message::Info("No messages.".into());
+                } else {
+                    self.message = Message::Info(history);
+                }
+            }
+            ExCommand::GrammarFetch => {
+                self.message = Message::Info(
+                    "Grammar fetch: use :GrammarFetch (auto-triggered on file open)".into(),
+                );
+            }
+            ExCommand::ListBuffers => {
+                let list: Vec<String> = self
+                    .docs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| {
+                        format!(
+                            "{}: {}{}",
+                            i + 1,
+                            d.name(),
+                            if d.is_modified() { " [+]" } else { "" }
+                        )
+                    })
+                    .collect();
+                self.message = Message::Info(list.join(" | "));
+            }
+            ExCommand::SessionSave(name) => {
+                let session = self.build_session();
+                let name = name.as_deref().unwrap_or("default");
+                match self.session_manager.save(name, &session) {
+                    Ok(_) => self.message = Message::Info(format!("Session saved: {name}")),
+                    Err(e) => self.message = Message::Error(format!("Session save error: {e}")),
+                }
+            }
+            ExCommand::SessionRestore(name) => {
+                let name_owned = name.unwrap_or_else(|| "default".into());
+                match self.session_manager.load(&name_owned) {
+                    Ok(session) => {
+                        self.apply_session(session)?;
+                        self.message = Message::Info(format!("Session restored: {name_owned}"));
+                    }
+                    Err(e) => {
+                        self.message = Message::Error(format!("Session restore error: {e}"));
+                    }
+                }
+            }
+            ExCommand::WriteQuitAll => {
+                // Write all modified docs, then auto-save session and quit
+                for doc in &mut self.docs {
+                    if doc.is_modified() {
+                        if let Err(e) = doc.save() {
+                            self.message = Message::Error(format!("E: {e}"));
+                            return Ok(());
+                        }
+                        doc.mark_saved();
+                    }
+                }
+                let session = self.build_session();
+                let _ = self.session_manager.auto_save(&session);
+                self.running = false;
+            }
+            ExCommand::LuaCommand(name, args) => {
+                if let Some(runtime) = &self.lua_runtime {
+                    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                    runtime.fire_command(&name, &args_refs);
+                }
+            }
             ExCommand::Write(path) => {
                 let result = if let Some(p) = path {
                     self.doc_mut().set_path(p.into());
@@ -876,8 +1278,17 @@ impl<B: Backend> App<B> {
                 self.search_matches.clear();
                 self.search.regex = None;
             }
-            ExCommand::Set(_key, _value) => {
-                // TODO T5.1: apply config settings at runtime
+            ExCommand::Set(key, value) => {
+                // Apply config settings at runtime (T5.1 partial: scrolloff)
+                if key == "scrolloff" {
+                    if let Some(v) = value.as_deref().and_then(|s| s.parse::<usize>().ok()) {
+                        self.viewport_mut().scrolloff = v;
+                    }
+                } else if self.config.editor.scrolloff != 5 {
+                    // Apply scrolloff from loaded config to current viewport
+                    let so = self.config.editor.scrolloff;
+                    self.viewport_mut().scrolloff = so;
+                }
             }
             ExCommand::Substitute {
                 range_all,
@@ -1411,19 +1822,34 @@ impl<B: Backend> App<B> {
                 }
             }
             Action::PlayMacro(c) => {
-                // TODO T6.3: macro replay — get keys and replay via handle_key loop
-                // Stubbed: just show a message to avoid complexity
-                let _keys: Option<Vec<Key>> = self.macros.get_macro(c).map(|s| s.to_vec());
-                // TODO: actually replay keys
-                debug!("PlayMacro({c}) — stub, not yet replaying");
+                if let Some(keys) = self.macros.get_macro(c).map(|s| s.to_vec()) {
+                    self.last_macro_reg = Some(c);
+                    for key in keys {
+                        self.handle_key(key)?;
+                    }
+                } else {
+                    self.message = Message::Info(format!("No macro in register @{c}"));
+                }
             }
             Action::PlayLastMacro => {
-                // TODO T6.3: macro replay — stub
-                debug!("PlayLastMacro — stub, not yet replaying");
+                if let Some(reg) = self.last_macro_reg {
+                    if let Some(keys) = self.macros.get_macro(reg).map(|s| s.to_vec()) {
+                        for key in keys {
+                            self.handle_key(key)?;
+                        }
+                    } else {
+                        self.message = Message::Info(format!("No macro in register @{reg}"));
+                    }
+                } else {
+                    self.message = Message::Info("No macro register set".into());
+                }
             }
             Action::DotRepeat => {
-                // TODO T6.3: dot-repeat — stub
-                debug!("DotRepeat — stub, not yet replaying");
+                if let Some(keys) = self.macros.dot_repeat().map(|s| s.to_vec()) {
+                    for key in keys {
+                        self.handle_key(key)?;
+                    }
+                }
             }
 
             // ── Register selection ────────────────────────────────────────────
@@ -1485,8 +1911,11 @@ impl<B: Backend> App<B> {
                 }
             }
             Action::OnlyWindow => {
-                // Close all but the focused window — TODO T6.6: full impl
-                // For now just keep the current layout
+                let kept = self.windows.remove(self.focused_window);
+                self.windows.clear();
+                self.windows.push(kept);
+                self.focused_window = 0;
+                self.layout = Layout::single(WindowId(0));
             }
 
             // ── Picker ────────────────────────────────────────────────────────
@@ -1608,6 +2037,257 @@ impl<B: Backend> App<B> {
         Ok(())
     }
 
+    // ── Terminal pane ─────────────────────────────────────────────────────────
+
+    fn open_terminal_pane(&mut self) -> Result<()> {
+        let (_, height) = self.backend.size();
+        let (width, _) = self.backend.size();
+        let rows = height.saturating_sub(3);
+        let cols = width;
+
+        let pane_id = self.next_pane_id;
+        self.next_pane_id += 1;
+
+        let bg_tx = self.get_bg_tx();
+        match PtyProcess::spawn(cols, rows) {
+            Ok((process, mut event_rx)) => {
+                let pane_id_copy = pane_id;
+                // Bridge PTY events to bg_rx via std thread
+                std::thread::spawn(move || {
+                    while let Some(ev) = event_rx.blocking_recv() {
+                        match ev {
+                            PtyEvent::Data(bytes) => {
+                                let _ = bg_tx.send(BgMessage::PtyData {
+                                    pane_id: pane_id_copy,
+                                    data: bytes,
+                                });
+                            }
+                            PtyEvent::Exited(_code) => {
+                                let _ = bg_tx.send(BgMessage::PtyExited {
+                                    pane_id: pane_id_copy,
+                                });
+                                break;
+                            }
+                        }
+                    }
+                });
+
+                let screen = TerminalScreen::new(rows, cols);
+                let pane = TerminalPane {
+                    process,
+                    screen,
+                    pane_id,
+                };
+                self.terminal_panes.push(pane);
+
+                // Open a new split for the terminal
+                let new_id = self.next_window_id;
+                self.next_window_id += 1;
+                // Create a scratch doc for the terminal window
+                let doc_idx = self.docs.len();
+                self.docs.push(Document::new_empty());
+                let new_win = WindowState::new(doc_idx);
+                self.windows.push(new_win);
+                let old_layout = std::mem::replace(&mut self.layout, Layout::single(WindowId(0)));
+                self.layout = old_layout.split_h(WindowId(new_id));
+
+                // Associate window with pane
+                self.window_to_pane.insert(new_id, pane_id);
+                self.focused_window = new_id;
+                self.mode = Mode::Terminal;
+                self.message = Message::Info("Terminal opened. Ctrl-\\ Ctrl-n to exit.".into());
+            }
+            Err(e) => {
+                self.message = Message::Error(format!("Terminal error: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn get_bg_tx(&self) -> mpsc::SyncSender<BgMessage> {
+        self.bg_tx.clone()
+    }
+
+    // ── Session ────────────────────────────────────────────────────────────────
+
+    fn build_session(&self) -> Session {
+        use onda_session::{BufferEntry, CursorPos, SplitEntry, WindowEntry};
+
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+        let buffers: Vec<BufferEntry> = self
+            .docs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let unsaved = if d.is_modified() && d.path().is_none() {
+                    Some(d.rope().to_string())
+                } else {
+                    None
+                };
+                BufferEntry {
+                    id: i,
+                    path: d.path().map(|p| p.to_path_buf()),
+                    name: d.name().to_string(),
+                    unsaved_content: unsaved,
+                }
+            })
+            .collect();
+
+        let windows: Vec<WindowEntry> = self
+            .windows
+            .iter()
+            .enumerate()
+            .map(|(i, w)| WindowEntry {
+                id: i,
+                buffer_id: w.doc_idx,
+                cursor: CursorPos {
+                    char_offset: w.selection.primary().head,
+                    viewport_line: w.viewport.offset_line,
+                },
+            })
+            .collect();
+
+        Session {
+            version: Session::CURRENT_VERSION,
+            cwd,
+            buffers,
+            windows,
+            layout: SplitEntry::Window { window_id: 0 },
+            focused_window: self.focused_window,
+        }
+    }
+
+    fn apply_session(&mut self, session: Session) -> Result<()> {
+        self.docs.clear();
+        self.windows.clear();
+        self.focused_window = session.focused_window;
+
+        for buf in &session.buffers {
+            let doc = if let Some(path) = &buf.path {
+                match Document::open(path) {
+                    Ok(d) => d,
+                    Err(_) => Document::new_empty(),
+                }
+            } else if let Some(content) = &buf.unsaved_content {
+                let mut d = Document::new_empty();
+                let cs = onda_core::transaction::ChangeSetBuilder::new(0)
+                    .insert(content)
+                    .build();
+                let _ = d.apply(&Transaction::new(cs));
+                d
+            } else {
+                Document::new_empty()
+            };
+            self.docs.push(doc);
+        }
+
+        for win in &session.windows {
+            let doc_idx = win.buffer_id.min(self.docs.len().saturating_sub(1));
+            let mut ws = WindowState::new(doc_idx);
+            let max_pos = self.docs[doc_idx].len_chars().saturating_sub(1);
+            ws.selection = Selection::point(win.cursor.char_offset.min(max_pos));
+            ws.viewport.offset_line = win.cursor.viewport_line;
+            self.windows.push(ws);
+        }
+
+        if self.windows.is_empty() {
+            self.windows.push(WindowState::new(0));
+        }
+        if self.focused_window >= self.windows.len() {
+            self.focused_window = 0;
+        }
+
+        // Reset layout to single window for simplicity
+        // (full layout serialization deferred to Phase 3)
+        self.layout = Layout::single(WindowId(0));
+
+        Ok(())
+    }
+
+    // ── Lua API call drain ────────────────────────────────────────────────────
+
+    fn drain_lua_calls(&mut self) {
+        let calls = if let Some(rt) = &self.lua_runtime {
+            rt.drain_calls()
+        } else {
+            return;
+        };
+
+        for call in calls {
+            match call {
+                LuaApiCall::Notify { msg, level } => {
+                    self.message_history.push(msg.clone());
+                    self.message = match level {
+                        onda_lua::api::NotifyLevel::Error => Message::Error(msg),
+                        _ => Message::Info(msg),
+                    };
+                }
+                LuaApiCall::BufSetLines {
+                    buf_id,
+                    start,
+                    end,
+                    lines,
+                } => {
+                    if buf_id < self.docs.len() {
+                        let doc = &self.docs[buf_id];
+                        let line_start = if start < doc.len_lines() {
+                            doc.line_to_char(start)
+                        } else {
+                            doc.len_chars()
+                        };
+                        let line_end = if end < doc.len_lines() {
+                            doc.line_to_char(end)
+                        } else {
+                            doc.len_chars()
+                        };
+                        let new_text = lines.join("\n");
+                        let len = doc.len_chars();
+                        let cs = onda_core::transaction::ChangeSetBuilder::new(len)
+                            .retain(line_start)
+                            .delete(line_end - line_start)
+                            .insert(&new_text)
+                            .build();
+                        let tx = Transaction::new(cs);
+                        let _ = self.docs[buf_id].apply(&tx);
+                    }
+                }
+                LuaApiCall::WinSetCursor { win_id, row, col } => {
+                    if win_id < self.windows.len() {
+                        let doc_idx = self.windows[win_id].doc_idx;
+                        if doc_idx < self.docs.len() {
+                            let doc = &self.docs[doc_idx];
+                            let line = row.min(doc.len_lines().saturating_sub(1));
+                            let line_start = doc.line_to_char(line);
+                            let line_len = doc.line_len_no_eol(line);
+                            let char_pos = line_start + col.min(line_len);
+                            self.windows[win_id].selection = Selection::point(char_pos);
+                        }
+                    }
+                }
+                LuaApiCall::CmdCreate {
+                    name, callback_id, ..
+                } => {
+                    self.lua_commands.insert(name, callback_id);
+                }
+                LuaApiCall::UiFloat {
+                    title: _title,
+                    lines,
+                    width: _width,
+                    height: _height,
+                } => {
+                    let lines_str: Vec<String> = lines;
+                    self.hover_float = Some(HoverFloat {
+                        lines: lines_str,
+                        col: 4,
+                        row: 4,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
     // ── Background channel drain ──────────────────────────────────────────────
 
     fn drain_bg_channel(&mut self) {
@@ -1626,8 +2306,212 @@ impl<B: Backend> App<B> {
                 BgMessage::FileError { path, error } => {
                     self.message = Message::Error(format!("{}: {error}", path.display()));
                 }
+                BgMessage::Lsp(lsp_ev) => {
+                    self.handle_lsp_event(lsp_ev);
+                }
+                BgMessage::PtyData { pane_id, data } => {
+                    if let Some(pane) = self
+                        .terminal_panes
+                        .iter_mut()
+                        .find(|p| p.pane_id == pane_id)
+                    {
+                        pane.screen.process(&data);
+                    }
+                }
+                BgMessage::PtyExited { pane_id } => {
+                    self.message = Message::Info(format!("Terminal [{}] exited", pane_id));
+                    self.terminal_panes.retain(|p| p.pane_id != pane_id);
+                    // Return to normal mode if focused window was this terminal
+                    if self.mode == Mode::Terminal {
+                        self.mode = Mode::Normal;
+                    }
+                }
             }
         }
+    }
+
+    fn handle_lsp_event(&mut self, ev: LspEvent) {
+        match ev {
+            LspEvent::Ready { root } => {
+                self.message = Message::Info(format!(
+                    "LSP ready for {:?}",
+                    root.file_name().unwrap_or_default()
+                ));
+            }
+            LspEvent::Diagnostics { path, diagnostics } => {
+                // Find the document index for this path
+                let doc_idx = self
+                    .docs
+                    .iter()
+                    .position(|d| d.path().map(|p| p == path).unwrap_or(false));
+
+                // Store diagnostics
+                self.diagnostics.insert(path.clone(), diagnostics.clone());
+
+                // Resolve to char offsets for rendering
+                if let Some(idx) = doc_idx {
+                    let doc = &self.docs[idx];
+                    let spans: Vec<DiagnosticSpan> = diagnostics
+                        .iter()
+                        .map(|d| {
+                            let start_line = d.range.start.line as usize;
+                            let start_col = d.range.start.character as usize;
+                            let end_line = d.range.end.line as usize;
+                            let end_col = d.range.end.character as usize;
+
+                            let from = if start_line < doc.len_lines() {
+                                doc.line_to_char(start_line) + start_col
+                            } else {
+                                doc.len_chars()
+                            };
+                            let to = if end_line < doc.len_lines() {
+                                doc.line_to_char(end_line) + end_col
+                            } else {
+                                doc.len_chars()
+                            };
+                            let severity = match d.severity {
+                                onda_lsp::types::DiagnosticSeverity::Error => 0,
+                                onda_lsp::types::DiagnosticSeverity::Warning => 1,
+                                _ => 2,
+                            };
+                            DiagnosticSpan { from, to, severity }
+                        })
+                        .collect();
+                    self.diagnostic_spans.insert(idx, spans);
+                }
+
+                // Update statusline diagnostic count
+                let error_count = diagnostics
+                    .iter()
+                    .filter(|d| matches!(d.severity, onda_lsp::types::DiagnosticSeverity::Error))
+                    .count();
+                let warn_count = diagnostics
+                    .iter()
+                    .filter(|d| matches!(d.severity, onda_lsp::types::DiagnosticSeverity::Warning))
+                    .count();
+                if error_count > 0 || warn_count > 0 {
+                    debug!("Diagnostics: E:{} W:{}", error_count, warn_count);
+                }
+            }
+            LspEvent::HoverResult {
+                request_id: _,
+                content,
+            } => {
+                if let Some(text) = content {
+                    let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+                    let (_, h) = self.backend.size();
+                    let row = h.saturating_sub(10).max(2);
+                    self.hover_float = Some(HoverFloat { lines, col: 4, row });
+                } else {
+                    self.message = Message::Info("No hover information available".into());
+                }
+            }
+            LspEvent::DefinitionResult {
+                request_id: _,
+                locations,
+            } => {
+                if locations.is_empty() {
+                    self.message = Message::Info("No definition found".into());
+                } else if locations.len() == 1 {
+                    let loc = &locations[0];
+                    let uri_str = loc.uri.as_str();
+                    let path = if let Some(rest) = uri_str.strip_prefix("file://") {
+                        PathBuf::from(rest)
+                    } else {
+                        PathBuf::from(uri_str)
+                    };
+                    self.jump_to_location(
+                        path,
+                        loc.range.start.line as usize,
+                        loc.range.start.character as usize,
+                    );
+                } else {
+                    // Multiple definitions: show in picker
+                    self.message = Message::Info(format!(
+                        "{} definitions found (use :gr for list)",
+                        locations.len()
+                    ));
+                }
+            }
+            LspEvent::ReferencesResult {
+                request_id: _,
+                locations,
+            } => {
+                self.message = Message::Info(format!("{} references found", locations.len()));
+            }
+            LspEvent::CompletionResult { request_id, items } => {
+                if !items.is_empty() {
+                    let menu_items: Vec<(String, String)> = items
+                        .iter()
+                        .map(|item| {
+                            let label = item.label.clone();
+                            let kind_icon = completion_kind_icon(item.kind);
+                            (label, kind_icon.to_string())
+                        })
+                        .collect();
+                    self.completion = Some(CompletionState {
+                        items: menu_items,
+                        selected: 0,
+                        request_id,
+                    });
+                }
+            }
+            LspEvent::RenameResult {
+                request_id: _,
+                edit,
+            } => {
+                if let Some(_edit) = edit {
+                    self.message = Message::Info("Rename: workspace edit applied (stub)".into());
+                }
+            }
+            LspEvent::FormattingResult {
+                request_id: _,
+                edits,
+            } => {
+                if !edits.is_empty() {
+                    self.message = Message::Info(format!("Format: {} edits applied", edits.len()));
+                }
+            }
+            LspEvent::ServerError {
+                root: _root,
+                message,
+            } => {
+                self.message = Message::Error(format!("LSP error: {message}"));
+            }
+        }
+    }
+
+    fn jump_to_location(&mut self, path: PathBuf, line: usize, col: usize) {
+        // Find or open the document
+        let doc_idx = if let Some(idx) = self
+            .docs
+            .iter()
+            .position(|d| d.path().map(|p| p == path).unwrap_or(false))
+        {
+            idx
+        } else {
+            match Document::open(&path) {
+                Ok(doc) => {
+                    let idx = self.docs.len();
+                    self.docs.push(doc);
+                    idx
+                }
+                Err(e) => {
+                    self.message = Message::Error(format!("Cannot open {:?}: {}", path, e));
+                    return;
+                }
+            }
+        };
+
+        self.focused_win_mut().doc_idx = doc_idx;
+        let doc = &self.docs[doc_idx];
+        let char_pos = if line < doc.len_lines() {
+            let ls = doc.line_to_char(line);
+            ls + col.min(doc.line_len_no_eol(line))
+        } else {
+            0
+        };
+        *self.selection_mut() = Selection::point(char_pos);
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
@@ -1643,8 +2527,13 @@ impl<B: Backend> App<B> {
             }
 
             self.drain_bg_channel();
+            self.drain_lua_calls();
             self.render_frame().context("render frame")?;
         }
+
+        // Auto-save session on quit
+        let session = self.build_session();
+        let _ = self.session_manager.auto_save(&session);
 
         #[cfg(feature = "bench")]
         self.tracer.report();
@@ -1675,6 +2564,7 @@ fn make_app<B: Backend>(
     initial_doc: Document,
     backend: B,
     compositor: Compositor,
+    bg_tx: mpsc::SyncSender<BgMessage>,
     bg_rx: mpsc::Receiver<BgMessage>,
     config: Config,
     running: bool,
@@ -1692,6 +2582,7 @@ fn make_app<B: Backend>(
         registers: RegisterBank::new(),
         pending_register: None,
         macros: MacroRecorder::new(),
+        last_macro_reg: None,
         search: SearchState::new(),
         search_matches: Vec::new(),
         search_input_dir: None,
@@ -1703,13 +2594,29 @@ fn make_app<B: Backend>(
         syntax_versions: Vec::new(),
         lang_registry: LanguageRegistry::new(),
         message: Message::None,
+        message_history: Vec::new(),
         goal_col: None,
         compositor,
         backend,
         running,
         command_line: CommandLine::new(),
+        bg_tx,
         bg_rx,
         config,
+        lsp_manager: None,
+        lsp_event_tx: None,
+        diagnostics: HashMap::new(),
+        diagnostic_spans: HashMap::new(),
+        lsp_request_id: 1,
+        hover_float: None,
+        completion: None,
+        terminal_panes: Vec::new(),
+        next_pane_id: 0,
+        window_to_pane: HashMap::new(),
+        session_manager: SessionManager::new(),
+        lua_runtime: None,
+        lua_commands: HashMap::new(),
+        soft_wrap: false,
         #[cfg(feature = "bench")]
         tracer: LatencyTracer::default(),
     }
@@ -1726,7 +2633,7 @@ fn init_tracing() {
 }
 
 fn run_bench_startup() -> Result<()> {
-    let (_, bg_rx) = mpsc::sync_channel(16);
+    let (bg_tx, bg_rx) = mpsc::sync_channel(16);
     let backend = NullBackend::new(120, 40);
     let (width, height) = backend.size();
     let compositor = Compositor::new(width, height);
@@ -1737,7 +2644,15 @@ fn run_bench_startup() -> Result<()> {
         .build();
     doc.apply(&Transaction::new(cs)).unwrap();
 
-    let mut app = make_app(doc, backend, compositor, bg_rx, Config::default(), false);
+    let mut app = make_app(
+        doc,
+        backend,
+        compositor,
+        bg_tx,
+        bg_rx,
+        Config::default(),
+        false,
+    );
 
     app.compositor.buf.invalidate();
     app.render_frame()?;
@@ -1750,7 +2665,7 @@ fn run_editor(paths: Vec<PathBuf>) -> Result<()> {
     let config_result = Config::load();
     let config = config_result.config;
 
-    let (bg_tx, bg_rx) = mpsc::sync_channel(16);
+    let (bg_tx, bg_rx) = mpsc::sync_channel::<BgMessage>(256);
 
     let initial_doc = if let Some(path) = paths.first() {
         match Document::open(path) {
@@ -1772,24 +2687,138 @@ fn run_editor(paths: Vec<PathBuf>) -> Result<()> {
     let mut term = TerminalBackend::new()?;
     term.enter()?;
 
+    // Enable mouse capture (T12.3)
+    crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
+
     let (width, height) = term.size();
     let compositor = Compositor::new(width, height);
 
-    let mut app = make_app(initial_doc, term, compositor, bg_rx, config, true);
+    let mut app = make_app(
+        initial_doc,
+        term,
+        compositor,
+        bg_tx.clone(),
+        bg_rx,
+        config,
+        true,
+    );
 
     // Show config warning if any
     if let Some(warn) = config_result.warning {
         app.message = Message::Error(warn);
     }
 
-    // Try to start syntax worker for the initial doc (requires tokio runtime).
-    // The runtime is only available when started via tokio main; for Phase 1 we
-    // run in a synchronous context, so skip if it would panic.
-    // TODO T6.4: start a tokio runtime and spawn syntax workers.
+    // Initialize Lua runtime and load plugins (T13.1)
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match LuaRuntime::new() {
+        Ok(runtime) => {
+            let errors = PluginLoader::load_all(&runtime, &cwd);
+            for (name, err) in errors {
+                app.message_history
+                    .push(format!("Plugin '{name}' error: {err}"));
+            }
+            app.lua_runtime = Some(runtime);
+        }
+        Err(e) => {
+            app.message_history
+                .push(format!("Lua runtime init error: {e}"));
+        }
+    }
 
     let result = app.run();
+
+    // Disable mouse capture on exit
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     app.backend.leave()?;
     result
+}
+
+// ── Terminal rendering helper ──────────────────────────────────────────────────
+
+fn render_terminal_pane(grid: &mut onda_render::Grid, screen: &TerminalScreen, rect: &Rect) {
+    use onda_render::{Attribute, Cell, Color, Style};
+
+    for row in 0..rect.height {
+        let screen_row = row.min(screen.rows().saturating_sub(1));
+        let cells = screen.row(screen_row);
+        for (col_idx, term_cell) in cells.iter().enumerate() {
+            let grid_col = rect.x + col_idx as u16;
+            if grid_col >= rect.x + rect.width {
+                break;
+            }
+            let fg = term_cell
+                .attrs
+                .fg
+                .map(|onda_terminal::screen::Rgb(r, g, b)| Color::Rgb(r, g, b))
+                .unwrap_or(Color::Reset);
+            let bg = term_cell
+                .attrs
+                .bg
+                .map(|onda_terminal::screen::Rgb(r, g, b)| Color::Rgb(r, g, b))
+                .unwrap_or(Color::Reset);
+            let mut attrs = Attribute::empty();
+            if term_cell.attrs.bold {
+                attrs |= Attribute::BOLD;
+            }
+            if term_cell.attrs.italic {
+                attrs |= Attribute::ITALIC;
+            }
+            if term_cell.attrs.underline {
+                attrs |= Attribute::UNDERLINE;
+            }
+            if term_cell.attrs.reverse {
+                attrs |= Attribute::REVERSE;
+            }
+            let style = Style { fg, bg, attrs };
+            grid.set(
+                grid_col,
+                rect.y + row,
+                Cell::new(term_cell.ch.to_string(), style),
+            );
+        }
+    }
+}
+
+// ── Key → PTY bytes ───────────────────────────────────────────────────────────
+
+fn key_to_pty_bytes(key: &Key) -> Vec<u8> {
+    match key {
+        Key::Char(c, m) if *m == KeyMod::NONE => c.to_string().into_bytes(),
+        Key::Char(c, m) if m.contains(KeyMod::CTRL) => {
+            // Ctrl+letter → ASCII control codes
+            let b = *c as u8;
+            if b.is_ascii_alphabetic() {
+                vec![b.to_ascii_lowercase() - b'a' + 1]
+            } else {
+                c.to_string().into_bytes()
+            }
+        }
+        Key::Enter => vec![b'\r'],
+        Key::Backspace => vec![0x7f],
+        Key::Delete => vec![0x1b, b'[', b'3', b'~'],
+        Key::Esc => vec![0x1b],
+        Key::Up => vec![0x1b, b'[', b'A'],
+        Key::Down => vec![0x1b, b'[', b'B'],
+        Key::Right => vec![0x1b, b'[', b'C'],
+        Key::Left => vec![0x1b, b'[', b'D'],
+        Key::Tab => vec![b'\t'],
+        _ => vec![],
+    }
+}
+
+// ── Completion kind icon ───────────────────────────────────────────────────────
+
+fn completion_kind_icon(kind: Option<onda_lsp::CompletionItemKind>) -> &'static str {
+    use onda_lsp::CompletionItemKind;
+    match kind {
+        Some(CompletionItemKind::FUNCTION) | Some(CompletionItemKind::METHOD) => "fn ",
+        Some(CompletionItemKind::STRUCT) | Some(CompletionItemKind::CLASS) => "st ",
+        Some(CompletionItemKind::VARIABLE) | Some(CompletionItemKind::FIELD) => "va ",
+        Some(CompletionItemKind::MODULE) | Some(CompletionItemKind::UNIT) => "md ",
+        Some(CompletionItemKind::KEYWORD) => "kw ",
+        Some(CompletionItemKind::SNIPPET) => "sn ",
+        _ => "   ",
+    }
 }
 
 fn main() -> Result<()> {

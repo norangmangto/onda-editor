@@ -70,6 +70,51 @@ mod palette {
         bg: Color::Reset,
         attrs: Attribute::empty(),
     };
+    pub const STATUS_TERMINAL: Style = Style {
+        fg: Color::Black,
+        bg: Color::LightBlue,
+        attrs: Attribute::empty(),
+    };
+    pub const DIAG_ERROR: Style = Style {
+        fg: Color::LightRed,
+        bg: Color::Reset,
+        attrs: Attribute::UNDERLINE,
+    };
+    pub const DIAG_WARNING: Style = Style {
+        fg: Color::Yellow,
+        bg: Color::Reset,
+        attrs: Attribute::UNDERLINE,
+    };
+    pub const DIAG_INFO: Style = Style {
+        fg: Color::LightCyan,
+        bg: Color::Reset,
+        attrs: Attribute::UNDERLINE,
+    };
+    pub const GUTTER_ERROR: Style = Style {
+        fg: Color::LightRed,
+        bg: Color::Reset,
+        attrs: Attribute::empty(),
+    };
+    pub const GUTTER_WARNING: Style = Style {
+        fg: Color::Yellow,
+        bg: Color::Reset,
+        attrs: Attribute::empty(),
+    };
+    pub const FLOAT_BG: Style = Style {
+        fg: Color::White,
+        bg: Color::DarkGray,
+        attrs: Attribute::empty(),
+    };
+    pub const FLOAT_BORDER: Style = Style {
+        fg: Color::LightCyan,
+        bg: Color::DarkGray,
+        attrs: Attribute::empty(),
+    };
+    pub const COMPLETION_SELECTED: Style = Style {
+        fg: Color::Black,
+        bg: Color::LightCyan,
+        attrs: Attribute::empty(),
+    };
 }
 
 /// The mode label shown in the statusline.
@@ -80,6 +125,8 @@ pub enum ModeIndicator {
     Visual,
     VisualLine,
     Command,
+    Terminal,
+    TerminalScroll,
 }
 
 impl ModeIndicator {
@@ -90,15 +137,17 @@ impl ModeIndicator {
             ModeIndicator::Visual => "VISUAL",
             ModeIndicator::VisualLine => "VISUAL LINE",
             ModeIndicator::Command => "COMMAND",
+            ModeIndicator::Terminal => "TERMINAL",
+            ModeIndicator::TerminalScroll => "TERMINAL SCROLL",
         }
     }
 
     fn style(self) -> Style {
         match self {
-            ModeIndicator::Normal => palette::STATUS_NORMAL,
+            ModeIndicator::Normal | ModeIndicator::Command => palette::STATUS_NORMAL,
             ModeIndicator::Insert => palette::STATUS_INSERT,
             ModeIndicator::Visual | ModeIndicator::VisualLine => palette::STATUS_VISUAL,
-            ModeIndicator::Command => palette::STATUS_NORMAL,
+            ModeIndicator::Terminal | ModeIndicator::TerminalScroll => palette::STATUS_TERMINAL,
         }
     }
 
@@ -368,12 +417,97 @@ impl DocumentView {
         }
     }
 
+    /// Render visible lines with diagnostic underline spans.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_diagnostics(
+        grid: &mut Grid,
+        doc: &Document,
+        sel: &Selection,
+        viewport: &Viewport,
+        mode: ModeIndicator,
+        row_offset: u16,
+        height: u16,
+        search_matches: &[onda_core::Range],
+        diagnostics: &[DiagnosticSpan],
+    ) {
+        // Render base content first
+        Self::render_with_highlights(
+            grid,
+            doc,
+            sel,
+            viewport,
+            mode,
+            row_offset,
+            height,
+            None,
+            search_matches,
+        );
+
+        // Overlay diagnostic underlines
+        let text_col_start = viewport.line_nr_width;
+        for screen_row in 0..height {
+            let doc_line = viewport.offset_line + screen_row as usize;
+            let abs_row = row_offset + screen_row;
+            if doc_line >= doc.len_lines() {
+                continue;
+            }
+            let line_start = doc.line_to_char(doc_line);
+            let line_len = doc.line_len_no_eol(doc_line);
+
+            for span in diagnostics {
+                // Skip spans that don't overlap this line
+                if span.to <= line_start || span.from >= line_start + line_len {
+                    continue;
+                }
+                let span_style = match span.severity {
+                    0 => palette::DIAG_ERROR,
+                    1 => palette::DIAG_WARNING,
+                    _ => palette::DIAG_INFO,
+                };
+                // Add gutter sign in the line-number column
+                if viewport.line_nr_width >= 2 {
+                    let sign = match span.severity {
+                        0 => "E",
+                        1 => "W",
+                        _ => "I",
+                    };
+                    let gutter_style = match span.severity {
+                        0 => palette::GUTTER_ERROR,
+                        1 => palette::GUTTER_WARNING,
+                        _ => palette::DIAG_INFO,
+                    };
+                    grid.write_str(0, abs_row, sign, gutter_style);
+                }
+                // Underline the span columns
+                let col_from = span.from.max(line_start) - line_start;
+                let col_to = (span.to.min(line_start + line_len)) - line_start;
+                let visible_from = col_from.saturating_sub(viewport.offset_col);
+                let visible_to = col_to.saturating_sub(viewport.offset_col);
+                for col_idx in visible_from..visible_to {
+                    let screen_col = text_col_start + col_idx as u16;
+                    if screen_col >= grid.width() {
+                        break;
+                    }
+                    if let Some(cell) = grid.get_mut(screen_col, abs_row) {
+                        cell.style.attrs |= Attribute::UNDERLINE;
+                        if cell.style.fg == palette::TEXT.fg {
+                            cell.style.fg = span_style.fg;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn char_style(char_idx: usize, sel: &Selection, mode: ModeIndicator) -> Style {
         let primary = sel.primary();
         let is_cursor = char_idx == primary.head;
 
         match mode {
-            ModeIndicator::Normal | ModeIndicator::Command => {
+            ModeIndicator::Normal
+            | ModeIndicator::Command
+            | ModeIndicator::Terminal
+            | ModeIndicator::TerminalScroll => {
                 if is_cursor {
                     palette::CURSOR_NORMAL
                 } else {
@@ -607,6 +741,123 @@ pub fn render_picker(
     if height > 1 {
         let bottom = format!("└{:─<width$}┘", "", width = inner_w as usize);
         grid.write_str(x, bottom_row, &bottom, picker_border);
+    }
+}
+
+// ── Diagnostic data ───────────────────────────────────────────────────────────
+
+/// A diagnostic span for rendering (char-index based, resolved from LSP line/col).
+#[derive(Debug, Clone)]
+pub struct DiagnosticSpan {
+    /// First char index in the buffer.
+    pub from: usize,
+    /// Last char index (exclusive).
+    pub to: usize,
+    /// Severity: 0=error, 1=warning, 2=info/hint.
+    pub severity: u8,
+}
+
+// ── Floating window ────────────────────────────────────────────────────────────
+
+/// Render a floating window (hover, documentation, completion detail).
+///
+/// The float is drawn over the grid at (`col`, `row`) with a border.
+/// Lines that are too long are truncated to fit `width`.
+pub fn render_float(grid: &mut Grid, title: &str, lines: &[&str], col: u16, row: u16, width: u16) {
+    let grid_w = grid.width();
+    let grid_h = grid.height();
+    if grid_w == 0 || grid_h == 0 {
+        return;
+    }
+
+    // Compute actual height: 2 border rows + content
+    let height = (lines.len() as u16 + 2).min(grid_h.saturating_sub(row));
+    if height < 2 {
+        return;
+    }
+    let width = width.min(grid_w.saturating_sub(col));
+    if width < 4 {
+        return;
+    }
+    let inner_w = width.saturating_sub(2) as usize;
+
+    // Top border
+    {
+        let title_truncated: String = title.chars().take(inner_w.saturating_sub(2)).collect();
+        let top = if title_truncated.is_empty() {
+            format!("╭{:─<w$}╮", "", w = inner_w)
+        } else {
+            format!(
+                "╭─ {:─<w$}─╮",
+                title_truncated,
+                w = inner_w.saturating_sub(title_truncated.len() + 3)
+            )
+        };
+        grid.write_str(col, row, &top, palette::FLOAT_BORDER);
+    }
+
+    // Content rows
+    for (i, line) in lines.iter().take(height as usize - 2).enumerate() {
+        let content: String = line.chars().take(inner_w).collect();
+        let row_str = format!("│{:<w$}│", content, w = inner_w);
+        grid.write_str(col, row + 1 + i as u16, &row_str, palette::FLOAT_BG);
+    }
+
+    // Bottom border
+    if height >= 2 {
+        let bottom = format!("╰{:─<w$}╯", "", w = inner_w);
+        grid.write_str(col, row + height - 1, &bottom, palette::FLOAT_BORDER);
+    }
+}
+
+// ── Completion menu ────────────────────────────────────────────────────────────
+
+/// Render a completion popup menu below the cursor position.
+pub fn render_completion_menu(
+    grid: &mut Grid,
+    items: &[(&str, &str)], // (label, kind_icon)
+    selected: usize,
+    cursor_col: u16,
+    cursor_row: u16,
+    max_visible: usize,
+) {
+    let grid_w = grid.width();
+    let grid_h = grid.height();
+    if items.is_empty() || grid_w == 0 || grid_h == 0 {
+        return;
+    }
+
+    let width: u16 = 40.min(grid_w.saturating_sub(cursor_col));
+    let visible = max_visible
+        .min(items.len())
+        .min(grid_h.saturating_sub(cursor_row + 1) as usize);
+    if visible == 0 {
+        return;
+    }
+
+    let inner_w = width.saturating_sub(2) as usize;
+    let start_row = cursor_row + 1;
+
+    for (i, (label, kind)) in items.iter().enumerate().take(visible) {
+        let row = start_row + i as u16;
+        if row >= grid_h {
+            break;
+        }
+        let is_selected = i == selected;
+        let style = if is_selected {
+            palette::COMPLETION_SELECTED
+        } else {
+            palette::FLOAT_BG
+        };
+        let kind_str = if kind.is_empty() { "   " } else { kind };
+        let label_part: String = label.chars().take(inner_w.saturating_sub(4)).collect();
+        let line = format!(
+            "{} {:<w$}",
+            kind_str,
+            label_part,
+            w = inner_w.saturating_sub(4)
+        );
+        grid.write_str(cursor_col, row, &line, style);
     }
 }
 

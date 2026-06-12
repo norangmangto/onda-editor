@@ -47,6 +47,7 @@ TASKS:
                       rust_100k.rs      — ~100k lines of Rust-like syntax
                       nested.json       — 20-level deeply-nested JSON
                       malformed.toml    — TOML with a syntax error at line 50
+                      prose_long.md     — 500 lines of 150+ char prose (soft-wrap bench)
     help            Print this help
 "#
     );
@@ -430,6 +431,9 @@ fn gen_fixtures() -> Result<()> {
     println!("==> Generating malformed TOML fixture...");
     gen_malformed_toml_fixture(&fixtures.join("malformed.toml"))?;
 
+    println!("==> Generating long-line prose fixture...");
+    gen_prose_long_line_fixture(&fixtures.join("prose_long.md"))?;
+
     println!("==> Fixtures generated in {}", fixtures.display());
     Ok(())
 }
@@ -576,6 +580,74 @@ fn gen_text_fixture(path: &Path, target_bytes: usize) -> Result<()> {
             break;
         }
     }
+    file.flush()?;
+    Ok(())
+}
+
+/// Generate a Markdown prose fixture with 500 lines each 150+ characters long.
+///
+/// Used by `bench_soft_wrap_render` and any benchmark that needs realistic
+/// long-line content to exercise the compositor's soft-wrap layout path.
+/// The key used in the fixtures map is `"prose_long_line"`.
+fn gen_prose_long_line_fixture(path: &Path) -> Result<()> {
+    if path.exists() {
+        println!("  {} already exists, skipping", path.display());
+        return Ok(());
+    }
+
+    let target_lines = 500usize;
+    let min_line_len = 150usize;
+
+    // Representative prose sentences of varying content rotated to fill lines.
+    let sentences = [
+        "Text editors occupy a peculiar position in the software landscape: simultaneously among the oldest and most performance-critical applications that developers use every day.",
+        "The rope data structure represents text as a balanced binary tree of string chunks, enabling O(log n) insertion and deletion without the linear shift cost of contiguous arrays.",
+        "Damage tracking in the compositor ensures that only changed cells are transmitted to the terminal, dramatically reducing the volume of escape sequences per frame during typical editing.",
+        "The main event loop must never block: file I/O, LSP communication, syntax highlighting, and fuzzy search all run on background tokio worker threads and deliver results through channels.",
+        "Tree-sitter's incremental parsing algorithm reuses unchanged subtrees directly, limiting reparse work to the region affected by an edit and completing single-character insertions in under one millisecond.",
+        "Multicursor editing treats the selection as a first-class sorted collection of non-overlapping ranges, each participating equally in motions and operators without special-casing any range as primary.",
+        "Cold startup latency below 40 milliseconds feels instantaneous to users; the dominant contributors are dynamic linking, configuration parsing, plugin initialization, and grammar compilation.",
+        "Criterion.rs provides statistical rigor through adaptive sample collection, Tukey-fence outlier detection, and Welch's t-test for comparing before-and-after measurements with a five-percent regression threshold.",
+        "GPU-accelerated rendering moves cell rasterization and compositing to the GPU's massively parallel execution units, enabling sub-millisecond render latency for the compositor's output stage.",
+        "Persistent incremental indexing caches project-wide symbol tables and cross-reference graphs, enabling instantaneous responses to queries that would otherwise require full-project scans on every invocation.",
+        "The ropey B-tree variant uses leaf nodes of 64 to 512 bytes to improve cache locality for sequential iteration while retaining the logarithmic insertion and deletion guarantees of the classical rope.",
+        "Soft-wrap layout caches visual line break positions keyed on document version numbers, so unchanged document lines reuse their cached layout without recomputation on every rendered frame.",
+        "The cell grid compositor maintains a shadow grid mirroring the terminal's current state, and emits only the minimal set of escape sequences required to advance from the shadow to the desired grid.",
+        "An editor that treats performance as a first-class constraint from the very first commit will naturally arrive at designs that are fast, because slow solutions are eliminated before they can accumulate.",
+        "Property-based tests verify that ChangeSet application preserves all rope invariants — character count, line count, and content correctness — across arbitrary sequences of insertions and deletions.",
+    ];
+
+    let mut file = io::BufWriter::new(std::fs::File::create(path)?);
+    writeln!(
+        file,
+        "# Long-Line Prose Fixture — {target_lines} lines of {min_line_len}+ characters"
+    )?;
+    writeln!(file)?;
+
+    let n_sentences = sentences.len();
+    let mut lines_written = 2usize; // header + blank
+
+    while lines_written < target_lines {
+        let idx = (lines_written - 2) % n_sentences;
+        let base = sentences[idx];
+
+        // Pad the line to at least min_line_len by appending a counter suffix.
+        let suffix = format!(" [line {:04}, fixture: prose_long_line]", lines_written - 1);
+        let mut line = base.to_string();
+        if line.len() + suffix.len() < min_line_len {
+            // Keep appending words until we exceed the minimum.
+            let filler =
+                " — performance, correctness, and maintainability are not in conflict here.";
+            while line.len() + suffix.len() < min_line_len {
+                line.push_str(filler);
+            }
+        }
+        line.push_str(&suffix);
+
+        writeln!(file, "{line}")?;
+        lines_written += 1;
+    }
+
     file.flush()?;
     Ok(())
 }

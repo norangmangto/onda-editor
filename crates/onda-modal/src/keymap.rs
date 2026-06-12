@@ -277,7 +277,7 @@ impl Keymap {
         match mode {
             Mode::Normal => Some(&self.normal),
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock => Some(&self.visual),
-            Mode::Insert | Mode::Command => None,
+            Mode::Insert | Mode::Command | Mode::Terminal | Mode::TerminalScroll => None,
         }
     }
 }

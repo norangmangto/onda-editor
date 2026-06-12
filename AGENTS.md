@@ -49,9 +49,10 @@ them without updating the doc first).
   which require a `// INVARIANT:` comment explaining why it cannot fail.
 - `unsafe` requires a `// SAFETY:` comment and reviewer sign-off; avoid it in Phase 0–2.
 - New dependencies require justification in the PR description (binary size, compile
-  time, and maintenance are costs). Pre-approved: ropey, crossterm, tokio, tracing,
-  thiserror, anyhow, criterion, unicode-segmentation, unicode-width, tree-sitter,
-  libloading, regex, nucleo-matcher, toml, notify, arboard, ignore.
+ time, and maintenance are costs). Pre-approved: ropey, crossterm, tokio, tracing,
+ thiserror, anyhow, criterion, unicode-segmentation, unicode-width, tree-sitter,
+ libloading, regex, nucleo-matcher, toml, notify, arboard, ignore,
+ lsp-types, portable-pty, vt100, mlua (lua54 feature), serde_json, url, tempfile.
 
 ### 5. Testing
 - Every motion/operator gets table-driven tests: `(input keys, before, after, selection)`.

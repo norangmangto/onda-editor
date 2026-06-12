@@ -1,0 +1,14 @@
+[package]
+name = "onda-terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+onda-core = { workspace = true }
+tokio = { workspace = true }
+portable-pty = { workspace = true }
+vt100 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
