@@ -1,0 +1,18 @@
+/target
+/bench/target
+/.build
+Cargo.lock
+*.orig
+.DS_Store
+*.swp
+*.swo
+
+# Generated test fixtures (large files)
+/bench/fixtures/
+
+# Benchmark output
+/bench/results/
+/BENCH_REPORT.md
+
+# Editor state
+/.onda/

@@ -1,0 +1,19 @@
+[package]
+name = "bench"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[[bench]]
+name = "startup"
+harness = false
+
+[[bench]]
+name = "large_file"
+harness = false
+
+[dependencies]
+onda-core.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true

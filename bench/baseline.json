@@ -1,0 +1,22 @@
+{
+  "results": [
+    {
+      "name": "startup_ms",
+      "median_ms": 0.0,
+      "mean_ms": 0.0,
+      "min_ms": 0.0,
+      "max_ms": 0.0,
+      "runs": 0
+    },
+    {
+      "name": "large_file_open_ms",
+      "median_ms": 0.0,
+      "mean_ms": 0.0,
+      "min_ms": 0.0,
+      "max_ms": 0.0,
+      "runs": 0
+    }
+  ],
+  "git_sha": "initial",
+  "timestamp": "2026-06-12"
+}

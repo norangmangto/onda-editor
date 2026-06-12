@@ -1,0 +1,27 @@
+[package]
+name = "onda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "onda"
+path = "src/main.rs"
+
+[dependencies]
+onda-core.workspace = true
+onda-render.workspace = true
+onda-modal.workspace = true
+onda-config.workspace = true
+crossterm.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+default = []
+debug-overlay = ["onda-render/debug-overlay"]
+bench = []
