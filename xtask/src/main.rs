@@ -39,7 +39,9 @@ USAGE:
 TASKS:
     ci              Run fmt check, clippy, tests, and deny
     bench           Run benchmarks and print results
-    bench --check   Check benchmarks against bench/baseline.json (exit 1 on >5% regression)
+    bench --check   Check benchmarks against bench/baseline.json (exit 1 on >5%
+                    regression OR on any measured Phase 3 gate exceeding its budget:
+                    dap_on_keypress_p99_ms<10, git_blame_render_ms<2, theme_switch_ms<5)
     bench-compare   Compare onda vs nvim/helix, write BENCH_REPORT.md
     gen-fixtures    Generate synthetic test fixtures (bench/fixtures/):
                       large_100mb.txt   — 100 MB line-numbered text
@@ -132,6 +134,36 @@ struct BenchResult {
     min_ms: f64,
     max_ms: f64,
     runs: usize,
+    /// Absolute performance budget (ceiling). `Some(x)` means `--check` fails if
+    /// `median_ms > x` once the gate has real measurements (`runs > 0`). Gates whose
+    /// feature is not yet wired carry a budget but `runs: 0`, so they don't spuriously
+    /// fail until a measurement source lands.
+    #[serde(default)]
+    budget_ms: Option<f64>,
+}
+
+/// Phase 3 perf gates (T15.0). Budgets are enforced by `bench --check`. Measurements
+/// for these are wired in as each feature lands (theme switch in T18.1, git blame in
+/// T16.1, DAP-on keypress latency in W15); until then they report `runs: 0` and the
+/// absolute-budget check is skipped for them.
+fn phase3_gates() -> Vec<BenchResult> {
+    let gate = |name: &str, budget_ms: f64| BenchResult {
+        name: name.to_string(),
+        median_ms: 0.0,
+        mean_ms: 0.0,
+        min_ms: 0.0,
+        max_ms: 0.0,
+        runs: 0,
+        budget_ms: Some(budget_ms),
+    };
+    vec![
+        // DAP attached: keypress → render p99 must stay under the 10ms input budget.
+        gate("dap_on_keypress_p99_ms", 10.0),
+        // Git blame annotation render cost for a 500-line file.
+        gate("git_blame_render_ms", 2.0),
+        // Full-screen re-render on `:theme` switch.
+        gate("theme_switch_ms", 5.0),
+    ]
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -160,7 +192,10 @@ fn bench(args: &[String]) -> Result<()> {
     println!("==> Running large-file benchmark...");
     let large_file = bench_large_file(&binary, &root)?;
 
-    let results = vec![startup, large_file];
+    let mut results = vec![startup, large_file];
+    // Phase 3 gates (T15.0). Carried through with their budgets so `--check` enforces
+    // them; measurements are filled in by the features that own each gate.
+    results.extend(phase3_gates());
 
     let report = BenchReport {
         results: results.clone(),
@@ -232,6 +267,7 @@ fn bench_large_file(binary: &Path, root: &Path) -> Result<BenchResult> {
             min_ms: 0.0,
             max_ms: 0.0,
             runs: 0,
+            budget_ms: Some(2000.0),
         });
     }
 
@@ -254,6 +290,10 @@ fn bench_large_file(binary: &Path, root: &Path) -> Result<BenchResult> {
 }
 
 fn summarize(name: &str, times: &mut [f64]) -> BenchResult {
+    summarize_with_budget(name, times, None)
+}
+
+fn summarize_with_budget(name: &str, times: &mut [f64], budget_ms: Option<f64>) -> BenchResult {
     if times.is_empty() {
         return BenchResult {
             name: name.to_string(),
@@ -262,6 +302,7 @@ fn summarize(name: &str, times: &mut [f64]) -> BenchResult {
             min_ms: 0.0,
             max_ms: 0.0,
             runs: 0,
+            budget_ms,
         };
     }
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -277,6 +318,7 @@ fn summarize(name: &str, times: &mut [f64]) -> BenchResult {
         min_ms: min,
         max_ms: max,
         runs: n,
+        budget_ms,
     }
 }
 
@@ -293,6 +335,18 @@ fn check_regression(results: &[BenchResult], root: &Path) -> Result<()> {
     let threshold = 1.05; // 5% regression
 
     for result in results {
+        // Absolute budget ceiling (T15.0): independent of the baseline, a measured gate
+        // that blows its budget always fails. Unmeasured gates (runs == 0) are skipped.
+        if let Some(budget) = result.budget_ms {
+            if result.runs > 0 && result.median_ms > budget {
+                eprintln!(
+                    "BUDGET EXCEEDED: {} median {:.2}ms > budget {:.2}ms",
+                    result.name, result.median_ms, budget
+                );
+                failed = true;
+            }
+        }
+
         if let Some(base) = baseline.results.iter().find(|r| r.name == result.name) {
             if base.median_ms > 0.0 {
                 let ratio = result.median_ms / base.median_ms;
@@ -319,7 +373,7 @@ fn check_regression(results: &[BenchResult], root: &Path) -> Result<()> {
     }
 
     if failed {
-        bail!("Benchmark regression detected (threshold: 5%)");
+        bail!("Benchmark regression / budget violation detected (threshold: 5%)");
     }
     Ok(())
 }

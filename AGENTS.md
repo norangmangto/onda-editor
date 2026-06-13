@@ -52,7 +52,12 @@ them without updating the doc first).
  time, and maintenance are costs). Pre-approved: ropey, crossterm, tokio, tracing,
  thiserror, anyhow, criterion, unicode-segmentation, unicode-width, tree-sitter,
  libloading, regex, nucleo-matcher, toml, notify, arboard, ignore,
- lsp-types, portable-pty, vt100, mlua (lua54 feature), serde_json, url, tempfile.
+ lsp-types, portable-pty, vt100, mlua (lua54 feature), serde_json, url, tempfile,
+ git2 (libgit2 bindings — git status/diff/blame, Phase 3 W16),
+ russh + russh-sftp (SSH transport for remote editing, Phase 3 W17),
+ libvterm-sys (vendored libvterm FFI — terminal emulation, Phase 3 W17;
+ `unsafe` FFI requires `// SAFETY:` comments per rule 4),
+ dap-types (hand-rolled DAP JSON types acceptable, Phase 3 W15).
 
 ### 5. Testing
 - Every motion/operator gets table-driven tests: `(input keys, before, after, selection)`.

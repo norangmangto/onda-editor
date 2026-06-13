@@ -6,7 +6,8 @@
       "mean_ms": 0.0,
       "min_ms": 0.0,
       "max_ms": 0.0,
-      "runs": 0
+      "runs": 0,
+      "budget_ms": 40.0
     },
     {
       "name": "large_file_open_ms",
@@ -14,9 +15,37 @@
       "mean_ms": 0.0,
       "min_ms": 0.0,
       "max_ms": 0.0,
-      "runs": 0
+      "runs": 0,
+      "budget_ms": 2000.0
+    },
+    {
+      "name": "dap_on_keypress_p99_ms",
+      "median_ms": 0.0,
+      "mean_ms": 0.0,
+      "min_ms": 0.0,
+      "max_ms": 0.0,
+      "runs": 0,
+      "budget_ms": 10.0
+    },
+    {
+      "name": "git_blame_render_ms",
+      "median_ms": 0.0,
+      "mean_ms": 0.0,
+      "min_ms": 0.0,
+      "max_ms": 0.0,
+      "runs": 0,
+      "budget_ms": 2.0
+    },
+    {
+      "name": "theme_switch_ms",
+      "median_ms": 0.0,
+      "mean_ms": 0.0,
+      "min_ms": 0.0,
+      "max_ms": 0.0,
+      "runs": 0,
+      "budget_ms": 5.0
     }
   ],
   "git_sha": "initial",
-  "timestamp": "2026-06-12"
+  "timestamp": "2026-06-13"
 }
