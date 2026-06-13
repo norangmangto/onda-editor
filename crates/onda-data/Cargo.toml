@@ -1,0 +1,12 @@
+[package]
+name = "onda-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+# preserve_order keeps JSON object key order through pretty/minify round-trips.
+serde_json = { workspace = true, features = ["preserve_order"] }
+unicode-width.workspace = true
+thiserror.workspace = true
