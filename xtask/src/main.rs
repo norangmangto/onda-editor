@@ -50,6 +50,9 @@ TASKS:
                       nested.json       — 20-level deeply-nested JSON
                       malformed.toml    — TOML with a syntax error at line 50
                       prose_long.md     — 500 lines of 150+ char prose (soft-wrap bench)
+                      wide.csv/narrow.csv — CSV table fixtures (ONDA_CSV_BYTES)
+                      records.jsonl     — JSONL record fixture (ONDA_JSONL_BYTES)
+                      malformed.csv/.jsonl — quoting/parse edge-case corpus
     help            Print this help
 "#
     );
@@ -168,6 +171,12 @@ fn extra_gates() -> Vec<BenchResult> {
         gate("panel_stream_frame_ms", 16.0),
         // Phase 4: keypress → render p99 while an agent streams in the panel.
         gate("agent_stream_keypress_p99_ms", 10.0),
+        // Phase 5: scroll one frame of CSV table mode on the 1GB fixture.
+        gate("csv_table_scroll_ms", 16.0),
+        // Phase 5: time to first parsed/visible record opening the 10GB JSONL fixture.
+        gate("jsonl_first_record_ms", 500.0),
+        // Phase 5: lazy persistent-undo load must not threaten the 40ms startup gate.
+        gate("persistent_undo_load_ms", 40.0),
     ]
 }
 
@@ -493,7 +502,139 @@ fn gen_fixtures() -> Result<()> {
     println!("==> Generating long-line prose fixture...");
     gen_prose_long_line_fixture(&fixtures.join("prose_long.md"))?;
 
+    // Phase 5 data-view fixtures. The huge variants stream to disk; size is taken
+    // from env so CI can pick a representative size without filling the runner
+    // (ONDA_CSV_BYTES / ONDA_JSONL_BYTES, defaulting to ~64MB).
+    let csv_bytes: usize = env_bytes("ONDA_CSV_BYTES", 64 * 1024 * 1024);
+    let jsonl_bytes: usize = env_bytes("ONDA_JSONL_BYTES", 64 * 1024 * 1024);
+
+    println!(
+        "==> Generating wide CSV fixture (~{} MB)...",
+        csv_bytes >> 20
+    );
+    gen_csv_fixture(&fixtures.join("wide.csv"), csv_bytes, 240)?;
+    println!(
+        "==> Generating narrow CSV fixture (~{} MB)...",
+        csv_bytes >> 20
+    );
+    gen_csv_fixture(&fixtures.join("narrow.csv"), csv_bytes, 4)?;
+    println!("==> Generating malformed CSV fixture...");
+    gen_malformed_csv_fixture(&fixtures.join("malformed.csv"))?;
+
+    println!(
+        "==> Generating JSONL fixture (~{} MB, streamed)...",
+        jsonl_bytes >> 20
+    );
+    gen_jsonl_fixture(&fixtures.join("records.jsonl"), jsonl_bytes)?;
+    println!("==> Generating malformed JSONL fixture...");
+    gen_malformed_jsonl_fixture(&fixtures.join("malformed.jsonl"))?;
+
     println!("==> Fixtures generated in {}", fixtures.display());
+    Ok(())
+}
+
+/// Read a byte-size from an env var, falling back to `default`.
+fn env_bytes(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+/// Generate a CSV with `columns` columns up to `target_bytes`, streamed.
+fn gen_csv_fixture(path: &Path, target_bytes: usize, columns: usize) -> Result<()> {
+    if path.exists() {
+        println!("  {} already exists, skipping", path.display());
+        return Ok(());
+    }
+    let mut file = io::BufWriter::new(std::fs::File::create(path)?);
+    // Header row.
+    let header: Vec<String> = (0..columns).map(|c| format!("col_{c}")).collect();
+    writeln!(file, "{}", header.join(","))?;
+    let mut written = header.join(",").len() + 1;
+    let mut row = 0usize;
+    while written < target_bytes {
+        let mut line = String::with_capacity(columns * 8);
+        for c in 0..columns {
+            if c > 0 {
+                line.push(',');
+            }
+            // Mix numbers, text, and a quoted field with an embedded comma + unicode.
+            match c % 4 {
+                0 => line.push_str(&format!("{}", row * 31 + c)),
+                1 => line.push_str(&format!("item-{row}-{c}")),
+                2 => line.push_str("\"a,b\""),
+                _ => line.push_str("李雷"),
+            }
+        }
+        line.push('\n');
+        written += line.len();
+        file.write_all(line.as_bytes())?;
+        row += 1;
+    }
+    file.flush()?;
+    Ok(())
+}
+
+/// A small CSV with quoting/raggedness edge cases for the sniffer/parser corpus.
+fn gen_malformed_csv_fixture(path: &Path) -> Result<()> {
+    if path.exists() {
+        println!("  {} already exists, skipping", path.display());
+        return Ok(());
+    }
+    let content = "\u{feff}id,name,note\r\n\
+        1,Alice,\"hello, world\"\r\n\
+        2,Bob\r\n\
+        3,Cara,\"unterminated quote\r\n\
+        4,Dan,ok,extra,columns\r\n\
+        5,\"esc \"\"quote\"\"\",fine\r\n";
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
+/// Generate a JSONL file of heterogeneous records up to `target_bytes`, streamed.
+fn gen_jsonl_fixture(path: &Path, target_bytes: usize) -> Result<()> {
+    if path.exists() {
+        println!("  {} already exists, skipping", path.display());
+        return Ok(());
+    }
+    let mut file = io::BufWriter::new(std::fs::File::create(path)?);
+    let mut written = 0usize;
+    let mut i = 0usize;
+    while written < target_bytes {
+        // Vary the schema so the :fields overlay has something to summarize.
+        let line = match i % 3 {
+            0 => format!(
+                r#"{{"id":{i},"name":"user-{i}","active":{},"tags":["a","b"]}}"#,
+                i % 2 == 0
+            ),
+            1 => format!(
+                r#"{{"id":"x{i}","name":"user-{i}","score":{}}}"#,
+                i as f64 * 1.5
+            ),
+            _ => format!(r#"{{"id":{i},"nested":{{"k":{i},"v":"日本語"}}}}"#),
+        };
+        written += line.len() + 1;
+        writeln!(file, "{line}")?;
+        i += 1;
+    }
+    file.flush()?;
+    Ok(())
+}
+
+/// A small JSONL with malformed records interleaved with valid ones.
+fn gen_malformed_jsonl_fixture(path: &Path) -> Result<()> {
+    if path.exists() {
+        println!("  {} already exists, skipping", path.display());
+        return Ok(());
+    }
+    let content = "{\"id\":1,\"ok\":true}\n\
+        {not valid json}\n\
+        {\"id\":3}\n\
+        \n\
+        {\"id\":4,\"trailing\":}\n\
+        {\"id\":5,\"unicode\":\"日本語\"}\n";
+    std::fs::write(path, content)?;
     Ok(())
 }
 
