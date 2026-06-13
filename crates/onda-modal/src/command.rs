@@ -58,6 +58,14 @@ pub enum ExCommand {
     GrammarFetch,
     /// `:ls` — list buffers.
     ListBuffers,
+    /// `:GitStatus` — open a picker of modified/untracked/staged files.
+    GitStatus,
+    /// `:GitStage` — stage the current file.
+    GitStage,
+    /// `:GitUnstage` — unstage the current file.
+    GitUnstage,
+    /// `:GitDiscard` — discard worktree changes to the current file.
+    GitDiscard,
     /// Custom command registered by a Lua plugin.
     LuaCommand(String, Vec<String>),
 }
@@ -139,6 +147,10 @@ impl ExCommand {
             "messages" | "mes" => Ok(ExCommand::Messages),
             "GrammarFetch" | "grammars" => Ok(ExCommand::GrammarFetch),
             "ls" | "buffers" => Ok(ExCommand::ListBuffers),
+            "GitStatus" | "gitstatus" | "Gs" => Ok(ExCommand::GitStatus),
+            "GitStage" | "gitstage" => Ok(ExCommand::GitStage),
+            "GitUnstage" | "gitunstage" => Ok(ExCommand::GitUnstage),
+            "GitDiscard" | "gitdiscard" => Ok(ExCommand::GitDiscard),
             s if s.starts_with("sp ") || s.starts_with("split ") => {
                 let path = s
                     .split_once(' ')

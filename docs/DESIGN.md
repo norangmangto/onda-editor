@@ -67,6 +67,13 @@ onda (bin)
 Dependency direction: `onda` → `{onda-modal, onda-render}` → `onda-core`.
 `onda-modal` and `onda-render` must not depend on each other.
 
+Feature crates added in later phases follow the same rule (each may depend on
+`onda-core`, never on a sibling feature crate; the binary wires them together):
+`onda-syntax`, `onda-lsp`, `onda-terminal`, `onda-session`, `onda-lua`, and — Phase 3 —
+`onda-git` (libgit2 status/diff/blame; depends only on `git2`, runs all work on a
+dedicated worker thread). Tree-sitter text objects (T18.2) live in `onda-syntax`;
+`onda-modal` only names the `TextObj` variants and the binary resolves them.
+
 ## 7. Architecture Decision Records
 
 ### ADR-001: Rope data structure

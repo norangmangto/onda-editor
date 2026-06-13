@@ -10,6 +10,7 @@ members = [
     "crates/onda-terminal",
     "crates/onda-session",
     "crates/onda-lua",
+    "crates/onda-git",
     "xtask",
     "bench",
 ]
@@ -94,6 +95,9 @@ vt100 = "0.16"
 # Lua 5.4 embedding
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
 
+# Git integration (libgit2 bindings)
+git2 = { version = "0.19", default-features = false }
+
 # URL parsing (used by lsp-types)
 url = "2"
 
@@ -107,6 +111,7 @@ onda-lsp = { path = "crates/onda-lsp" }
 onda-terminal = { path = "crates/onda-terminal" }
 onda-session = { path = "crates/onda-session" }
 onda-lua = { path = "crates/onda-lua" }
+onda-git = { path = "crates/onda-git" }
 
 [profile.release]
 opt-level = 3
