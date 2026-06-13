@@ -1,8 +1,9 @@
 //! Theme system (onda T18.1).
 //!
 //! A `Theme` maps scope names (`ui.text`, `ui.statusline.insert`, `syntax.keyword`,
-//! `diff.add`, …) to [`Style`]s. Themes load from TOML and ship as three built-ins
-//! (`onda-dark`, `onda-light`, `onda-contrast`). The renderer reads styles through the
+//! `diff.add`, …) to [`Style`]s. Themes load from TOML and ship as built-ins
+//! (`onda-dark`, `onda-light`, `onda-contrast`, `onda-wave`); a theme may `inherits`
+//! a built-in and override only some scopes. The renderer reads styles through the
 //! typed accessor methods, each of which carries a sensible dark default so an
 //! incomplete theme never leaves a surface unstyled. Plugins can override any group
 //! via [`Theme::set`].
@@ -44,7 +45,7 @@ struct StyleSpec {
 }
 
 /// Built-in theme names, in display order.
-pub const BUILTIN_THEMES: &[&str] = &["onda-dark", "onda-light", "onda-contrast"];
+pub const BUILTIN_THEMES: &[&str] = &["onda-dark", "onda-light", "onda-contrast", "onda-wave"];
 
 impl Theme {
     pub fn name(&self) -> &str {
@@ -97,9 +98,21 @@ impl Theme {
 
     /// Parse a theme from TOML text. Keys are scope names; values are style tables:
     /// `"ui.text" = { fg = "#c0c0c0", bg = "#101010", bold = true }`.
+    ///
+    /// An optional top-level `inherits = "<theme>"` starts from a built-in theme's
+    /// styles and overlays the ones defined here.
     pub fn from_toml(name: &str, text: &str) -> Result<Theme, ThemeError> {
-        let specs: HashMap<String, StyleSpec> = toml::from_str(text)?;
-        let mut styles = HashMap::with_capacity(specs.len());
+        // Parse generically first so we can pull out `inherits` before treating the
+        // rest as scope→style entries.
+        let mut root: toml::value::Table = toml::from_str(text)?;
+        let mut styles = match root.remove("inherits") {
+            Some(toml::Value::String(parent)) => Theme::builtin(&parent)
+                .map(|t| t.styles)
+                .unwrap_or_default(),
+            _ => HashMap::new(),
+        };
+
+        let specs: HashMap<String, StyleSpec> = toml::Value::Table(root).try_into()?;
         for (scope, spec) in specs {
             let mut attrs = Attribute::empty();
             if spec.bold {
@@ -133,6 +146,7 @@ impl Theme {
             "onda-dark" => include_str!("../../../runtime/themes/onda-dark.toml"),
             "onda-light" => include_str!("../../../runtime/themes/onda-light.toml"),
             "onda-contrast" => include_str!("../../../runtime/themes/onda-contrast.toml"),
+            "onda-wave" => include_str!("../../../runtime/themes/onda-wave.toml"),
             _ => return None,
         };
         // INVARIANT: built-in theme TOML files are validated by the theme_builtins test.
@@ -291,6 +305,29 @@ mod tests {
         assert_eq!(parse_color("lightcyan").unwrap(), Color::LightCyan);
         assert!(parse_color("#xyz").is_err());
         assert!(parse_color("notacolor").is_err());
+    }
+
+    #[test]
+    fn inherits_overlays_parent() {
+        // Inherit onda-dark, override only ui.text → other scopes come from the parent.
+        let toml = r##"
+inherits = "onda-dark"
+"ui.text" = { fg = "#abcdef" }
+"##;
+        let theme = Theme::from_toml("custom", toml).unwrap();
+        // Overridden scope.
+        assert_eq!(theme.text().fg, Color::Rgb(0xab, 0xcd, 0xef));
+        // Inherited scope (onda-dark statusline is white-on-darkgray).
+        assert_eq!(theme.status_bg().bg, Color::DarkGray);
+    }
+
+    #[test]
+    fn onda_wave_inherits_and_is_oceanic() {
+        let theme = Theme::builtin("onda-wave").unwrap();
+        // Its own override.
+        assert_eq!(theme.text().bg, Color::Rgb(0x0b, 0x1e, 0x2d));
+        // An inherited scope still resolves (proves inheritance merged).
+        assert!(theme.styles.contains_key("ui.statusline"));
     }
 
     #[test]

@@ -3,6 +3,8 @@ use std::{collections::HashMap, path::PathBuf, sync::mpsc, time::Duration};
 #[cfg(feature = "bench")]
 use std::time::Instant;
 
+mod doctor;
+
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEvent,
@@ -3575,6 +3577,10 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("onda {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+
+    if args.first().map(|s| s.as_str()) == Some("doctor") {
+        std::process::exit(doctor::run());
     }
 
     if args.iter().any(|a| a == "--bench-startup") {

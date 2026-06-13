@@ -1,0 +1,38 @@
+# onda-wave — the brand theme (ocean palette, T30.1).
+# Inherits onda-dark for any scope it doesn't override.
+
+inherits = "onda-dark"
+
+"ui.text"                 = { fg = "#d6e9f0", bg = "#0b1e2d" }
+"ui.cursor"               = { fg = "#0b1e2d", bg = "#4fd6be" }
+"ui.cursor.insert"        = { fg = "#0b1e2d", bg = "#5fb3d4" }
+"ui.selection"            = { fg = "#d6e9f0", bg = "#1c4257" }
+"ui.linenr"               = { fg = "#3e6275", bg = "#0b1e2d" }
+"ui.linenr.current"       = { fg = "#4fd6be", bg = "#0b1e2d" }
+"ui.statusline"           = { fg = "#d6e9f0", bg = "#13344a" }
+"ui.statusline.normal"    = { fg = "#0b1e2d", bg = "#4fd6be" }
+"ui.statusline.insert"    = { fg = "#0b1e2d", bg = "#5fb3d4" }
+"ui.statusline.visual"    = { fg = "#0b1e2d", bg = "#f2c14e" }
+"ui.statusline.terminal"  = { fg = "#0b1e2d", bg = "#8a7fff" }
+"ui.message.error"        = { fg = "#ff6b81" }
+"ui.message.info"         = { fg = "#d6e9f0" }
+"ui.menu"                 = { fg = "#d6e9f0", bg = "#13344a" }
+"ui.menu.selected"        = { fg = "#0b1e2d", bg = "#4fd6be" }
+"ui.float"                = { fg = "#d6e9f0", bg = "#13344a" }
+"ui.float.border"         = { fg = "#4fd6be", bg = "#13344a" }
+"diagnostic.error"        = { fg = "#ff6b81", underline = true }
+"diagnostic.warning"      = { fg = "#f2c14e", underline = true }
+"diagnostic.info"         = { fg = "#5fb3d4", underline = true }
+"gutter.error"            = { fg = "#ff6b81" }
+"gutter.warning"          = { fg = "#f2c14e" }
+"diff.add"                = { fg = "#4fd6be" }
+"diff.delete"             = { fg = "#ff6b81" }
+"diff.change"             = { fg = "#5fb3d4" }
+"syntax.keyword"          = { fg = "#8a7fff" }
+"syntax.type"             = { fg = "#f2c14e" }
+"syntax.function"         = { fg = "#5fb3d4" }
+"syntax.string"           = { fg = "#4fd6be" }
+"syntax.number"           = { fg = "#9ad9ea" }
+"syntax.comment"          = { fg = "#3e6275", italic = true }
+"syntax.constant"         = { fg = "#9ad9ea" }
+"syntax.operator"         = { fg = "#d6e9f0" }

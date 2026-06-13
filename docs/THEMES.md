@@ -6,7 +6,8 @@ onda ships three built-in themes and supports user themes + live reload (T18.1).
 
 - `:theme` — show the active theme and the list of built-ins.
 - `:theme <name>` — switch live (full re-render, < 5ms). Built-ins:
-  `onda-dark` (default), `onda-light`, `onda-contrast` (WCAG AA high-contrast).
+  `onda-dark` (default), `onda-light`, `onda-contrast` (WCAG AA high-contrast),
+  `onda-wave` (the brand ocean theme).
 - `config.toml` `theme = "onda-light"` sets the default at startup.
 
 ## Theme files
@@ -22,6 +23,13 @@ Themes are TOML. Keys are scope names; values are style tables:
 
 Colors are `#rrggbb` hex or basic ANSI names (`red`, `lightcyan`, `reset`, …).
 Style flags: `bold`, `italic`, `underline` (all default `false`).
+
+A theme may inherit a built-in and override only the scopes it cares about:
+
+```toml
+inherits = "onda-dark"
+"ui.text" = { fg = "#d6e9f0", bg = "#0b1e2d" }
+```
 
 ### Resolution order
 
