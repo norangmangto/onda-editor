@@ -90,9 +90,13 @@ audit-gap fixes were implemented. "Engine done" = pure, unit-tested logic crate;
   session, staging+rebase, permission model, mention assembly; mock-agent E2E.
 - **`onda doctor`** (T30.2); **`onda data` engines**; **`cargo xtask install`/`bundle`**
   (T31.1/T19.4); **`BENCH_REPORT.md` v1.0** with real numbers (Phase 0/5).
+- **DAP debugger** (Phase 3 W15): `onda-dap` (protocol/transport/session/client + mock
+  adapter, 19 tests) wired into the editor — `<F9>` breakpoints + gutter markers,
+  `:DapRun`, F5/F10/F11/F12 control, stop marker, `:DapStack`/`:DapVars`/`:DapEval`,
+  `dap.toml` + `docs/DAP.md`. Conformance via `onda-mock-dap`; lldb-dap/debugpy are the
+  documented real targets (not run in CI). Conditional breakpoints + side panel deferred.
 
 ### Outstanding (not implemented — each is large and/or needs external infra)
-- **DAP debugger** (Phase 3 W15): no `onda-dap` crate yet. Needs lldb-dap/debugpy to validate.
 - **Remote editing `scp://`** (Phase 3 W17): no `russh` transport; needs a live SSH host.
 - **libvterm** (Phase 3 W17): terminal still uses `vt100`; vendoring + nvim/tmux/htop
   regression is a large FFI effort.
