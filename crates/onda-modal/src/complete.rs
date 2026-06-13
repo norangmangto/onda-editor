@@ -50,6 +50,12 @@ pub const COMMAND_NAMES: &[&str] = &[
     "theme",
     "table",
     "fields",
+    "DapRun",
+    "DapStop",
+    "DapStack",
+    "DapVars",
+    "DapEval",
+    "DapBreakpoint",
 ];
 
 /// What a `<Tab>` press in the command line should complete.

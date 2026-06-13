@@ -76,6 +76,18 @@ pub enum ExCommand {
     GitResetHunk,
     /// `:theme [name]` — switch theme, or report the current one when name omitted.
     Theme(Option<String>),
+    /// `:DapRun` — launch a debug session for the current file.
+    DapRun,
+    /// `:DapStop` — end the debug session.
+    DapStop,
+    /// `:DapStack` — show the call stack.
+    DapStack,
+    /// `:DapVars` — show current-frame variables.
+    DapVars,
+    /// `:DapEval <expr>` — evaluate an expression in the stopped frame.
+    DapEval(String),
+    /// `:DapBreakpoint` — toggle a breakpoint on the current line.
+    DapBreakpoint,
     /// `:table` — toggle CSV/TSV virtual table view for the current buffer.
     Table,
     /// `:fields` — show the JSONL field schema overlay for the current buffer.
@@ -169,6 +181,14 @@ impl ExCommand {
             "GitBlame" | "gitblame" => Ok(ExCommand::GitBlame),
             "GitStageHunk" | "gitstagehunk" => Ok(ExCommand::GitStageHunk),
             "GitResetHunk" | "gitresethunk" => Ok(ExCommand::GitResetHunk),
+            "DapRun" | "daprun" => Ok(ExCommand::DapRun),
+            "DapStop" | "dapstop" => Ok(ExCommand::DapStop),
+            "DapStack" | "dapstack" => Ok(ExCommand::DapStack),
+            "DapVars" | "dapvars" => Ok(ExCommand::DapVars),
+            "DapBreakpoint" | "dapbreakpoint" => Ok(ExCommand::DapBreakpoint),
+            s if s.starts_with("DapEval ") || s.starts_with("dapeval ") => {
+                Ok(ExCommand::DapEval(s[8..].trim().to_string()))
+            }
             "table" | "csv" => Ok(ExCommand::Table),
             "fields" => Ok(ExCommand::Fields),
             "theme" => Ok(ExCommand::Theme(None)),

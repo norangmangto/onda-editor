@@ -146,6 +146,12 @@ impl DapClient {
         self.cmd_tx.send(cmd).await.map_err(|_| DapError::Closed)
     }
 
+    /// Non-blocking dispatch for callers outside an async context (the editor's
+    /// synchronous main loop). Returns false if the driver is gone or its queue full.
+    pub fn dispatch(&self, cmd: DapCommand) -> bool {
+        self.cmd_tx.try_send(cmd).is_ok()
+    }
+
     pub async fn set_breakpoints(
         &self,
         path: PathBuf,
