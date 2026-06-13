@@ -17,6 +17,8 @@ fn main() -> Result<()> {
         "bench" => bench(&args[1..]),
         "bench-compare" => bench_compare(),
         "gen-fixtures" => gen_fixtures(),
+        "install" => install(),
+        "bundle" => bundle(),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -42,6 +44,9 @@ TASKS:
     bench --check   Check benchmarks against bench/baseline.json (exit 1 on >5%
                     regression OR on any measured Phase 3 gate exceeding its budget:
                     dap_on_keypress_p99_ms<10, git_blame_render_ms<2, theme_switch_ms<5)
+    install         Build release + copy binary to ~/.local/bin and runtime/
+                    (themes, queries) to ~/.local/share/onda (idempotent)
+    bundle          Build release + assemble dist/ (binary + runtime/) for packaging
     bench-compare   Compare onda vs nvim/helix, write BENCH_REPORT.md
     gen-fixtures    Generate synthetic test fixtures (bench/fixtures/):
                       large_100mb.txt   — 100 MB line-numbered text
@@ -475,6 +480,97 @@ fn generate_markdown_table(rows: &[[String; 4]]) -> String {
         }
     }
     out
+}
+
+// ── install / bundle ────────────────────────────────────────────────────────────
+
+/// Copy `from` → `to`, creating parent dirs. Overwrites (idempotent install).
+fn copy_into(from: &Path, to: &Path) -> Result<()> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(from, to)
+        .with_context(|| format!("copy {} -> {}", from.display(), to.display()))?;
+    Ok(())
+}
+
+/// Recursively copy a directory tree.
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    for entry in walk_files(from) {
+        let rel = entry.strip_prefix(from).unwrap();
+        copy_into(&entry, &to.join(rel))?;
+    }
+    Ok(())
+}
+
+/// All files under `root` (recursive), skipping nothing — runtime dirs are small.
+fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Build release and assemble `dist/` (binary + bundled runtime grammars/themes).
+fn bundle() -> Result<()> {
+    let root = workspace_root();
+    println!("==> Building release binary...");
+    run_cmd("cargo", &["build", "--release", "-p", "onda"])?;
+
+    let dist = root.join("dist");
+    let _ = std::fs::remove_dir_all(&dist);
+    std::fs::create_dir_all(dist.join("bin"))?;
+
+    let binary = root.join("target/release/onda");
+    copy_into(&binary, &dist.join("bin/onda"))?;
+    // Bundle runtime (tree-sitter queries + themes) — the Phase 3 grammar-bundle risk.
+    copy_tree(&root.join("runtime"), &dist.join("share/onda/runtime"))?;
+
+    println!("==> dist/ assembled at {}", dist.display());
+    println!("    bin/onda + share/onda/runtime (themes, queries)");
+    Ok(())
+}
+
+/// Install the binary to ~/.local/bin and runtime to ~/.local/share/onda. Idempotent.
+fn install() -> Result<()> {
+    let root = workspace_root();
+    println!("==> Building release binary...");
+    run_cmd("cargo", &["build", "--release", "-p", "onda"])?;
+
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let home = PathBuf::from(home);
+    let bin_dst = home.join(".local/bin/onda");
+    let share_dst = home.join(".local/share/onda/runtime");
+
+    copy_into(&root.join("target/release/onda"), &bin_dst)?;
+    // Make the binary executable (copy preserves mode on unix, but be explicit).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&bin_dst)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin_dst, perms)?;
+    }
+    let _ = std::fs::remove_dir_all(&share_dst);
+    copy_tree(&root.join("runtime"), &share_dst)?;
+
+    let version = env!("CARGO_PKG_VERSION");
+    println!("==> Installed onda {version}");
+    println!("    binary:  {}", bin_dst.display());
+    println!("    runtime: {}", share_dst.display());
+    println!("    (ensure ~/.local/bin is on your PATH)");
+    Ok(())
 }
 
 // ── gen-fixtures ──────────────────────────────────────────────────────────────

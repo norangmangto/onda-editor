@@ -1,5 +1,7 @@
 /target
 /bench/target
+# Release bundle output (`cargo xtask bundle`)
+/dist/
 /.build
 Cargo.lock
 *.orig

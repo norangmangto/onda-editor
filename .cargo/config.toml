@@ -1,0 +1,3 @@
+# `cargo xtask <task>` runs the project automation crate (AGENTS.md references it).
+[alias]
+xtask = "run --release --quiet -p xtask --"
