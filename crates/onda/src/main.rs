@@ -456,6 +456,8 @@ impl<B: Backend> App<B> {
                 // TODO T6.4: always spawn worker, handle no-runtime gracefully.
             }
             if let Some(worker) = self.syntax_workers[doc_idx].as_ref() {
+                // Bump the version so the worker treats this as a fresh parse.
+                self.syntax_versions[doc_idx] = self.syntax_versions[doc_idx].wrapping_add(1);
                 let version = self.syntax_versions[doc_idx];
                 worker.request_parse(doc.rope().clone(), lang, version);
             }
@@ -472,6 +474,81 @@ impl<B: Backend> App<B> {
         }
         self.request_syntax_parse_for_doc(doc_idx);
         self.request_git_signs(doc_idx);
+    }
+
+    /// Resolve the window's syntax highlights into theme-styled char spans for the
+    /// visible region only (byte→char converted, last-writer-wins on overlap → a
+    /// sorted, non-overlapping list the renderer can stream).
+    fn build_highlights(&self, win_idx: usize, height: u16) -> Vec<onda_render::HlSpan> {
+        let doc_idx = self.windows[win_idx].doc_idx;
+        let worker = match self.syntax_workers.get(doc_idx).and_then(|w| w.as_ref()) {
+            Some(w) => w,
+            None => return Vec::new(),
+        };
+        let hls = match worker.current_highlights() {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+        let doc = &self.docs[doc_idx];
+        let rope = doc.rope();
+        let total_lines = doc.len_lines();
+
+        // Visible char window.
+        let vp = &self.windows[win_idx].viewport;
+        let first_line = vp.offset_line.min(total_lines.saturating_sub(1));
+        let last_line = (vp.offset_line + height as usize).min(total_lines);
+        let first_char = doc.line_to_char(first_line);
+        let last_char = if last_line >= total_lines {
+            rope.len_chars()
+        } else {
+            doc.line_to_char(last_line)
+        };
+        if last_char <= first_char {
+            return Vec::new();
+        }
+        let len = last_char - first_char;
+        let mut painted: Vec<Option<onda_render::Style>> = vec![None; len];
+
+        let start_byte = rope.char_to_byte(first_char);
+        let end_byte = rope.char_to_byte(last_char);
+        for span in hls.spans_in_range(start_byte, end_byte) {
+            let style = self.theme.syntax(scope_name(span.scope));
+            let cs = rope
+                .byte_to_char(span.start.min(rope.len_bytes()))
+                .max(first_char);
+            let ce = rope
+                .byte_to_char(span.end.min(rope.len_bytes()))
+                .min(last_char);
+            for slot in painted
+                .iter_mut()
+                .take(ce - first_char)
+                .skip(cs - first_char)
+            {
+                *slot = Some(style);
+            }
+        }
+
+        // Emit contiguous runs of equal style as HlSpans (absolute char coords).
+        let mut out = Vec::new();
+        let mut run_start = 0usize;
+        while run_start < len {
+            match painted[run_start] {
+                None => run_start += 1,
+                Some(style) => {
+                    let mut run_end = run_start + 1;
+                    while run_end < len && painted[run_end] == Some(style) {
+                        run_end += 1;
+                    }
+                    out.push(onda_render::HlSpan {
+                        start: first_char + run_start,
+                        end: first_char + run_end,
+                        style,
+                    });
+                    run_start = run_end;
+                }
+            }
+        }
+        out
     }
 
     // ── Git helpers ───────────────────────────────────────────────────────────
@@ -551,15 +628,21 @@ impl<B: Backend> App<B> {
         }
     }
 
-    /// Recompute git signs for the focused doc when its length changed since the last
-    /// request (cheap per-key change detector — keeps signs current within a frame).
-    fn maybe_refresh_git_signs(&mut self) {
+    /// Refresh syntax highlights and git signs for the focused doc when its length
+    /// changed since the last request (cheap per-key change detector). The syntax
+    /// worker debounces and rope clones are O(1)-ish, so this stays off the hot path.
+    fn maybe_refresh_decorations(&mut self) {
         let doc_idx = self.focused_win().doc_idx;
-        if self.docs.get(doc_idx).and_then(|d| d.path()).is_none() {
+        let len = match self.docs.get(doc_idx) {
+            Some(d) => d.len_chars(),
+            None => return,
+        };
+        if self.git_last_len.get(&doc_idx) == Some(&len) {
             return;
         }
-        let len = self.docs[doc_idx].len_chars();
-        if self.git_last_len.get(&doc_idx) != Some(&len) {
+        self.git_last_len.insert(doc_idx, len);
+        self.request_syntax_parse_for_doc(doc_idx);
+        if self.docs[doc_idx].path().is_some() {
             self.request_git_signs(doc_idx);
         }
     }
@@ -754,6 +837,20 @@ impl<B: Backend> App<B> {
         // Cursor position (computed before getting grid)
         let (cursor_col, cursor_row) = self.cursor_screen_pos(&rects);
 
+        // Syntax highlights per window, resolved to styled char spans *before* the
+        // grid borrow (so the worker output + theme can be read off `self`).
+        let mut highlights: HashMap<usize, Vec<onda_render::HlSpan>> = HashMap::new();
+        for (win_id, rect) in &rects {
+            let win_idx = win_id.0;
+            if win_idx >= self.windows.len() || self.window_to_pane.contains_key(&win_idx) {
+                continue;
+            }
+            let spans = self.build_highlights(win_idx, rect.height);
+            if !spans.is_empty() {
+                highlights.insert(win_idx, spans);
+            }
+        }
+
         // ── Phase 3: render into grid ─────────────────────────────────────────
         {
             let theme = &self.theme;
@@ -794,6 +891,10 @@ impl<B: Backend> App<B> {
                     .get(&doc_idx)
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
+                let hl_spans: &[onda_render::HlSpan] = highlights
+                    .get(&win_idx)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
 
                 if diag_spans.is_empty() {
                     DocumentView::render_with_highlights(
@@ -804,7 +905,7 @@ impl<B: Backend> App<B> {
                         mode_ind,
                         rect.y,
                         rect.height,
-                        None,
+                        hl_spans,
                         matches,
                         theme,
                     );
@@ -817,6 +918,7 @@ impl<B: Backend> App<B> {
                         mode_ind,
                         rect.y,
                         rect.height,
+                        hl_spans,
                         matches,
                         diag_spans,
                         theme,
@@ -957,7 +1059,7 @@ impl<B: Backend> App<B> {
                 self.handle_key(key)?;
 
                 // Refresh git gutter signs if the buffer changed this keypress.
-                self.maybe_refresh_git_signs();
+                self.maybe_refresh_decorations();
 
                 // Clear info messages on any keypress in normal mode
                 if self.mode == Mode::Normal && matches!(self.message, Message::Info(_)) {
@@ -3328,6 +3430,13 @@ fn run_bench_startup() -> Result<()> {
 fn run_editor(paths: Vec<PathBuf>) -> Result<()> {
     init_tracing();
 
+    // A multi-threaded tokio runtime backs all background workers (syntax, LSP,
+    // agent). Entering its context lets `tokio::spawn` work from the synchronous
+    // main loop; spawned tasks run on the runtime's own threads. The guard (and
+    // runtime) must outlive `app.run()`.
+    let runtime = tokio::runtime::Runtime::new()?;
+    let _rt_guard = runtime.enter();
+
     let config_result = Config::load();
     let config = config_result.config;
 
@@ -3368,6 +3477,9 @@ fn run_editor(paths: Vec<PathBuf>) -> Result<()> {
         config,
         true,
     );
+
+    // Spawn the syntax worker for the initial (CLI-opened) document.
+    app.try_spawn_syntax_worker_for_doc(0);
 
     // Show config warning if any
     if let Some(warn) = config_result.warning {
@@ -3482,6 +3594,25 @@ fn draw_cmd_completion(grid: &mut onda_render::Grid, comp: &CmdCompletion, ancho
         };
         grid.fill_rect(0, row, width, 1, style);
         grid.write_str(1, row, label, style);
+    }
+}
+
+/// Map a tree-sitter highlight scope to its theme scope-name suffix.
+fn scope_name(scope: onda_syntax::Scope) -> &'static str {
+    use onda_syntax::Scope::*;
+    match scope {
+        Keyword => "keyword",
+        Type => "type",
+        Function => "function",
+        Variable => "variable",
+        String => "string",
+        Number => "number",
+        Comment => "comment",
+        Operator => "operator",
+        Punctuation => "punctuation",
+        Attribute => "attribute",
+        Constant => "constant",
+        Error => "error",
     }
 }
 

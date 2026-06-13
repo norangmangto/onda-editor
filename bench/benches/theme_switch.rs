@@ -38,7 +38,7 @@ fn bench_theme_switch(c: &mut Criterion) {
                 ModeIndicator::Normal,
                 0,
                 40,
-                None,
+                &[],
                 &[],
                 &theme,
             );

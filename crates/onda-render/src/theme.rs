@@ -241,6 +241,12 @@ impl Theme {
     pub fn diff_change(&self) -> Style {
         self.get("diff.change", fgsty(Color::Yellow))
     }
+
+    /// Style for a syntax scope name (e.g. `"keyword"` → `syntax.keyword`), with a
+    /// reasonable default so unstyled scopes still read as plain text.
+    pub fn syntax(&self, scope: &str) -> Style {
+        self.get(&format!("syntax.{scope}"), Style::RESET)
+    }
 }
 
 fn sty(fg: Color, bg: Color) -> Style {

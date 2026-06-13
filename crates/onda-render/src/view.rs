@@ -99,18 +99,54 @@ impl Default for Viewport {
 
 // ── DocumentView ──────────────────────────────────────────────────────────────
 
-/// Placeholder type used in `render_with_highlights` until a real syntax-highlight
-/// type is introduced (avoids a dependency on `onda-syntax` in Phase 1).
-pub struct HighlightsPlaceholder;
+/// A pre-resolved syntax-highlight span: char range `[start, end)` painted with
+/// `style`. The binary resolves tree-sitter scopes to theme styles and passes these
+/// in, so `onda-render` stays free of an `onda-syntax` dependency. Spans must be
+/// sorted by `start` and non-overlapping (innermost-wins resolved by the caller).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HlSpan {
+    pub start: usize,
+    pub end: usize,
+    pub style: Style,
+}
+
+/// Advancing cursor over a sorted, non-overlapping `&[HlSpan]`. Because the render
+/// pass visits char indices monotonically, a single moving pointer resolves the
+/// active style in amortized O(1) per char.
+struct HlCursor<'a> {
+    spans: &'a [HlSpan],
+    idx: usize,
+}
+
+impl<'a> HlCursor<'a> {
+    fn new(spans: &'a [HlSpan]) -> Self {
+        Self { spans, idx: 0 }
+    }
+
+    /// Style for `char_idx` (monotonically non-decreasing across calls), if any span
+    /// covers it.
+    fn style_at(&mut self, char_idx: usize) -> Option<Style> {
+        while self.idx < self.spans.len() && self.spans[self.idx].end <= char_idx {
+            self.idx += 1;
+        }
+        let s = self.spans.get(self.idx)?;
+        if s.start <= char_idx && char_idx < s.end {
+            Some(s.style)
+        } else {
+            None
+        }
+    }
+}
 
 /// Renders the document content into a grid region.
 pub struct DocumentView;
 
 impl DocumentView {
-    /// Render visible lines of `doc` into `grid`, with optional search-match highlighting.
+    /// Render visible lines of `doc` into `grid`, applying syntax `highlights`,
+    /// selection/cursor styling, and search-match highlighting.
     ///
-    /// `_highlights` is reserved for future syntax-highlight data (currently unused).
-    /// `search_matches` is a slice of char-index ranges to highlight with reversed style.
+    /// `highlights` are pre-resolved styled char spans (sorted, non-overlapping);
+    /// `search_matches` is a slice of char-index ranges shown reversed.
     #[allow(clippy::too_many_arguments)]
     pub fn render_with_highlights(
         grid: &mut Grid,
@@ -120,13 +156,14 @@ impl DocumentView {
         mode: ModeIndicator,
         row_offset: u16,
         height: u16,
-        _highlights: Option<&HighlightsPlaceholder>,
+        highlights: &[HlSpan],
         search_matches: &[onda_core::Range],
         theme: &Theme,
     ) {
         let text_col_start = viewport.line_nr_width;
         let text_width = grid.width().saturating_sub(text_col_start) as usize;
         let total_lines = doc.len_lines();
+        let mut hl = HlCursor::new(highlights);
 
         for screen_row in 0..height {
             let doc_line = viewport.offset_line + screen_row as usize;
@@ -179,13 +216,15 @@ impl DocumentView {
                     break;
                 }
                 let char_idx = row_char_start + i;
-                let mut style = Self::char_style(char_idx, sel, mode, theme);
+                // Syntax style is the base; cursor/selection override it.
+                let base = hl.style_at(char_idx).unwrap_or_else(|| theme.text());
+                let mut style = Self::char_style(char_idx, sel, mode, theme, base);
 
                 // Apply search-match highlight (reversed style) if in a match range.
                 let in_match = search_matches
                     .iter()
                     .any(|r| char_idx >= r.from() && char_idx < r.to());
-                if in_match && style == theme.text() {
+                if in_match && style == base {
                     // Reverse: swap fg/bg for the match cells
                     let cursor = theme.cursor_normal();
                     style = Style {
@@ -290,7 +329,7 @@ impl DocumentView {
                     break;
                 }
                 let char_idx = row_char_start + i;
-                let style = Self::char_style(char_idx, sel, mode, theme);
+                let style = Self::char_style(char_idx, sel, mode, theme, theme.text());
                 let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1) as u16;
                 grid.set(
                     col,
@@ -321,6 +360,7 @@ impl DocumentView {
         mode: ModeIndicator,
         row_offset: u16,
         height: u16,
+        highlights: &[HlSpan],
         search_matches: &[onda_core::Range],
         diagnostics: &[DiagnosticSpan],
         theme: &Theme,
@@ -334,7 +374,7 @@ impl DocumentView {
             mode,
             row_offset,
             height,
-            None,
+            highlights,
             search_matches,
             theme,
         );
@@ -395,7 +435,15 @@ impl DocumentView {
         }
     }
 
-    fn char_style(char_idx: usize, sel: &Selection, mode: ModeIndicator, theme: &Theme) -> Style {
+    /// Resolve a cell's style: cursor/selection override `base` (the syntax/text
+    /// style); otherwise `base` shows through.
+    fn char_style(
+        char_idx: usize,
+        sel: &Selection,
+        mode: ModeIndicator,
+        theme: &Theme,
+        base: Style,
+    ) -> Style {
         let primary = sel.primary();
         let is_cursor = char_idx == primary.head;
 
@@ -407,14 +455,14 @@ impl DocumentView {
                 if is_cursor {
                     theme.cursor_normal()
                 } else {
-                    theme.text()
+                    base
                 }
             }
             ModeIndicator::Insert => {
                 if is_cursor {
                     theme.cursor_insert()
                 } else {
-                    theme.text()
+                    base
                 }
             }
             ModeIndicator::Visual | ModeIndicator::VisualLine => {
@@ -424,7 +472,7 @@ impl DocumentView {
                 } else if in_selection {
                     theme.selection()
                 } else {
-                    theme.text()
+                    base
                 }
             }
         }
@@ -823,5 +871,81 @@ impl Compositor {
             attrs: Attribute::empty(),
         };
         self.buf.current_mut().write_str(0, 0, &s, overlay);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onda_core::{Document, Selection};
+
+    fn doc_with(text: &str) -> Document {
+        let mut d = Document::new_empty();
+        let cs = onda_core::transaction::ChangeSetBuilder::new(0)
+            .insert(text)
+            .build();
+        d.apply(&onda_core::Transaction::new(cs)).unwrap();
+        d
+    }
+
+    #[test]
+    fn hl_cursor_resolves_styles_monotonically() {
+        let red = Style::default().fg(Color::Red);
+        let blue = Style::default().fg(Color::Blue);
+        let spans = [
+            HlSpan {
+                start: 0,
+                end: 3,
+                style: red,
+            },
+            HlSpan {
+                start: 5,
+                end: 8,
+                style: blue,
+            },
+        ];
+        let mut c = HlCursor::new(&spans);
+        assert_eq!(c.style_at(0), Some(red));
+        assert_eq!(c.style_at(2), Some(red));
+        assert_eq!(c.style_at(3), None); // gap
+        assert_eq!(c.style_at(4), None);
+        assert_eq!(c.style_at(5), Some(blue));
+        assert_eq!(c.style_at(9), None); // past end
+    }
+
+    #[test]
+    fn render_applies_syntax_style_to_cells() {
+        let mut grid = Grid::new(40, 4);
+        let doc = doc_with("fn main\n");
+        let sel = Selection::point(100); // cursor off-screen so it doesn't override
+        let vp = Viewport {
+            offset_line: 0,
+            offset_col: 0,
+            scrolloff: 0,
+            line_nr_width: 0,
+        };
+        let theme = Theme::default_dark();
+        let kw = theme.syntax("keyword"); // syntax.keyword from onda-dark (magenta)
+                                          // Highlight "fn" (chars 0..2) as keyword.
+        let spans = [HlSpan {
+            start: 0,
+            end: 2,
+            style: kw,
+        }];
+        DocumentView::render_with_highlights(
+            &mut grid,
+            &doc,
+            &sel,
+            &vp,
+            ModeIndicator::Normal,
+            0,
+            4,
+            &spans,
+            &[],
+            &theme,
+        );
+        // Cell at col 0 ('f') carries the keyword fg; col 3 ('m') does not.
+        assert_eq!(grid.get(0, 0).unwrap().style.fg, kw.fg);
+        assert_ne!(grid.get(3, 0).unwrap().style.fg, kw.fg);
     }
 }
