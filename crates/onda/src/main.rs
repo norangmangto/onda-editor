@@ -138,6 +138,15 @@ enum GitPickerAction {
     Discard,
 }
 
+/// Active command-line completion (T18.3): a cycling candidate list with the
+/// fixed prefix (`base`) that precedes the token being completed.
+#[derive(Debug, Clone)]
+struct CmdCompletion {
+    base: String,
+    candidates: Vec<String>,
+    selected: usize,
+}
+
 // ── SearchMode ────────────────────────────────────────────────────────────────
 
 /// Whether we are entering a forward or backward search pattern in command mode.
@@ -235,6 +244,8 @@ struct App<B: Backend> {
     backend: B,
     running: bool,
     command_line: CommandLine,
+    /// Active command-line completion popup, if any (T18.3).
+    cmd_completion: Option<CmdCompletion>,
     bg_tx: mpsc::SyncSender<BgMessage>,
     bg_rx: mpsc::Receiver<BgMessage>,
 
@@ -757,6 +768,13 @@ impl<B: Backend> App<B> {
             // Message line
             MessageLine::render(grid, msg_row, &msg);
 
+            // Command-line completion popup (above the command line).
+            if self.mode == Mode::Command {
+                if let Some(comp) = self.cmd_completion.as_ref() {
+                    draw_cmd_completion(grid, comp, msg_row);
+                }
+            }
+
             // Picker overlay
             if let Some((title, query, items, pw, ph)) = picker_data {
                 let items_ref: Vec<(&str, bool)> =
@@ -1213,14 +1231,36 @@ impl<B: Backend> App<B> {
     }
 
     fn handle_command_key(&mut self, key: Key) -> Result<()> {
+        // Completion: <Tab>/<S-Tab> cycle candidates; never leaves command mode.
+        // File/command completion only applies to `:` ex-commands, not `/` search.
+        match &key {
+            Key::Tab if self.search_input_dir.is_none() => {
+                self.cmd_complete_advance(1);
+                return Ok(());
+            }
+            Key::BackTab if self.search_input_dir.is_none() => {
+                self.cmd_complete_advance(-1);
+                return Ok(());
+            }
+            _ => {}
+        }
+
         match &key {
             Key::Esc => {
+                // A first <Esc> while a completion popup is open just dismisses it.
+                if self.cmd_completion.take().is_some() {
+                    return Ok(());
+                }
                 self.command_line.clear();
                 self.search_input_dir = None;
                 self.mode = Mode::Normal;
                 self.message = Message::None;
             }
             Key::Enter => {
+                // <CR> accepts an open completion (keeps the line) without submitting.
+                if self.cmd_completion.take().is_some() {
+                    return Ok(());
+                }
                 if let Some(dir) = self.search_input_dir.take() {
                     // Search mode: compile pattern and jump
                     let pattern = self.command_line.as_str().to_string();
@@ -1258,6 +1298,7 @@ impl<B: Backend> App<B> {
                 }
             }
             Key::Backspace => {
+                self.cmd_completion = None;
                 if self.command_line.as_str().is_empty() {
                     self.search_input_dir = None;
                     self.mode = Mode::Normal;
@@ -1267,11 +1308,46 @@ impl<B: Backend> App<B> {
                 }
             }
             Key::Char(c, _) => {
+                self.cmd_completion = None;
                 self.command_line.push_char(*c);
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Advance command-line completion by `dir` (+1 forward, -1 backward), computing
+    /// candidates on first use, then writing the selected candidate into the line.
+    fn cmd_complete_advance(&mut self, dir: i32) {
+        if self.cmd_completion.is_none() {
+            let extra: Vec<String> = self.lua_commands.keys().cloned().collect();
+            let line = self.command_line.as_str().to_string();
+            let (base, candidates) = match onda_modal::analyze(&line, &extra) {
+                onda_modal::Completion::Commands {
+                    base, candidates, ..
+                } => (base, candidates),
+                onda_modal::Completion::Paths {
+                    base, candidates, ..
+                } => (base, candidates),
+                onda_modal::Completion::None => return,
+            };
+            self.cmd_completion = Some(CmdCompletion {
+                base,
+                candidates,
+                selected: 0,
+            });
+        } else if let Some(c) = self.cmd_completion.as_mut() {
+            let n = c.candidates.len();
+            if n > 0 {
+                c.selected = ((c.selected as i32 + dir).rem_euclid(n as i32)) as usize;
+            }
+        }
+        // Write the selected candidate into the command line.
+        if let Some(c) = self.cmd_completion.as_ref() {
+            if let Some(cand) = c.candidates.get(c.selected) {
+                self.command_line.buffer = format!("{}{}", c.base, cand);
+            }
+        }
     }
 
     fn execute_ex_command(&mut self, cmd: ExCommand) -> Result<()> {
@@ -3000,6 +3076,7 @@ fn make_app<B: Backend>(
         backend,
         running,
         command_line: CommandLine::new(),
+        cmd_completion: None,
         bg_tx,
         bg_rx,
         config,
@@ -3174,6 +3251,56 @@ fn draw_git_signs(
                 Cell::new(sign.glyph().to_string(), style),
             );
         }
+    }
+}
+
+/// Draw the command-line completion popup, bottom-anchored just above `anchor_row`.
+/// Shows up to 8 candidates, scrolled to keep the selected item visible.
+fn draw_cmd_completion(grid: &mut onda_render::Grid, comp: &CmdCompletion, anchor_row: u16) {
+    use onda_render::{Color, Style};
+
+    if comp.candidates.is_empty() {
+        return;
+    }
+    const MAX_VISIBLE: usize = 8;
+    let n = comp.candidates.len();
+    let visible = MAX_VISIBLE.min(n);
+
+    // Scroll window so the selected item is shown.
+    let start = if comp.selected >= visible {
+        comp.selected + 1 - visible
+    } else {
+        0
+    };
+    let slice = &comp.candidates[start..start + visible];
+
+    // Display the basename portion for paths, but the full candidate otherwise.
+    let labels: Vec<&str> = slice
+        .iter()
+        .map(|c| c.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(c))
+        .collect();
+    let width = labels
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(8)
+        + 2;
+    let width = (width as u16).min(grid.width());
+
+    let menu_bg = Style::default().fg(Color::White).bg(Color::DarkGray);
+    let sel_bg = Style::default().fg(Color::Black).bg(Color::LightCyan);
+
+    let top = anchor_row.saturating_sub(visible as u16);
+    for (i, label) in labels.iter().enumerate() {
+        let row = top + i as u16;
+        let style = if start + i == comp.selected {
+            sel_bg
+        } else {
+            menu_bg
+        };
+        grid.fill_rect(0, row, width, 1, style);
+        grid.write_str(1, row, label, style);
     }
 }
 

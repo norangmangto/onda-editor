@@ -1,4 +1,5 @@
 pub mod command;
+pub mod complete;
 pub mod jumplist;
 pub mod key;
 pub mod keymap;
@@ -13,6 +14,7 @@ pub mod search;
 pub mod textobj;
 
 pub use command::{CommandError, CommandLine, ExCommand};
+pub use complete::{analyze, Completion};
 pub use jumplist::JumpList;
 pub use key::{Key, KeyMod};
 pub use keymap::{Action, Keymap, KeymapState, PendingResult, TextObj};
