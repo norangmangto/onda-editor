@@ -66,6 +66,14 @@ pub enum ExCommand {
     GitUnstage,
     /// `:GitDiscard` — discard worktree changes to the current file.
     GitDiscard,
+    /// `:GitDiff` — show the unified diff of the current file vs HEAD.
+    GitDiff,
+    /// `:GitBlame` — show blame for the current line.
+    GitBlame,
+    /// `:GitStageHunk` — stage the hunk under the cursor.
+    GitStageHunk,
+    /// `:GitResetHunk` — reset the hunk under the cursor.
+    GitResetHunk,
     /// `:theme [name]` — switch theme, or report the current one when name omitted.
     Theme(Option<String>),
     /// `:table` — toggle CSV/TSV virtual table view for the current buffer.
@@ -157,6 +165,10 @@ impl ExCommand {
             "GitStage" | "gitstage" => Ok(ExCommand::GitStage),
             "GitUnstage" | "gitunstage" => Ok(ExCommand::GitUnstage),
             "GitDiscard" | "gitdiscard" => Ok(ExCommand::GitDiscard),
+            "GitDiff" | "gitdiff" => Ok(ExCommand::GitDiff),
+            "GitBlame" | "gitblame" => Ok(ExCommand::GitBlame),
+            "GitStageHunk" | "gitstagehunk" => Ok(ExCommand::GitStageHunk),
+            "GitResetHunk" | "gitresethunk" => Ok(ExCommand::GitResetHunk),
             "table" | "csv" => Ok(ExCommand::Table),
             "fields" => Ok(ExCommand::Fields),
             "theme" => Ok(ExCommand::Theme(None)),

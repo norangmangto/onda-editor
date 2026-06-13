@@ -98,7 +98,10 @@ pub fn gutter_signs(
 
 /// Fetch the raw bytes of `rel_path` as stored in HEAD, or `None` when the file is
 /// not tracked in HEAD (new file, or an unborn branch with no commits yet).
-fn head_blob_bytes(repo: &Repository, rel_path: &Path) -> Result<Option<Vec<u8>>, GitError> {
+pub(crate) fn head_blob_bytes(
+    repo: &Repository,
+    rel_path: &Path,
+) -> Result<Option<Vec<u8>>, GitError> {
     let head = match repo.head() {
         Ok(h) => h,
         // Unborn branch (no commits): everything is new.

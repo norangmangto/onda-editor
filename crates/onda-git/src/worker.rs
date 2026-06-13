@@ -28,6 +28,14 @@ pub enum GitCommand {
     Unstage { path: PathBuf },
     /// Discard worktree changes to the file at `path`, then re-emit status.
     Discard { path: PathBuf },
+    /// Compute unified-diff hunks of the live buffer vs HEAD.
+    Diff { path: PathBuf, buffer: Vec<u8> },
+    /// Blame the file at `path`.
+    Blame { path: PathBuf },
+    /// Stage the hunk containing 0-based `line`, then re-emit status.
+    StageHunk { path: PathBuf, line: usize },
+    /// Reset the hunk containing 0-based `line`, then re-emit status.
+    ResetHunk { path: PathBuf, line: usize },
     /// Stop the worker thread.
     Shutdown,
 }
@@ -44,6 +52,16 @@ pub enum GitEvent {
     Status {
         root: PathBuf,
         entries: Vec<status::FileStatus>,
+    },
+    /// Unified-diff hunks for a file vs HEAD.
+    Diff {
+        path: PathBuf,
+        hunks: Vec<crate::blame::DiffHunk>,
+    },
+    /// Per-line blame annotations for a file.
+    Blame {
+        path: PathBuf,
+        lines: Vec<crate::blame::BlameLine>,
     },
     /// A non-fatal error (logged + shown on the message line).
     Error(String),
@@ -88,6 +106,22 @@ impl GitWorker {
 
     pub fn discard(&self, path: PathBuf) {
         let _ = self.tx.send(GitCommand::Discard { path });
+    }
+
+    pub fn diff(&self, path: PathBuf, buffer: Vec<u8>) {
+        let _ = self.tx.send(GitCommand::Diff { path, buffer });
+    }
+
+    pub fn blame(&self, path: PathBuf) {
+        let _ = self.tx.send(GitCommand::Blame { path });
+    }
+
+    pub fn stage_hunk(&self, path: PathBuf, line: usize) {
+        let _ = self.tx.send(GitCommand::StageHunk { path, line });
+    }
+
+    pub fn reset_hunk(&self, path: PathBuf, line: usize) {
+        let _ = self.tx.send(GitCommand::ResetHunk { path, line });
     }
 }
 
@@ -147,6 +181,31 @@ fn handle(cmd: GitCommand, events: &Sender<GitEvent>) -> Result<bool, String> {
         GitCommand::Discard { path } => {
             let (repo, rel) = crate::open_for(&path).map_err(|e| e.to_string())?;
             status::discard_file(&repo, &rel).map_err(|e| e.to_string())?;
+            emit_status(&path, events)?;
+        }
+
+        GitCommand::Diff { path, buffer } => {
+            let (repo, rel) = crate::open_for(&path).map_err(|e| e.to_string())?;
+            let hunks =
+                crate::blame::file_hunks(&repo, &rel, &buffer).map_err(|e| e.to_string())?;
+            let _ = events.send(GitEvent::Diff { path, hunks });
+        }
+
+        GitCommand::Blame { path } => {
+            let (repo, rel) = crate::open_for(&path).map_err(|e| e.to_string())?;
+            let lines = crate::blame::blame_file(&repo, &rel).map_err(|e| e.to_string())?;
+            let _ = events.send(GitEvent::Blame { path, lines });
+        }
+
+        GitCommand::StageHunk { path, line } => {
+            let (repo, rel) = crate::open_for(&path).map_err(|e| e.to_string())?;
+            crate::blame::stage_hunk(&repo, &rel, line).map_err(|e| e.to_string())?;
+            emit_status(&path, events)?;
+        }
+
+        GitCommand::ResetHunk { path, line } => {
+            let (repo, rel) = crate::open_for(&path).map_err(|e| e.to_string())?;
+            crate::blame::reset_hunk(&repo, &rel, line).map_err(|e| e.to_string())?;
             emit_status(&path, events)?;
         }
     }

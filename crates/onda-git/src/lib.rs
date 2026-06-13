@@ -10,10 +10,12 @@ use std::path::{Path, PathBuf};
 use git2::Repository;
 use thiserror::Error;
 
+pub mod blame;
 pub mod diff;
 pub mod status;
 pub mod worker;
 
+pub use blame::{blame_file, file_hunks, reset_hunk, stage_hunk, BlameLine, DiffHunk};
 pub use diff::{gutter_signs, LineSign};
 pub use status::{discard_file, file_statuses, stage_file, unstage_file, FileState, FileStatus};
 pub use worker::{GitCommand, GitEvent, GitWorker};

@@ -1742,6 +1742,57 @@ impl<B: Backend> App<B> {
                     self.message = Message::Error("Git: current buffer has no file".into());
                 }
             }
+            ExCommand::GitDiff => {
+                if let Some(path) = self.doc().path().map(|p| p.to_path_buf()) {
+                    let buffer = self.doc().rope().to_string().into_bytes();
+                    self.ensure_git_worker();
+                    if let Some(worker) = self.git_worker.as_ref() {
+                        worker.diff(path, buffer);
+                    }
+                    self.message = Message::Info("Git: computing diff…".into());
+                } else {
+                    self.message = Message::Error("Git: current buffer has no file".into());
+                }
+            }
+            ExCommand::GitBlame => {
+                if let Some(path) = self.doc().path().map(|p| p.to_path_buf()) {
+                    self.ensure_git_worker();
+                    if let Some(worker) = self.git_worker.as_ref() {
+                        worker.blame(path);
+                    }
+                    self.message = Message::Info("Git: blaming…".into());
+                } else {
+                    self.message = Message::Error("Git: current buffer has no file".into());
+                }
+            }
+            ExCommand::GitStageHunk => {
+                if let Some(path) = self.doc().path().map(|p| p.to_path_buf()) {
+                    let line = self.doc().char_to_line(self.selection().primary().head);
+                    self.ensure_git_worker();
+                    if let Some(worker) = self.git_worker.as_ref() {
+                        worker.stage_hunk(path, line);
+                    }
+                    let doc_idx = self.focused_win().doc_idx;
+                    self.request_git_signs(doc_idx);
+                    self.message = Message::Info(format!("Git: staged hunk at line {}", line + 1));
+                } else {
+                    self.message = Message::Error("Git: current buffer has no file".into());
+                }
+            }
+            ExCommand::GitResetHunk => {
+                if let Some(path) = self.doc().path().map(|p| p.to_path_buf()) {
+                    let line = self.doc().char_to_line(self.selection().primary().head);
+                    self.ensure_git_worker();
+                    if let Some(worker) = self.git_worker.as_ref() {
+                        worker.reset_hunk(path, line);
+                    }
+                    let doc_idx = self.focused_win().doc_idx;
+                    self.request_git_signs(doc_idx);
+                    self.message = Message::Info(format!("Git: reset hunk at line {}", line + 1));
+                } else {
+                    self.message = Message::Error("Git: current buffer has no file".into());
+                }
+            }
             ExCommand::Theme(name) => match name {
                 Some(n) => {
                     self.apply_theme(&n);
@@ -3103,6 +3154,59 @@ impl<B: Backend> App<B> {
                     self.rebuild_git_picker();
                 }
             }
+            onda_git::GitEvent::Diff { path, hunks } => {
+                if hunks.is_empty() {
+                    self.message = Message::Info("Git: no changes vs HEAD".into());
+                    return;
+                }
+                // Open the unified diff in a scratch buffer.
+                let mut text = format!(
+                    "# git diff (working vs HEAD) — {}\n",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                );
+                for h in &hunks {
+                    text.push_str(&format!(
+                        "@@ -{},{} +{},{} @@\n",
+                        h.old_start, h.old_lines, h.new_start, h.new_lines
+                    ));
+                    for l in &h.lines {
+                        text.push_str(l);
+                        text.push('\n');
+                    }
+                }
+                let mut doc = Document::new_empty();
+                let cs = onda_core::transaction::ChangeSetBuilder::new(0)
+                    .insert(&text)
+                    .build();
+                let _ = doc.apply(&Transaction::new(cs));
+                let doc_idx = self.docs.len();
+                self.docs.push(doc);
+                self.focused_win_mut().doc_idx = doc_idx;
+                *self.selection_mut() = Selection::point(0);
+                *self.viewport_mut() = Viewport::new();
+                self.message = Message::Info(format!("Git: diff ({} hunks)", hunks.len()));
+            }
+            onda_git::GitEvent::Blame { path, lines } => {
+                let doc_idx = self.focused_win().doc_idx;
+                // Only show if blame is for the focused doc.
+                if self.docs[doc_idx].path() != Some(path.as_path()) {
+                    return;
+                }
+                let cur = self.doc().char_to_line(self.selection().primary().head);
+                if let Some(b) = lines.iter().find(|b| b.line == cur) {
+                    let date = format_unix_date(b.time);
+                    self.hover_float = Some(HoverFloat {
+                        lines: vec![
+                            format!("{} {} {}", b.commit, b.author, date),
+                            b.summary.clone(),
+                        ],
+                        col: 4,
+                        row: 2,
+                    });
+                } else {
+                    self.message = Message::Info("Git: no blame for this line".into());
+                }
+            }
             onda_git::GitEvent::Error(msg) => {
                 self.message = Message::Error(format!("git: {msg}"));
             }
@@ -3793,6 +3897,24 @@ fn render_table(
         screen_row += 1;
         line += 1;
     }
+}
+
+/// Format a unix timestamp (seconds, UTC) as `YYYY-MM-DD` without a date crate
+/// (Howard Hinnant's days-from-civil, inverted). Used for git blame display.
+fn format_unix_date(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    // days → civil date (UTC), algorithm from chrono-compatible public domain code.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02}")
 }
 
 /// Map a tree-sitter highlight scope to its theme scope-name suffix.
