@@ -6,6 +6,10 @@ members = [
     "crates/onda-render",
     "crates/onda-config",
     "crates/onda-syntax",
+    "crates/onda-lsp",
+    "crates/onda-terminal",
+    "crates/onda-session",
+    "crates/onda-lua",
     "xtask",
     "bench",
 ]
@@ -28,7 +32,7 @@ unicode-width = "0.2"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "io-util", "fs", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "io-util", "fs", "macros", "time", "process"] }
 
 # Observability
 tracing = "0.1"
@@ -75,12 +79,31 @@ notify = "6"
 # Gitignore-aware directory traversal
 ignore = "0.4"
 
+# LSP types
+lsp-types = "0.97"
+
+# PTY management
+portable-pty = "0.9"
+
+# VT100 terminal emulation
+vt100 = "0.16"
+
+# Lua 5.4 embedding
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+
+# URL parsing (used by lsp-types)
+url = "2"
+
 # Crate cross-references
 onda-core = { path = "crates/onda-core" }
 onda-render = { path = "crates/onda-render" }
 onda-modal = { path = "crates/onda-modal" }
 onda-config = { path = "crates/onda-config" }
 onda-syntax = { path = "crates/onda-syntax" }
+onda-lsp = { path = "crates/onda-lsp" }
+onda-terminal = { path = "crates/onda-terminal" }
+onda-session = { path = "crates/onda-session" }
+onda-lua = { path = "crates/onda-lua" }
 
 [profile.release]
 opt-level = 3

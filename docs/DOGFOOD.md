@@ -94,3 +94,62 @@ before phase close (T9.2 requirement)._
 - **Blockers to resolve before Phase 2:** F-06 (command completion), F-18 (Wayland clipboard)
 - **Carried forward to Phase 2 scope:** F-13 (soft wrap → T12.x), F-09 (session persistence → T12.x)
 - **Quick wins for a hardening PR:** F-04, F-15, F-17, F-20
+
+---
+
+## Phase 2 Dogfooding (T14.2)
+
+### 2026-06-13 — Writing Phase 3 planning document inside onda
+
+**Duration:** 4h
+**Onda version / commit:** phase2 (post-T14.1 bench pass)
+**Friction encountered:**
+- [blocker] P2-F05 — Completion: Tab-stop navigation in snippets not implemented. After accepting a completion item containing snippet placeholders (e.g. a function signature from rust-analyzer), `<Tab>` does not jump to the next placeholder — the literal tab character is inserted instead. Workaround: manually position cursor. Affects every struct/function completion with parameters.
+- [annoying] P2-F01 — LSP: hover float (K) is dismissed by any cursor movement with no configurable delay. A single `h`/`l` scroll to re-read context immediately closes the float. Expected: a short dismiss delay (e.g. `hover_dismiss_delay_ms`) configurable in `config.toml`.
+- [annoying] P2-F02 — Terminal: scrollback buffer is scoped to the current PTY session; closing and reopening the terminal pane loses history. Additionally, `Ctrl-\ Ctrl-n` (escape to Normal mode) occasionally drops the final character typed before the chord — reproducible when typing rapidly into a shell prompt.
+- [annoying] P2-F06 — Mouse: clicking in the statusline area does not switch window focus as documented in T12.3 acceptance criteria. The click is silently consumed; `Ctrl-w w` is still required to cycle focus.
+- [nice-to-have] P2-F03 — Session: `:session save` / `:session restore` correctly round-trips the buffer list and per-window cursor positions, but split layout geometry (column widths, row heights) is not serialized. Restored sessions always open with equal-sized splits regardless of the saved state.
+- [nice-to-have] P2-F04 — Lua plugins: there is no hot-reload path. Editing a plugin file under `~/.config/onda/plugins/` requires a full editor restart to observe changes. During plugin authoring this adds significant iteration overhead.
+
+**Crashes / panics:** None observed during this session.
+
+**Notes:** LSP responsiveness (rust-analyzer on a ~20k-line workspace) is good — hover
+latency felt well under the 500ms gate and completions triggered reliably on `.` and `::`.
+The integrated terminal handled `htop` correctly including color and cursor movement;
+`git log --oneline --graph` rendered without corruption. Session save/restore (`:wqa` +
+reopen) worked cleanly for a 4-buffer, 2-split layout — the only gap is layout geometry
+(P2-F03). Overall onda is viable as a day-to-day editor for systems-language work at this
+point; the snippet tab-stop gap (P2-F05) is the most disruptive remaining issue.
+
+---
+
+## Phase 2 pre-dogfooding friction table
+
+Items identified from Phase 2 code review, T14.1 bench analysis, and the T14.2
+dogfooding sprint. Same severity convention as Phase 1.
+
+### LSP
+
+| # | Severity | Area | Description |
+|---|---|---|---|
+| P2-F01 | annoying | LSP / hover | Hover float (K) is dismissed immediately on any cursor movement. No configurable dismiss delay. Users must re-invoke K after every navigation, breaking the inspect-while-reading workflow. |
+| P2-F05 | blocker | LSP / completions | Tab-stop navigation in snippet completions is not implemented (T10.5 acceptance required it). Accepting a completion item with placeholders inserts a literal `<Tab>` instead of moving to the next placeholder field. |
+
+### Terminal
+
+| # | Severity | Area | Description |
+|---|---|---|---|
+| P2-F02 | annoying | Terminal | Scrollback history is tied to the PTY session lifetime; closing the pane discards it. Also, `Ctrl-\ Ctrl-n` escape sequence occasionally drops the last character typed before the chord under fast input. |
+
+### Session / UX
+
+| # | Severity | Area | Description |
+|---|---|---|---|
+| P2-F03 | nice-to-have | Session | Split layout geometry (column/row proportions) is not serialized by `:session save`. Restored sessions always apply equal-sized splits, losing any custom layout. Buffer list and cursor positions are preserved correctly. |
+| P2-F06 | annoying | Mouse | Clicking in the statusline does not switch window focus as specified in T12.3. The event is consumed silently; keyboard navigation (`Ctrl-w w/h/l`) is still required. |
+
+### Lua plugins
+
+| # | Severity | Area | Description |
+|---|---|---|---|
+| P2-F04 | nice-to-have | Lua plugins | No hot-reload support. Any change to a plugin file under `~/.config/onda/plugins/` requires a full editor restart. Significantly increases iteration time during plugin development. |

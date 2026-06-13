@@ -12,6 +12,10 @@ pub enum Mode {
     VisualBlock,
     /// Command-line (`:`) mode.
     Command,
+    /// Integrated terminal pane: all keys forwarded raw to PTY.
+    Terminal,
+    /// Terminal scrollback browsing: vim motions scroll the history.
+    TerminalScroll,
 }
 
 impl Mode {
@@ -25,5 +29,9 @@ impl Mode {
 
     pub fn is_normal(self) -> bool {
         self == Mode::Normal
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Mode::Terminal | Mode::TerminalScroll)
     }
 }
