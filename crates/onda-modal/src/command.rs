@@ -66,6 +66,8 @@ pub enum ExCommand {
     GitUnstage,
     /// `:GitDiscard` — discard worktree changes to the current file.
     GitDiscard,
+    /// `:theme [name]` — switch theme, or report the current one when name omitted.
+    Theme(Option<String>),
     /// Custom command registered by a Lua plugin.
     LuaCommand(String, Vec<String>),
 }
@@ -151,6 +153,15 @@ impl ExCommand {
             "GitStage" | "gitstage" => Ok(ExCommand::GitStage),
             "GitUnstage" | "gitunstage" => Ok(ExCommand::GitUnstage),
             "GitDiscard" | "gitdiscard" => Ok(ExCommand::GitDiscard),
+            "theme" => Ok(ExCommand::Theme(None)),
+            s if s.starts_with("theme ") => {
+                let name = s[6..].trim().to_string();
+                Ok(ExCommand::Theme(if name.is_empty() {
+                    None
+                } else {
+                    Some(name)
+                }))
+            }
             s if s.starts_with("sp ") || s.starts_with("split ") => {
                 let path = s
                     .split_once(' ')

@@ -57,6 +57,8 @@ enum BgMessage {
     Git(onda_git::GitEvent),
     /// The repo `.git` directory changed on disk (external `git` command, etc.).
     GitRepoChanged,
+    /// The active theme file changed on disk (live reload, T18.1).
+    ThemeReload,
 }
 
 // ── Latency tracer ────────────────────────────────────────────────────────────
@@ -252,6 +254,17 @@ struct App<B: Backend> {
     // ── Config ────────────────────────────────────────────────────────────────
     #[allow(dead_code)]
     config: Config,
+
+    // ── Theme ─────────────────────────────────────────────────────────────────
+    /// Active theme (T18.1).
+    theme: onda_render::Theme,
+    /// Filesystem watcher on the active theme file (live reload), kept alive.
+    theme_watcher: Option<notify::RecommendedWatcher>,
+    /// Path of the on-disk theme file currently watched, if any.
+    theme_path: Option<PathBuf>,
+    /// Highlight overrides registered by Lua plugins (`onda.highlight.set`),
+    /// re-applied on top of the theme after every switch/reload (the ThemeChanged effect).
+    lua_highlights: Vec<(String, onda_lua::api::HighlightOpts)>,
 
     // ── LSP ───────────────────────────────────────────────────────────────────
     /// LSP manager (None when tokio runtime unavailable, e.g. bench).
@@ -603,6 +616,60 @@ impl<B: Backend> App<B> {
         self.picker = Some(picker);
         self.picker_kind = PickerKind::Git;
     }
+
+    // ── Theme helpers (T18.1) ─────────────────────────────────────────────────
+
+    /// Switch to the named theme: load it, re-watch its file, re-apply Lua overrides,
+    /// and force a full damage-tracked re-render.
+    fn apply_theme(&mut self, name: &str) {
+        let (theme, path) = load_theme(name);
+        self.theme = theme;
+        self.theme_watcher = path
+            .as_ref()
+            .and_then(|p| spawn_theme_watcher(p, self.bg_tx.clone()));
+        self.theme_path = path;
+        self.reapply_lua_highlights();
+        // Full re-render: theme changes touch every cell (rule 3 allows redraw on
+        // theme change). The compositor still diffs, so only changed cells flush.
+        self.compositor.buf.invalidate();
+    }
+
+    /// Re-read the active theme file from disk (live reload).
+    fn reload_theme_file(&mut self) {
+        let Some(path) = self.theme_path.clone() else {
+            return;
+        };
+        let name = self.theme.name().to_string();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match onda_render::Theme::from_toml(&name, &text) {
+                Ok(theme) => {
+                    self.theme = theme;
+                    self.reapply_lua_highlights();
+                    self.compositor.buf.invalidate();
+                }
+                Err(e) => {
+                    self.message = Message::Error(format!("theme error: {e}"));
+                }
+            },
+            Err(e) => {
+                self.message = Message::Error(format!("theme read error: {e}"));
+            }
+        }
+    }
+
+    /// Re-apply all Lua-registered highlight overrides on top of the current theme.
+    fn reapply_lua_highlights(&mut self) {
+        for (group, opts) in &self.lua_highlights {
+            let _ = self.theme.set_parsed(
+                group,
+                opts.fg.as_deref(),
+                opts.bg.as_deref(),
+                opts.bold,
+                opts.italic,
+                opts.underline,
+            );
+        }
+    }
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
@@ -687,6 +754,7 @@ impl<B: Backend> App<B> {
 
         // ── Phase 3: render into grid ─────────────────────────────────────────
         {
+            let theme = &self.theme;
             let grid = self.compositor.buf.current_mut();
 
             // Draw borders
@@ -736,6 +804,7 @@ impl<B: Backend> App<B> {
                         rect.height,
                         None,
                         matches,
+                        theme,
                     );
                 } else {
                     DocumentView::render_with_diagnostics(
@@ -748,6 +817,7 @@ impl<B: Backend> App<B> {
                         rect.height,
                         matches,
                         diag_spans,
+                        theme,
                     );
                 }
 
@@ -762,11 +832,11 @@ impl<B: Backend> App<B> {
                 let focused_doc_idx = self.windows[self.focused_window].doc_idx;
                 let doc = &self.docs[focused_doc_idx];
                 let sel = &self.windows[self.focused_window].selection;
-                Statusline::render(grid, status_row, mode_ind, doc, sel, macro_recording);
+                Statusline::render(grid, status_row, mode_ind, doc, sel, macro_recording, theme);
             }
 
             // Message line
-            MessageLine::render(grid, msg_row, &msg);
+            MessageLine::render(grid, msg_row, &msg, theme);
 
             // Command-line completion popup (above the command line).
             if self.mode == Mode::Command {
@@ -779,7 +849,7 @@ impl<B: Backend> App<B> {
             if let Some((title, query, items, pw, ph)) = picker_data {
                 let items_ref: Vec<(&str, bool)> =
                     items.iter().map(|(s, b)| (s.as_str(), *b)).collect();
-                render_picker(grid, &title, &query, &items_ref, pw, ph);
+                render_picker(grid, &title, &query, &items_ref, pw, ph, theme);
             }
 
             // Hover float overlay
@@ -793,6 +863,7 @@ impl<B: Backend> App<B> {
                     hover.col,
                     hover.row,
                     float_width.min(width - 4),
+                    theme,
                 );
             }
 
@@ -803,7 +874,15 @@ impl<B: Backend> App<B> {
                     .iter()
                     .map(|(l, k)| (l.as_str(), k.as_str()))
                     .collect();
-                render_completion_menu(grid, &items_ref, comp.selected, cursor_col, cursor_row, 10);
+                render_completion_menu(
+                    grid,
+                    &items_ref,
+                    comp.selected,
+                    cursor_col,
+                    cursor_row,
+                    10,
+                    theme,
+                );
             }
         }
 
@@ -1469,6 +1548,17 @@ impl<B: Backend> App<B> {
                     self.message = Message::Error("Git: current buffer has no file".into());
                 }
             }
+            ExCommand::Theme(name) => match name {
+                Some(n) => {
+                    self.apply_theme(&n);
+                    self.message = Message::Info(format!("theme: {}", self.theme.name()));
+                }
+                None => {
+                    let avail = onda_render::BUILTIN_THEMES.join(", ");
+                    self.message =
+                        Message::Info(format!("theme: {} (available: {avail})", self.theme.name()));
+                }
+            },
             ExCommand::SessionSave(name) => {
                 let session = self.build_session();
                 let name = name.as_deref().unwrap_or("default");
@@ -2726,6 +2816,20 @@ impl<B: Backend> App<B> {
                         row: 4,
                     });
                 }
+                LuaApiCall::HighlightSet { group, opts } => {
+                    // Apply immediately and remember it so it survives theme switches.
+                    let _ = self.theme.set_parsed(
+                        &group,
+                        opts.fg.as_deref(),
+                        opts.bg.as_deref(),
+                        opts.bold,
+                        opts.italic,
+                        opts.underline,
+                    );
+                    self.lua_highlights.retain(|(g, _)| g != &group);
+                    self.lua_highlights.push((group, opts));
+                    self.compositor.buf.invalidate();
+                }
                 _ => {}
             }
         }
@@ -2779,6 +2883,9 @@ impl<B: Backend> App<B> {
                             worker.status(anchor);
                         }
                     }
+                }
+                BgMessage::ThemeReload => {
+                    self.reload_theme_file();
                 }
             }
         }
@@ -3018,6 +3125,70 @@ impl<B: Backend> App<B> {
     }
 }
 
+// ── Theme loading ──────────────────────────────────────────────────────────────
+
+/// Candidate on-disk paths for a theme file, in priority order.
+fn theme_search_paths(name: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        paths.push(
+            PathBuf::from(home)
+                .join(".config/onda/themes")
+                .join(format!("{name}.toml")),
+        );
+    }
+    paths.push(PathBuf::from(format!("runtime/themes/{name}.toml")));
+    paths
+}
+
+/// Spawn a filesystem watcher on a theme file; sends `ThemeReload` on change
+/// (100ms leading-edge debounce). Returns the watcher (kept alive by the caller).
+fn spawn_theme_watcher(
+    path: &std::path::Path,
+    bg_tx: mpsc::SyncSender<BgMessage>,
+) -> Option<notify::RecommendedWatcher> {
+    use notify::Watcher;
+    let last = std::sync::Arc::new(std::sync::Mutex::new(
+        std::time::Instant::now() - Duration::from_secs(1),
+    ));
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if res.is_ok() {
+            if let Ok(mut l) = last.lock() {
+                if l.elapsed() >= Duration::from_millis(100) {
+                    *l = std::time::Instant::now();
+                    let _ = bg_tx.try_send(BgMessage::ThemeReload);
+                }
+            }
+        }
+    })
+    .ok()?;
+    watcher
+        .watch(path, notify::RecursiveMode::NonRecursive)
+        .ok()?;
+    Some(watcher)
+}
+
+/// Resolve a theme by name. Tries on-disk files first (so they can hot-reload),
+/// then the embedded built-in, then falls back to `onda-dark`. Returns the theme and
+/// the on-disk path it was loaded from (for the live-reload watcher), if any.
+fn load_theme(name: &str) -> (onda_render::Theme, Option<PathBuf>) {
+    let normalized = if name.is_empty() || name == "default" {
+        "onda-dark"
+    } else {
+        name
+    };
+    for path in theme_search_paths(normalized) {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(theme) = onda_render::Theme::from_toml(normalized, &text) {
+                return (theme, Some(path));
+            }
+        }
+    }
+    let theme =
+        onda_render::Theme::builtin(normalized).unwrap_or_else(onda_render::Theme::default_dark);
+    (theme, None)
+}
+
 // ── Background file loader ─────────────────────────────────────────────────────
 
 fn load_file_async(path: PathBuf, tx: mpsc::SyncSender<BgMessage>) {
@@ -3046,6 +3217,10 @@ fn make_app<B: Backend>(
     running: bool,
 ) -> App<B> {
     let win0 = WindowState::new(0);
+    let (theme, theme_path) = load_theme(&config.theme);
+    let theme_watcher = theme_path
+        .as_ref()
+        .and_then(|p| spawn_theme_watcher(p, bg_tx.clone()));
     App {
         docs: vec![initial_doc],
         windows: vec![win0],
@@ -3079,6 +3254,10 @@ fn make_app<B: Backend>(
         cmd_completion: None,
         bg_tx,
         bg_rx,
+        theme,
+        theme_watcher,
+        theme_path,
+        lua_highlights: Vec::new(),
         config,
         lsp_manager: None,
         lsp_event_tx: None,

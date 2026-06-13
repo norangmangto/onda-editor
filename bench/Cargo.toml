@@ -12,8 +12,13 @@ harness = false
 name = "large_file"
 harness = false
 
+[[bench]]
+name = "theme_switch"
+harness = false
+
 [dependencies]
 onda-core.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+onda-render.workspace = true

@@ -449,6 +449,32 @@ onda.autocmd.create("BufEnter", "*.rs", ON_BUF_ENTER_ID)
 
 ---
 
+### onda.highlight.set(group, opts)
+
+Define or override a theme highlight group (T18.1). Overrides apply immediately and
+persist across `:theme` switches (re-applied on top of every newly-loaded theme).
+
+**Parameters**
+
+| Name | Type | Description |
+|---|---|---|
+| `group` | `string` | Scope name, e.g. `"syntax.keyword"`, `"ui.statusline"` (see `docs/THEMES.md`). |
+| `opts` | `table` | `{ fg, bg, bold, italic, underline }`. `fg`/`bg` are `#rrggbb` or ANSI names; flags are booleans (default false). |
+
+**Returns:** nothing
+
+**Behaviour:** Enqueues a `HighlightSet` API call applied between frames; triggers a
+full damage-tracked re-render.
+
+**Example**
+
+```lua
+onda.highlight.set("syntax.keyword", { fg = "#ff79c6", bold = true })
+onda.highlight.set("ui.statusline", { fg = "black", bg = "#88c0d0" })
+```
+
+---
+
 ## Callback Registry Protocol
 
 onda's API functions that need to call back into Lua (`keymap.set`, `cmd.create`,

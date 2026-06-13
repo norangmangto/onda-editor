@@ -1,0 +1,35 @@
+# onda-contrast — WCAG AA high-contrast theme (bright on pure black, T18.1).
+
+"ui.text"                 = { fg = "#ffffff", bg = "#000000" }
+"ui.cursor"               = { fg = "#000000", bg = "#ffff00" }
+"ui.cursor.insert"        = { fg = "#000000", bg = "#00ffff" }
+"ui.selection"            = { fg = "#000000", bg = "#ffffff" }
+"ui.linenr"               = { fg = "#b0b0b0", bg = "#000000" }
+"ui.linenr.current"       = { fg = "#ffff00", bg = "#000000" }
+"ui.statusline"           = { fg = "#000000", bg = "#ffffff" }
+"ui.statusline.normal"    = { fg = "#000000", bg = "#00ff00" }
+"ui.statusline.insert"    = { fg = "#000000", bg = "#00ffff" }
+"ui.statusline.visual"    = { fg = "#000000", bg = "#ffff00" }
+"ui.statusline.terminal"  = { fg = "#000000", bg = "#ff00ff" }
+"ui.message.error"        = { fg = "#ff5555", bold = true }
+"ui.message.info"         = { fg = "#ffffff" }
+"ui.menu"                 = { fg = "#ffffff", bg = "#1a1a1a" }
+"ui.menu.selected"        = { fg = "#000000", bg = "#00ffff" }
+"ui.float"                = { fg = "#ffffff", bg = "#1a1a1a" }
+"ui.float.border"         = { fg = "#00ffff", bg = "#1a1a1a" }
+"diagnostic.error"        = { fg = "#ff5555", underline = true, bold = true }
+"diagnostic.warning"      = { fg = "#ffff00", underline = true }
+"diagnostic.info"         = { fg = "#00ffff", underline = true }
+"gutter.error"            = { fg = "#ff5555" }
+"gutter.warning"          = { fg = "#ffff00" }
+"diff.add"                = { fg = "#00ff00" }
+"diff.delete"             = { fg = "#ff5555" }
+"diff.change"             = { fg = "#ffff00" }
+"syntax.keyword"          = { fg = "#ff79c6", bold = true }
+"syntax.type"             = { fg = "#ffff00" }
+"syntax.function"         = { fg = "#00ffff" }
+"syntax.string"           = { fg = "#00ff00" }
+"syntax.number"           = { fg = "#ffaf00" }
+"syntax.comment"          = { fg = "#b0b0b0", italic = true }
+"syntax.constant"         = { fg = "#ffaf00" }
+"syntax.operator"         = { fg = "#ffffff" }

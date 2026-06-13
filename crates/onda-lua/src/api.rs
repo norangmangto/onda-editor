@@ -52,6 +52,18 @@ pub enum LuaApiCall {
         pattern: String,
         callback_id: u64,
     },
+    /// `onda.highlight.set(group, opts)` — define/override a theme highlight group.
+    HighlightSet { group: String, opts: HighlightOpts },
+}
+
+/// Style options for `onda.highlight.set` (colors are `#rrggbb` or ANSI names).
+#[derive(Debug, Clone, Default)]
+pub struct HighlightOpts {
+    pub fg: Option<String>,
+    pub bg: Option<String>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +281,34 @@ pub fn inject(
         )?;
         autocmd.set("create", create_fn)?;
         onda.set("autocmd", autocmd)?;
+    }
+
+    // ── onda.highlight ──────────────────────────────────────────────────────────
+    {
+        let highlight = lua.create_table()?;
+        let tx = call_tx.clone();
+        let set_fn = lua.create_function(move |_lua, (group, opts): (String, mlua::Table)| {
+            let h = HighlightOpts {
+                fg: opts.get::<Option<String>>("fg").unwrap_or(None),
+                bg: opts.get::<Option<String>>("bg").unwrap_or(None),
+                bold: opts
+                    .get::<Option<bool>>("bold")
+                    .unwrap_or(None)
+                    .unwrap_or(false),
+                italic: opts
+                    .get::<Option<bool>>("italic")
+                    .unwrap_or(None)
+                    .unwrap_or(false),
+                underline: opts
+                    .get::<Option<bool>>("underline")
+                    .unwrap_or(None)
+                    .unwrap_or(false),
+            };
+            let _ = tx.try_send(LuaApiCall::HighlightSet { group, opts: h });
+            Ok(())
+        })?;
+        highlight.set("set", set_fn)?;
+        onda.set("highlight", highlight)?;
     }
 
     globals.set("onda", onda)?;

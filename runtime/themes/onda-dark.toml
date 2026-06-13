@@ -1,0 +1,35 @@
+# onda-dark — the default theme (T18.1). Matches the original hard-coded palette.
+
+"ui.text"                 = { fg = "reset",     bg = "reset" }
+"ui.cursor"               = { fg = "black",     bg = "white" }
+"ui.cursor.insert"        = { fg = "black",     bg = "lightcyan" }
+"ui.selection"            = { fg = "black",     bg = "lightblue" }
+"ui.linenr"               = { fg = "darkgray" }
+"ui.linenr.current"       = { fg = "yellow" }
+"ui.statusline"           = { fg = "white",     bg = "darkgray" }
+"ui.statusline.normal"    = { fg = "black",     bg = "green" }
+"ui.statusline.insert"    = { fg = "black",     bg = "lightcyan" }
+"ui.statusline.visual"    = { fg = "black",     bg = "yellow" }
+"ui.statusline.terminal"  = { fg = "black",     bg = "lightblue" }
+"ui.message.error"        = { fg = "lightred" }
+"ui.message.info"         = { fg = "reset" }
+"ui.menu"                 = { fg = "white",     bg = "darkgray" }
+"ui.menu.selected"        = { fg = "black",     bg = "lightcyan" }
+"ui.float"                = { fg = "white",     bg = "darkgray" }
+"ui.float.border"         = { fg = "lightcyan", bg = "darkgray" }
+"diagnostic.error"        = { fg = "lightred",  underline = true }
+"diagnostic.warning"      = { fg = "yellow",    underline = true }
+"diagnostic.info"         = { fg = "lightcyan", underline = true }
+"gutter.error"            = { fg = "lightred" }
+"gutter.warning"          = { fg = "yellow" }
+"diff.add"                = { fg = "green" }
+"diff.delete"             = { fg = "red" }
+"diff.change"             = { fg = "yellow" }
+"syntax.keyword"          = { fg = "magenta" }
+"syntax.type"             = { fg = "yellow" }
+"syntax.function"         = { fg = "blue" }
+"syntax.string"           = { fg = "green" }
+"syntax.number"           = { fg = "cyan" }
+"syntax.comment"          = { fg = "darkgray", italic = true }
+"syntax.constant"         = { fg = "cyan" }
+"syntax.operator"         = { fg = "white" }

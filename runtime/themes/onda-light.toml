@@ -1,0 +1,35 @@
+# onda-light — inverted palette for light terminals (T18.1).
+
+"ui.text"                 = { fg = "#1c1c1c", bg = "#fafafa" }
+"ui.cursor"               = { fg = "#fafafa", bg = "#1c1c1c" }
+"ui.cursor.insert"        = { fg = "#fafafa", bg = "#005f87" }
+"ui.selection"            = { fg = "#1c1c1c", bg = "#cfe8ff" }
+"ui.linenr"               = { fg = "#9e9e9e", bg = "#fafafa" }
+"ui.linenr.current"       = { fg = "#005f87", bg = "#fafafa" }
+"ui.statusline"           = { fg = "#1c1c1c", bg = "#dcdcdc" }
+"ui.statusline.normal"    = { fg = "#fafafa", bg = "#2e7d32" }
+"ui.statusline.insert"    = { fg = "#fafafa", bg = "#005f87" }
+"ui.statusline.visual"    = { fg = "#1c1c1c", bg = "#f9a825" }
+"ui.statusline.terminal"  = { fg = "#fafafa", bg = "#6a1b9a" }
+"ui.message.error"        = { fg = "#c62828" }
+"ui.message.info"         = { fg = "#1c1c1c" }
+"ui.menu"                 = { fg = "#1c1c1c", bg = "#e8e8e8" }
+"ui.menu.selected"        = { fg = "#fafafa", bg = "#005f87" }
+"ui.float"                = { fg = "#1c1c1c", bg = "#ececec" }
+"ui.float.border"         = { fg = "#005f87", bg = "#ececec" }
+"diagnostic.error"        = { fg = "#c62828", underline = true }
+"diagnostic.warning"      = { fg = "#ef6c00", underline = true }
+"diagnostic.info"         = { fg = "#0277bd", underline = true }
+"gutter.error"            = { fg = "#c62828" }
+"gutter.warning"          = { fg = "#ef6c00" }
+"diff.add"                = { fg = "#2e7d32" }
+"diff.delete"             = { fg = "#c62828" }
+"diff.change"             = { fg = "#ef6c00" }
+"syntax.keyword"          = { fg = "#8e24aa" }
+"syntax.type"             = { fg = "#b8860b" }
+"syntax.function"         = { fg = "#1565c0" }
+"syntax.string"           = { fg = "#2e7d32" }
+"syntax.number"           = { fg = "#00838f" }
+"syntax.comment"          = { fg = "#9e9e9e", italic = true }
+"syntax.constant"         = { fg = "#00838f" }
+"syntax.operator"         = { fg = "#1c1c1c" }

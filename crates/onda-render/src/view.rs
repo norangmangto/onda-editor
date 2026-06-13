@@ -5,117 +5,7 @@ use crate::{
     grid::{Attribute, Cell, Color, DoubleBuffer, Grid, Style},
 };
 
-// ── Palette ────────────────────────────────────────────────────────────────────
-
-mod palette {
-    use super::{Attribute, Color, Style};
-
-    pub const TEXT: Style = Style {
-        fg: Color::Reset,
-        bg: Color::Reset,
-        attrs: Attribute::empty(),
-    };
-    pub const CURSOR_NORMAL: Style = Style {
-        fg: Color::Black,
-        bg: Color::White,
-        attrs: Attribute::empty(),
-    };
-    pub const CURSOR_INSERT: Style = Style {
-        fg: Color::Black,
-        bg: Color::LightCyan,
-        attrs: Attribute::empty(),
-    };
-    pub const SELECTION: Style = Style {
-        fg: Color::Black,
-        bg: Color::LightBlue,
-        attrs: Attribute::empty(),
-    };
-    pub const LINE_NR: Style = Style {
-        fg: Color::DarkGray,
-        bg: Color::Reset,
-        attrs: Attribute::empty(),
-    };
-    pub const LINE_NR_CURRENT: Style = Style {
-        fg: Color::Yellow,
-        bg: Color::Reset,
-        attrs: Attribute::empty(),
-    };
-    pub const STATUS_NORMAL: Style = Style {
-        fg: Color::Black,
-        bg: Color::Green,
-        attrs: Attribute::empty(),
-    };
-    pub const STATUS_INSERT: Style = Style {
-        fg: Color::Black,
-        bg: Color::LightCyan,
-        attrs: Attribute::empty(),
-    };
-    pub const STATUS_VISUAL: Style = Style {
-        fg: Color::Black,
-        bg: Color::Yellow,
-        attrs: Attribute::empty(),
-    };
-    pub const STATUS_BG: Style = Style {
-        fg: Color::White,
-        bg: Color::DarkGray,
-        attrs: Attribute::empty(),
-    };
-    pub const MSG_ERROR: Style = Style {
-        fg: Color::LightRed,
-        bg: Color::Reset,
-        attrs: Attribute::empty(),
-    };
-    pub const MSG_INFO: Style = Style {
-        fg: Color::Reset,
-        bg: Color::Reset,
-        attrs: Attribute::empty(),
-    };
-    pub const STATUS_TERMINAL: Style = Style {
-        fg: Color::Black,
-        bg: Color::LightBlue,
-        attrs: Attribute::empty(),
-    };
-    pub const DIAG_ERROR: Style = Style {
-        fg: Color::LightRed,
-        bg: Color::Reset,
-        attrs: Attribute::UNDERLINE,
-    };
-    pub const DIAG_WARNING: Style = Style {
-        fg: Color::Yellow,
-        bg: Color::Reset,
-        attrs: Attribute::UNDERLINE,
-    };
-    pub const DIAG_INFO: Style = Style {
-        fg: Color::LightCyan,
-        bg: Color::Reset,
-        attrs: Attribute::UNDERLINE,
-    };
-    pub const GUTTER_ERROR: Style = Style {
-        fg: Color::LightRed,
-        bg: Color::Reset,
-        attrs: Attribute::empty(),
-    };
-    pub const GUTTER_WARNING: Style = Style {
-        fg: Color::Yellow,
-        bg: Color::Reset,
-        attrs: Attribute::empty(),
-    };
-    pub const FLOAT_BG: Style = Style {
-        fg: Color::White,
-        bg: Color::DarkGray,
-        attrs: Attribute::empty(),
-    };
-    pub const FLOAT_BORDER: Style = Style {
-        fg: Color::LightCyan,
-        bg: Color::DarkGray,
-        attrs: Attribute::empty(),
-    };
-    pub const COMPLETION_SELECTED: Style = Style {
-        fg: Color::Black,
-        bg: Color::LightCyan,
-        attrs: Attribute::empty(),
-    };
-}
+use crate::theme::Theme;
 
 /// The mode label shown in the statusline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,12 +32,12 @@ impl ModeIndicator {
         }
     }
 
-    fn style(self) -> Style {
+    fn style(self, theme: &Theme) -> Style {
         match self {
-            ModeIndicator::Normal | ModeIndicator::Command => palette::STATUS_NORMAL,
-            ModeIndicator::Insert => palette::STATUS_INSERT,
-            ModeIndicator::Visual | ModeIndicator::VisualLine => palette::STATUS_VISUAL,
-            ModeIndicator::Terminal | ModeIndicator::TerminalScroll => palette::STATUS_TERMINAL,
+            ModeIndicator::Normal | ModeIndicator::Command => theme.status_normal(),
+            ModeIndicator::Insert => theme.status_insert(),
+            ModeIndicator::Visual | ModeIndicator::VisualLine => theme.status_visual(),
+            ModeIndicator::Terminal | ModeIndicator::TerminalScroll => theme.status_terminal(),
         }
     }
 
@@ -232,6 +122,7 @@ impl DocumentView {
         height: u16,
         _highlights: Option<&HighlightsPlaceholder>,
         search_matches: &[onda_core::Range],
+        theme: &Theme,
     ) {
         let text_col_start = viewport.line_nr_width;
         let text_width = grid.width().saturating_sub(text_col_start) as usize;
@@ -257,9 +148,9 @@ impl DocumentView {
                     .iter()
                     .any(|r| doc.char_to_line(r.head) == doc_line);
                 let nr_style = if is_cursor_line {
-                    palette::LINE_NR_CURRENT
+                    theme.line_nr_current()
                 } else {
-                    palette::LINE_NR
+                    theme.line_nr()
                 };
                 let nr_str = format!(
                     "{:>width$} ",
@@ -288,17 +179,18 @@ impl DocumentView {
                     break;
                 }
                 let char_idx = row_char_start + i;
-                let mut style = Self::char_style(char_idx, sel, mode);
+                let mut style = Self::char_style(char_idx, sel, mode, theme);
 
                 // Apply search-match highlight (reversed style) if in a match range.
                 let in_match = search_matches
                     .iter()
                     .any(|r| char_idx >= r.from() && char_idx < r.to());
-                if in_match && style == palette::TEXT {
+                if in_match && style == theme.text() {
                     // Reverse: swap fg/bg for the match cells
+                    let cursor = theme.cursor_normal();
                     style = Style {
-                        fg: palette::CURSOR_NORMAL.bg,
-                        bg: palette::CURSOR_NORMAL.fg,
+                        fg: cursor.bg,
+                        bg: cursor.fg,
                         attrs: style.attrs,
                     };
                 }
@@ -326,6 +218,7 @@ impl DocumentView {
     ///
     /// Only the rows from `row_offset` to `row_offset + height` are written.
     /// Only rope slices for visible lines are accessed (critical for the 1GB demo).
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         grid: &mut Grid,
         doc: &Document,
@@ -334,6 +227,7 @@ impl DocumentView {
         mode: ModeIndicator,
         row_offset: u16,
         height: u16,
+        theme: &Theme,
     ) {
         let text_col_start = viewport.line_nr_width;
         let text_width = grid.width().saturating_sub(text_col_start) as usize;
@@ -361,9 +255,9 @@ impl DocumentView {
                     .iter()
                     .any(|r| doc.char_to_line(r.head) == doc_line);
                 let nr_style = if is_cursor_line {
-                    palette::LINE_NR_CURRENT
+                    theme.line_nr_current()
                 } else {
-                    palette::LINE_NR
+                    theme.line_nr()
                 };
                 let nr_str = format!(
                     "{:>width$} ",
@@ -396,7 +290,7 @@ impl DocumentView {
                     break;
                 }
                 let char_idx = row_char_start + i;
-                let style = Self::char_style(char_idx, sel, mode);
+                let style = Self::char_style(char_idx, sel, mode, theme);
                 let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1) as u16;
                 grid.set(
                     col,
@@ -429,6 +323,7 @@ impl DocumentView {
         height: u16,
         search_matches: &[onda_core::Range],
         diagnostics: &[DiagnosticSpan],
+        theme: &Theme,
     ) {
         // Render base content first
         Self::render_with_highlights(
@@ -441,6 +336,7 @@ impl DocumentView {
             height,
             None,
             search_matches,
+            theme,
         );
 
         // Overlay diagnostic underlines
@@ -460,9 +356,9 @@ impl DocumentView {
                     continue;
                 }
                 let span_style = match span.severity {
-                    0 => palette::DIAG_ERROR,
-                    1 => palette::DIAG_WARNING,
-                    _ => palette::DIAG_INFO,
+                    0 => theme.diag_error(),
+                    1 => theme.diag_warning(),
+                    _ => theme.diag_info(),
                 };
                 // Add gutter sign in the line-number column
                 if viewport.line_nr_width >= 2 {
@@ -472,9 +368,9 @@ impl DocumentView {
                         _ => "I",
                     };
                     let gutter_style = match span.severity {
-                        0 => palette::GUTTER_ERROR,
-                        1 => palette::GUTTER_WARNING,
-                        _ => palette::DIAG_INFO,
+                        0 => theme.gutter_error(),
+                        1 => theme.gutter_warning(),
+                        _ => theme.diag_info(),
                     };
                     grid.write_str(0, abs_row, sign, gutter_style);
                 }
@@ -490,7 +386,7 @@ impl DocumentView {
                     }
                     if let Some(cell) = grid.get_mut(screen_col, abs_row) {
                         cell.style.attrs |= Attribute::UNDERLINE;
-                        if cell.style.fg == palette::TEXT.fg {
+                        if cell.style.fg == theme.text().fg {
                             cell.style.fg = span_style.fg;
                         }
                     }
@@ -499,7 +395,7 @@ impl DocumentView {
         }
     }
 
-    fn char_style(char_idx: usize, sel: &Selection, mode: ModeIndicator) -> Style {
+    fn char_style(char_idx: usize, sel: &Selection, mode: ModeIndicator, theme: &Theme) -> Style {
         let primary = sel.primary();
         let is_cursor = char_idx == primary.head;
 
@@ -509,26 +405,26 @@ impl DocumentView {
             | ModeIndicator::Terminal
             | ModeIndicator::TerminalScroll => {
                 if is_cursor {
-                    palette::CURSOR_NORMAL
+                    theme.cursor_normal()
                 } else {
-                    palette::TEXT
+                    theme.text()
                 }
             }
             ModeIndicator::Insert => {
                 if is_cursor {
-                    palette::CURSOR_INSERT
+                    theme.cursor_insert()
                 } else {
-                    palette::TEXT
+                    theme.text()
                 }
             }
             ModeIndicator::Visual | ModeIndicator::VisualLine => {
                 let in_selection = sel.ranges().iter().any(|r| r.contains_inclusive(char_idx));
                 if is_cursor {
-                    palette::CURSOR_NORMAL
+                    theme.cursor_normal()
                 } else if in_selection {
-                    palette::SELECTION
+                    theme.selection()
                 } else {
-                    palette::TEXT
+                    theme.text()
                 }
             }
         }
@@ -548,6 +444,7 @@ impl Statusline {
         doc: &Document,
         sel: &Selection,
         macro_recording: Option<char>,
+        theme: &Theme,
     ) {
         let width = grid.width() as usize;
         if width == 0 {
@@ -555,8 +452,8 @@ impl Statusline {
         }
 
         let mode_label = format!(" {} ", mode.label());
-        let mode_style = mode.style();
-        let bg_style = palette::STATUS_BG;
+        let mode_style = mode.style(theme);
+        let bg_style = theme.status_bg();
 
         // Left: mode indicator
         let x = grid.write_str(0, row, &mode_label, mode_style);
@@ -569,7 +466,7 @@ impl Statusline {
         // Macro recording indicator
         if let Some(reg) = macro_recording {
             let rec_label = format!(" recording @{reg} ");
-            x = grid.write_str(x, row, &rec_label, palette::STATUS_VISUAL);
+            x = grid.write_str(x, row, &rec_label, theme.status_visual());
         }
 
         // Right: position
@@ -614,18 +511,18 @@ impl Message {
 }
 
 impl MessageLine {
-    pub fn render(grid: &mut Grid, row: u16, message: &Message) {
+    pub fn render(grid: &mut Grid, row: u16, message: &Message, theme: &Theme) {
         let width = grid.width();
         match message {
             Message::None => {
                 grid.fill_rect(0, row, width, 1, Style::RESET);
             }
             Message::Info(s) => {
-                let x = grid.write_str(0, row, s, palette::MSG_INFO);
+                let x = grid.write_str(0, row, s, theme.msg_info());
                 grid.fill_rect(x, row, width.saturating_sub(x), 1, Style::RESET);
             }
             Message::Error(s) => {
-                let x = grid.write_str(0, row, s, palette::MSG_ERROR);
+                let x = grid.write_str(0, row, s, theme.msg_error());
                 grid.fill_rect(x, row, width.saturating_sub(x), 1, Style::RESET);
             }
             Message::Command(s) => {
@@ -657,6 +554,7 @@ pub fn render_picker(
     items: &[(&str, bool)],
     width: u16,
     height: u16,
+    theme: &Theme,
 ) {
     let grid_w = grid.width();
     let grid_h = grid.height();
@@ -671,26 +569,10 @@ pub fn render_picker(
 
     let inner_w = width.saturating_sub(2); // subtract left+right border cols
 
-    let picker_bg = Style {
-        fg: Color::White,
-        bg: Color::DarkGray,
-        attrs: Attribute::empty(),
-    };
-    let picker_border = Style {
-        fg: Color::White,
-        bg: Color::DarkGray,
-        attrs: Attribute::empty(),
-    };
-    let picker_selected = Style {
-        fg: Color::Black,
-        bg: Color::LightCyan,
-        attrs: Attribute::empty(),
-    };
-    let picker_prompt = Style {
-        fg: Color::LightCyan,
-        bg: Color::DarkGray,
-        attrs: Attribute::empty(),
-    };
+    let picker_bg = theme.menu();
+    let picker_border = theme.float_border();
+    let picker_selected = theme.menu_selected();
+    let picker_prompt = theme.float_border();
 
     // Top border
     {
@@ -763,12 +645,22 @@ pub struct DiagnosticSpan {
 ///
 /// The float is drawn over the grid at (`col`, `row`) with a border.
 /// Lines that are too long are truncated to fit `width`.
-pub fn render_float(grid: &mut Grid, title: &str, lines: &[&str], col: u16, row: u16, width: u16) {
+pub fn render_float(
+    grid: &mut Grid,
+    title: &str,
+    lines: &[&str],
+    col: u16,
+    row: u16,
+    width: u16,
+    theme: &Theme,
+) {
     let grid_w = grid.width();
     let grid_h = grid.height();
     if grid_w == 0 || grid_h == 0 {
         return;
     }
+    let float_border = theme.float_border();
+    let float_bg = theme.float_bg();
 
     // Compute actual height: 2 border rows + content
     let height = (lines.len() as u16 + 2).min(grid_h.saturating_sub(row));
@@ -793,26 +685,27 @@ pub fn render_float(grid: &mut Grid, title: &str, lines: &[&str], col: u16, row:
                 w = inner_w.saturating_sub(title_truncated.len() + 3)
             )
         };
-        grid.write_str(col, row, &top, palette::FLOAT_BORDER);
+        grid.write_str(col, row, &top, float_border);
     }
 
     // Content rows
     for (i, line) in lines.iter().take(height as usize - 2).enumerate() {
         let content: String = line.chars().take(inner_w).collect();
         let row_str = format!("│{:<w$}│", content, w = inner_w);
-        grid.write_str(col, row + 1 + i as u16, &row_str, palette::FLOAT_BG);
+        grid.write_str(col, row + 1 + i as u16, &row_str, float_bg);
     }
 
     // Bottom border
     if height >= 2 {
         let bottom = format!("╰{:─<w$}╯", "", w = inner_w);
-        grid.write_str(col, row + height - 1, &bottom, palette::FLOAT_BORDER);
+        grid.write_str(col, row + height - 1, &bottom, float_border);
     }
 }
 
 // ── Completion menu ────────────────────────────────────────────────────────────
 
 /// Render a completion popup menu below the cursor position.
+#[allow(clippy::too_many_arguments)]
 pub fn render_completion_menu(
     grid: &mut Grid,
     items: &[(&str, &str)], // (label, kind_icon)
@@ -820,6 +713,7 @@ pub fn render_completion_menu(
     cursor_col: u16,
     cursor_row: u16,
     max_visible: usize,
+    theme: &Theme,
 ) {
     let grid_w = grid.width();
     let grid_h = grid.height();
@@ -845,9 +739,9 @@ pub fn render_completion_menu(
         }
         let is_selected = i == selected;
         let style = if is_selected {
-            palette::COMPLETION_SELECTED
+            theme.menu_selected()
         } else {
-            palette::FLOAT_BG
+            theme.float_bg()
         };
         let kind_str = if kind.is_empty() { "   " } else { kind };
         let label_part: String = label.chars().take(inner_w.saturating_sub(4)).collect();
@@ -923,8 +817,11 @@ impl Compositor {
             " DAMAGE:{} FRAME:{}µs ",
             self.last_diff_count, self.last_frame_us
         );
-        self.buf
-            .current_mut()
-            .write_str(0, 0, &s, palette::DEBUG_OVERLAY);
+        let overlay = Style {
+            fg: Color::Black,
+            bg: Color::LightYellow,
+            attrs: Attribute::empty(),
+        };
+        self.buf.current_mut().write_str(0, 0, &s, overlay);
     }
 }
