@@ -11,6 +11,7 @@ members = [
     "crates/onda-session",
     "crates/onda-lua",
     "crates/onda-git",
+    "crates/onda-agent",
     "xtask",
     "bench",
 ]
@@ -112,6 +113,7 @@ onda-terminal = { path = "crates/onda-terminal" }
 onda-session = { path = "crates/onda-session" }
 onda-lua = { path = "crates/onda-lua" }
 onda-git = { path = "crates/onda-git" }
+onda-agent = { path = "crates/onda-agent" }
 
 [profile.release]
 opt-level = 3

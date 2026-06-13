@@ -44,6 +44,24 @@
       "max_ms": 0.0,
       "runs": 0,
       "budget_ms": 5.0
+    },
+    {
+      "name": "panel_stream_frame_ms",
+      "median_ms": 0.0,
+      "mean_ms": 0.0,
+      "min_ms": 0.0,
+      "max_ms": 0.0,
+      "runs": 0,
+      "budget_ms": 16.0
+    },
+    {
+      "name": "agent_stream_keypress_p99_ms",
+      "median_ms": 0.0,
+      "mean_ms": 0.0,
+      "min_ms": 0.0,
+      "max_ms": 0.0,
+      "runs": 0,
+      "budget_ms": 10.0
     }
   ],
   "git_sha": "initial",

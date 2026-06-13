@@ -142,11 +142,11 @@ struct BenchResult {
     budget_ms: Option<f64>,
 }
 
-/// Phase 3 perf gates (T15.0). Budgets are enforced by `bench --check`. Measurements
-/// for these are wired in as each feature lands (theme switch in T18.1, git blame in
-/// T16.1, DAP-on keypress latency in W15); until then they report `runs: 0` and the
-/// absolute-budget check is skipped for them.
-fn phase3_gates() -> Vec<BenchResult> {
+/// Phase 3+4 perf gates. Budgets are enforced by `bench --check`. Measurements are
+/// wired in as each feature lands (theme switch in T18.1; git blame in T16.1; DAP-on
+/// keypress in W15; agent panel-stream + stream-while-editing in W23/W26); until then
+/// they report `runs: 0` and the absolute-budget check is skipped for them.
+fn extra_gates() -> Vec<BenchResult> {
     let gate = |name: &str, budget_ms: f64| BenchResult {
         name: name.to_string(),
         median_ms: 0.0,
@@ -163,6 +163,11 @@ fn phase3_gates() -> Vec<BenchResult> {
         gate("git_blame_render_ms", 2.0),
         // Full-screen re-render on `:theme` switch.
         gate("theme_switch_ms", 5.0),
+        // Phase 4 (ACP agent): coalesced agent-panel stream re-render per frame
+        // under a 10k tokens/s burst must fit the frame budget.
+        gate("panel_stream_frame_ms", 16.0),
+        // Phase 4: keypress → render p99 while an agent streams in the panel.
+        gate("agent_stream_keypress_p99_ms", 10.0),
     ]
 }
 
@@ -193,9 +198,9 @@ fn bench(args: &[String]) -> Result<()> {
     let large_file = bench_large_file(&binary, &root)?;
 
     let mut results = vec![startup, large_file];
-    // Phase 3 gates (T15.0). Carried through with their budgets so `--check` enforces
+    // Phase 3+4 perf gates. Carried through with their budgets so `--check` enforces
     // them; measurements are filled in by the features that own each gate.
-    results.extend(phase3_gates());
+    results.extend(extra_gates());
 
     let report = BenchReport {
         results: results.clone(),

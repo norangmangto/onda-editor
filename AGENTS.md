@@ -58,6 +58,11 @@ them without updating the doc first).
  libvterm-sys (vendored libvterm FFI — terminal emulation, Phase 3 W17;
  `unsafe` FFI requires `// SAFETY:` comments per rule 4),
  dap-types (hand-rolled DAP JSON types acceptable, Phase 3 W15).
+ Phase 4 (ACP agent integration): the `agent-client-protocol` crate is the upstream
+ option but the spec is moving — onda **vendors** the ACP JSON-RPC types in `onda-agent`
+ (no new external dep; built on the pre-approved serde/serde_json/tokio), with a thin
+ adapter layer so the protocol surface can churn without touching the UI. The
+ `mock-agent` test binary (in `onda-agent`) owns protocol conformance.
 
 ### 5. Testing
 - Every motion/operator gets table-driven tests: `(input keys, before, after, selection)`.

@@ -1,0 +1,20 @@
+[package]
+name = "onda-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "onda-mock-agent"
+path = "src/bin/mock_agent.rs"
+
+[dependencies]
+onda-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
