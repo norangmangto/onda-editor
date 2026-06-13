@@ -68,3 +68,39 @@ Items identified during Phase 1 that were explicitly deferred:
 ## Notes from Phase 1
 
 <!-- Agents: append here as you work. Format: `- [T5.x–T9.x] Note about friction/decision.` -->
+
+## Phase 3–5 status audit (post-foundational-implementation)
+
+This records what is **done** vs **outstanding** after the foundational engines and the
+audit-gap fixes were implemented. "Engine done" = pure, unit-tested logic crate;
+"wired" = usable in the editor.
+
+### Done (this pass)
+- **Phase 1 gap fixed**: tree-sitter syntax highlighting now actually paints (the editor
+  had no tokio runtime, so the syntax worker never spawned; render discarded highlights).
+  Runtime created+entered in `run_editor`; `HlSpan`/`HlCursor` render path; reparse on edit.
+- **Git** (T16.1–16.4): status gutter signs, `:GitStatus` picker, `:GitDiff` (scratch
+  buffer), `:GitBlame` (current-line float), `:GitStageHunk`/`:GitResetHunk` — all wired.
+- **Themes** (T18.1/T30.1): 4 built-ins incl. `onda-wave`, `:theme`, hot-reload,
+  `inherits`, Lua `onda.highlight.set`.
+- **Tree-sitter text objects** (T18.2), **command-line completion** (T18.3).
+- **Data views** (W27/W28): `onda-data` CSV + JSONL engines, wired as `:table` (aligned
+  virtual table) and `:fields` (JSONL schema overlay).
+- **ACP agent engine** (W22, T24.1/24.3, T25.1): `onda-agent` — protocol/transport/
+  session, staging+rebase, permission model, mention assembly; mock-agent E2E.
+- **`onda doctor`** (T30.2); **`onda data` engines**; **`cargo xtask install`/`bundle`**
+  (T31.1/T19.4); **`BENCH_REPORT.md` v1.0** with real numbers (Phase 0/5).
+
+### Outstanding (not implemented — each is large and/or needs external infra)
+- **DAP debugger** (Phase 3 W15): no `onda-dap` crate yet. Needs lldb-dap/debugpy to validate.
+- **Remote editing `scp://`** (Phase 3 W17): no `russh` transport; needs a live SSH host.
+- **libvterm** (Phase 3 W17): terminal still uses `vt100`; vendoring + nvim/tmux/htop
+  regression is a large FFI effort.
+- **Agent panel UI** (Phase 4 W23/T24.2): the `onda-agent` engine is built+tested but not
+  wired into the binary — no streaming panel, hunk-review screen, or permission-prompt UI;
+  no live Claude Code (needs the agent binary).
+- **Persistent undo** (Phase 5 T29.1): needs serde on core transaction types; default-off
+  for v0.1, lowest priority.
+- **Release/launch** (W31/W32): clean-machine install matrix, Homebrew tap, docs site,
+  signed multi-platform artifacts, `v0.0.3`/`v0.1.0` tags + announcement — not codeable/
+  verifiable in a sandbox.
