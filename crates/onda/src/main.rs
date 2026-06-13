@@ -1502,6 +1502,24 @@ impl<B: Backend> App<B> {
                 if let Some(r) = range {
                     let op_sel = Selection::new(vec![r], 0);
                     self.apply_operator(op, &op_sel, false)?;
+                } else if Self::is_ts_textobj(textobj) {
+                    self.message = Message::Info("no tree-sitter text object here".to_string());
+                }
+            }
+
+            // ── Visual-mode text object (viw, vaf, via) ─────────────────────────
+            Action::SelectTextObj(textobj) => {
+                let pos = self.selection().primary().head;
+                let rope = self.doc().rope().clone();
+                match self.resolve_textobj(&rope, pos, textobj) {
+                    Some(r) => {
+                        // Extend the selection to cover the text object.
+                        *self.selection_mut() = Selection::new(vec![r], 0);
+                    }
+                    None if Self::is_ts_textobj(textobj) => {
+                        self.message = Message::Info("no tree-sitter text object here".to_string());
+                    }
+                    None => {}
                 }
             }
 
@@ -1985,7 +2003,83 @@ impl<B: Backend> App<B> {
             TextObj::OuterBacktick => to::outer_backtick(rope, pos),
             TextObj::InnerParagraph => to::inner_paragraph(rope, pos),
             TextObj::OuterParagraph => to::outer_paragraph(rope, pos),
+            // Tree-sitter text objects (T18.2) resolved via onda-syntax.
+            TextObj::InnerFunction => self.resolve_ts_textobj(
+                rope,
+                pos,
+                onda_syntax::TextObjectKind::Function,
+                onda_syntax::TextObjectScope::Inner,
+            ),
+            TextObj::OuterFunction => self.resolve_ts_textobj(
+                rope,
+                pos,
+                onda_syntax::TextObjectKind::Function,
+                onda_syntax::TextObjectScope::Outer,
+            ),
+            TextObj::InnerClass => self.resolve_ts_textobj(
+                rope,
+                pos,
+                onda_syntax::TextObjectKind::Class,
+                onda_syntax::TextObjectScope::Inner,
+            ),
+            TextObj::OuterClass => self.resolve_ts_textobj(
+                rope,
+                pos,
+                onda_syntax::TextObjectKind::Class,
+                onda_syntax::TextObjectScope::Outer,
+            ),
+            TextObj::InnerArgument => self.resolve_ts_textobj(
+                rope,
+                pos,
+                onda_syntax::TextObjectKind::Parameter,
+                onda_syntax::TextObjectScope::Inner,
+            ),
+            TextObj::OuterArgument => self.resolve_ts_textobj(
+                rope,
+                pos,
+                onda_syntax::TextObjectKind::Parameter,
+                onda_syntax::TextObjectScope::Outer,
+            ),
         }
+    }
+
+    /// Resolve a tree-sitter text object for the current document's language.
+    /// Returns `None` (graceful fallback) when no grammar is available.
+    fn resolve_ts_textobj(
+        &self,
+        rope: &ropey::Rope,
+        pos: usize,
+        kind: onda_syntax::TextObjectKind,
+        scope: onda_syntax::TextObjectScope,
+    ) -> Option<onda_core::Range> {
+        let lang = self.current_language_name()?;
+        onda_syntax::text_object(rope, pos, &lang, kind, scope)
+    }
+
+    /// Detect the current document's language name via the registry.
+    fn current_language_name(&self) -> Option<String> {
+        let doc = self.doc();
+        let path_str = doc
+            .path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let first_line = if doc.len_lines() > 0 {
+            Some(doc.rope().line(0).to_string())
+        } else {
+            None
+        };
+        self.lang_registry
+            .detect(&path_str, first_line.as_deref())
+            .map(|c| c.name.clone())
+    }
+
+    /// True when `textobj` is a tree-sitter (grammar-backed) text object.
+    fn is_ts_textobj(textobj: onda_modal::TextObj) -> bool {
+        use onda_modal::TextObj::*;
+        matches!(
+            textobj,
+            InnerFunction | OuterFunction | InnerClass | OuterClass | InnerArgument | OuterArgument
+        )
     }
 
     // ── Register helper ───────────────────────────────────────────────────────

@@ -63,6 +63,9 @@ tree-sitter = "0.22"
 tree-sitter-rust = "0.21"
 tree-sitter-python = "0.21"
 tree-sitter-json = "0.21"
+tree-sitter-go = "0.21"
+tree-sitter-c = "0.21"
+tree-sitter-typescript = "0.21"
 
 # Regex
 regex = "1"

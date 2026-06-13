@@ -23,6 +23,52 @@ pub enum TextObj {
     OuterBacktick,
     InnerParagraph,
     OuterParagraph,
+    // Tree-sitter text objects (T18.2). Resolved by the binary via onda-syntax;
+    // a no-op (with a message) when no grammar is loaded for the buffer.
+    InnerFunction,
+    OuterFunction,
+    InnerClass,
+    OuterClass,
+    InnerArgument,
+    OuterArgument,
+}
+
+/// Map a selector char to the *inner* text object it names, if any.
+fn inner_textobj_for_char(c: char) -> Option<TextObj> {
+    Some(match c {
+        'w' => TextObj::InnerWord,
+        'W' => TextObj::InnerBigWord,
+        '(' | ')' | 'b' => TextObj::InnerParens,
+        '[' | ']' => TextObj::InnerBrackets,
+        '{' | '}' | 'B' => TextObj::InnerBraces,
+        '"' => TextObj::InnerDoubleQuote,
+        '\'' => TextObj::InnerSingleQuote,
+        '`' => TextObj::InnerBacktick,
+        'p' => TextObj::InnerParagraph,
+        'f' => TextObj::InnerFunction,
+        'c' => TextObj::InnerClass,
+        'a' => TextObj::InnerArgument,
+        _ => return None,
+    })
+}
+
+/// Map a selector char to the *outer* text object it names, if any.
+fn outer_textobj_for_char(c: char) -> Option<TextObj> {
+    Some(match c {
+        'w' => TextObj::OuterWord,
+        'W' => TextObj::OuterBigWord,
+        '(' | ')' | 'b' => TextObj::OuterParens,
+        '[' | ']' => TextObj::OuterBrackets,
+        '{' | '}' | 'B' => TextObj::OuterBraces,
+        '"' => TextObj::OuterDoubleQuote,
+        '\'' => TextObj::OuterSingleQuote,
+        '`' => TextObj::OuterBacktick,
+        'p' => TextObj::OuterParagraph,
+        'f' => TextObj::OuterFunction,
+        'c' => TextObj::OuterClass,
+        'a' => TextObj::OuterArgument,
+        _ => return None,
+    })
 }
 
 /// All actions that can be triggered by a keymap entry.
@@ -49,6 +95,9 @@ pub enum Action {
 
     // Operator + text object (e.g. diw, ca")
     ApplyOperatorTextObj(Operator, TextObj),
+
+    // Select a text object in visual mode (e.g. viw, vaf) — extends the selection.
+    SelectTextObj(TextObj),
 
     // Pending operator (waits for a motion key)
     PendingOperator(Operator),
@@ -319,6 +368,10 @@ pub struct KeymapState {
     pending_textobj_inner: bool,
     /// Pending text-object outer: operator was set and `a` was pressed.
     pending_textobj_outer: bool,
+    /// Pending visual-mode text-object inner: `i` was pressed in visual mode.
+    pending_visual_textobj_inner: bool,
+    /// Pending visual-mode text-object outer: `a` was pressed in visual mode.
+    pending_visual_textobj_outer: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +409,8 @@ impl KeymapState {
         self.pending_mark_jump_line = false;
         self.pending_textobj_inner = false;
         self.pending_textobj_outer = false;
+        self.pending_visual_textobj_inner = false;
+        self.pending_visual_textobj_outer = false;
     }
 
     /// Process one key in the given mode. Returns what should happen.
@@ -451,17 +506,9 @@ impl KeymapState {
             let count = self.count.unwrap_or(1);
             self.count = None;
             if let Key::Char(c, _) = key {
-                let textobj = match c {
-                    'w' => TextObj::InnerWord,
-                    'W' => TextObj::InnerBigWord,
-                    '(' | ')' | 'b' => TextObj::InnerParens,
-                    '[' | ']' => TextObj::InnerBrackets,
-                    '{' | '}' | 'B' => TextObj::InnerBraces,
-                    '"' => TextObj::InnerDoubleQuote,
-                    '\'' => TextObj::InnerSingleQuote,
-                    '`' => TextObj::InnerBacktick,
-                    'p' => TextObj::InnerParagraph,
-                    _ => {
+                let textobj = match inner_textobj_for_char(*c) {
+                    Some(t) => t,
+                    None => {
                         self.reset();
                         return PendingResult::NoMatch;
                     }
@@ -485,17 +532,9 @@ impl KeymapState {
             let count = self.count.unwrap_or(1);
             self.count = None;
             if let Key::Char(c, _) = key {
-                let textobj = match c {
-                    'w' => TextObj::OuterWord,
-                    'W' => TextObj::OuterBigWord,
-                    '(' | ')' | 'b' => TextObj::OuterParens,
-                    '[' | ']' => TextObj::OuterBrackets,
-                    '{' | '}' | 'B' => TextObj::OuterBraces,
-                    '"' => TextObj::OuterDoubleQuote,
-                    '\'' => TextObj::OuterSingleQuote,
-                    '`' => TextObj::OuterBacktick,
-                    'p' => TextObj::OuterParagraph,
-                    _ => {
+                let textobj = match outer_textobj_for_char(*c) {
+                    Some(t) => t,
+                    None => {
                         self.reset();
                         return PendingResult::NoMatch;
                     }
@@ -504,6 +543,47 @@ impl KeymapState {
             }
             self.reset();
             return PendingResult::NoMatch;
+        }
+
+        // Handle pending visual-mode text object inner/outer (e.g. viw, vaf, via).
+        if self.pending_visual_textobj_inner || self.pending_visual_textobj_outer {
+            let inner = self.pending_visual_textobj_inner;
+            self.pending_visual_textobj_inner = false;
+            self.pending_visual_textobj_outer = false;
+            self.count = None;
+            if let Key::Char(c, _) = key {
+                let textobj = if inner {
+                    inner_textobj_for_char(*c)
+                } else {
+                    outer_textobj_for_char(*c)
+                };
+                match textobj {
+                    Some(t) => return PendingResult::Action(Action::SelectTextObj(t), 1),
+                    None => {
+                        self.reset();
+                        return PendingResult::NoMatch;
+                    }
+                }
+            }
+            self.reset();
+            return PendingResult::NoMatch;
+        }
+
+        // In visual mode, `i`/`a` (with no pending operator) begin a text object.
+        if matches!(mode, Mode::Visual | Mode::VisualLine | Mode::VisualBlock)
+            && self.pending_operator.is_none()
+        {
+            match key {
+                Key::Char('i', _) => {
+                    self.pending_visual_textobj_inner = true;
+                    return PendingResult::NeedMore;
+                }
+                Key::Char('a', _) => {
+                    self.pending_visual_textobj_outer = true;
+                    return PendingResult::NeedMore;
+                }
+                _ => {}
+            }
         }
 
         // Handle pending 'r' (replace char)
@@ -720,6 +800,8 @@ impl KeymapState {
             || self.pending_mark_jump_line
             || self.pending_textobj_inner
             || self.pending_textobj_outer
+            || self.pending_visual_textobj_inner
+            || self.pending_visual_textobj_outer
     }
 }
 
@@ -848,6 +930,80 @@ mod tests {
         assert!(matches!(
             st.process(&Key::char('z'), Mode::Normal, &km),
             PendingResult::Action(Action::ReplaceChar('z'), 1)
+        ));
+    }
+
+    #[test]
+    fn operator_textobj_function() {
+        // `daf` → delete-around-function.
+        let (mut st, km) = state();
+        assert!(matches!(
+            st.process(&Key::char('d'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('a'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('f'), Mode::Normal, &km),
+            PendingResult::Action(
+                Action::ApplyOperatorTextObj(Operator::Delete, TextObj::OuterFunction),
+                1
+            )
+        ));
+    }
+
+    #[test]
+    fn operator_textobj_inner_class_and_argument() {
+        // `cic` → change-inner-class.
+        let (mut st, km) = state();
+        st.process(&Key::char('c'), Mode::Normal, &km);
+        st.process(&Key::char('i'), Mode::Normal, &km);
+        assert!(matches!(
+            st.process(&Key::char('c'), Mode::Normal, &km),
+            PendingResult::Action(
+                Action::ApplyOperatorTextObj(Operator::Change, TextObj::InnerClass),
+                1
+            )
+        ));
+        // `dia` → delete-inner-argument.
+        st.process(&Key::char('d'), Mode::Normal, &km);
+        st.process(&Key::char('i'), Mode::Normal, &km);
+        assert!(matches!(
+            st.process(&Key::char('a'), Mode::Normal, &km),
+            PendingResult::Action(
+                Action::ApplyOperatorTextObj(Operator::Delete, TextObj::InnerArgument),
+                1
+            )
+        ));
+    }
+
+    #[test]
+    fn visual_textobj_select_function() {
+        // `vaf` → in visual mode, select-around-function.
+        let (mut st, km) = state();
+        assert!(matches!(
+            st.process(&Key::char('a'), Mode::Visual, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('f'), Mode::Visual, &km),
+            PendingResult::Action(Action::SelectTextObj(TextObj::OuterFunction), 1)
+        ));
+    }
+
+    #[test]
+    fn visual_textobj_select_inner_argument() {
+        // `via` → in visual mode, select-inner-argument.
+        let (mut st, km) = state();
+        assert!(matches!(
+            st.process(&Key::char('i'), Mode::Visual, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('a'), Mode::Visual, &km),
+            PendingResult::Action(Action::SelectTextObj(TextObj::InnerArgument), 1)
         ));
     }
 }
