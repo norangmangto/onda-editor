@@ -6,8 +6,11 @@
 //! a tokio driver task that the editor talks to over channels — the main loop never
 //! blocks on agent I/O (AGENTS.md rule 2).
 
+pub mod mentions;
+pub mod permissions;
 pub mod protocol;
 pub mod session;
+pub mod staging;
 pub mod transport;
 
 use std::path::PathBuf;
@@ -17,11 +20,17 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+pub use mentions::{
+    build_context, format_diagnostics, parse_mentions, DiagnosticItem, Mention, MentionKind,
+    ResolvedContext, Severity,
+};
+pub use permissions::{Decision, PermissionStore, Rule, Scope, Target};
 pub use protocol::{
     ContentBlock, PermissionOption, PermissionOutcome, PlanEntry, RequestPermissionParams,
     StopReason, ToolCall, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 pub use session::{AgentEvent, PendingKind, SessionState};
+pub use staging::{ProposedEdit, Resolution, StagingArea};
 use transport::{Incoming, JsonRpcError, Transport, TransportError};
 
 #[derive(Debug, Error)]
