@@ -44,6 +44,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "session save",
     "session restore",
     "theme",
+    "table",
+    "fields",
 ];
 
 /// What a `<Tab>` press in the command line should complete.

@@ -268,6 +268,12 @@ struct App<B: Backend> {
     /// re-applied on top of the theme after every switch/reload (the ThemeChanged effect).
     lua_highlights: Vec<(String, onda_lua::api::HighlightOpts)>,
 
+    // ── Data views (CSV table) ─────────────────────────────────────────────────
+    /// Docs currently shown as a CSV/TSV table, with their sniffed dialect.
+    table_docs: HashMap<usize, onda_data::Dialect>,
+    /// Cached per-column layout for table docs (computed on `:table` enable).
+    table_layout: HashMap<usize, onda_data::ColumnLayout>,
+
     // ── LSP ───────────────────────────────────────────────────────────────────
     /// LSP manager (None when tokio runtime unavailable, e.g. bench).
     #[allow(dead_code)]
@@ -549,6 +555,81 @@ impl<B: Backend> App<B> {
             }
         }
         out
+    }
+
+    // ── Data views (CSV table / JSONL fields) ──────────────────────────────────
+
+    /// Toggle CSV/TSV table view for the focused doc. View-only: the rope is
+    /// untouched; on enable we sniff the dialect and cache column widths from a
+    /// sample of the file.
+    fn toggle_table_view(&mut self) {
+        let doc_idx = self.focused_win().doc_idx;
+        if self.table_docs.remove(&doc_idx).is_some() {
+            self.table_layout.remove(&doc_idx);
+            self.compositor.buf.invalidate();
+            self.message = Message::Info("table view off".into());
+            return;
+        }
+        let doc = &self.docs[doc_idx];
+        // Sample the first chunk for sniffing + widths (bounded for big files).
+        let sample_lines: Vec<String> = (0..doc.len_lines().min(500))
+            .map(|l| {
+                let s = doc.line_to_char(l);
+                let len = doc.line_len_no_eol(l);
+                onda_data::csv::clean_line(&doc.rope().slice(s..s + len).to_string()).to_string()
+            })
+            .collect();
+        let dialect = onda_data::sniff(&sample_lines.join("\n"));
+        let rows: Vec<Vec<String>> = sample_lines
+            .iter()
+            .map(|l| onda_data::parse_fields(l, dialect.delimiter, dialect.quote))
+            .collect();
+        let layout = onda_data::column_layout(&rows);
+        self.table_docs.insert(doc_idx, dialect);
+        self.table_layout.insert(doc_idx, layout);
+        self.compositor.buf.invalidate();
+        self.message = Message::Info(format!(
+            "table view on ({} cols, delim {:?})",
+            self.table_layout[&doc_idx].column_count(),
+            dialect.delimiter
+        ));
+    }
+
+    /// Show the JSONL field schema for the focused doc in a float overlay.
+    fn show_jsonl_fields(&mut self) {
+        let doc = self.doc();
+        let n = doc.len_lines().min(1000);
+        let lines: Vec<String> = (0..n)
+            .map(|l| {
+                let s = doc.line_to_char(l);
+                let len = doc.line_len_no_eol(l);
+                doc.rope().slice(s..s + len).to_string()
+            })
+            .collect();
+        let schema = onda_data::field_schema(lines.iter().map(|s| s.as_str()), n);
+        if schema.is_empty() {
+            self.message = Message::Info("no JSON records found".into());
+            return;
+        }
+        let mut out = vec![format!("fields (sampled {n} records):")];
+        for f in &schema {
+            let types: Vec<String> = f
+                .types
+                .iter()
+                .map(|(t, c)| format!("{}×{}", t.label(), c))
+                .collect();
+            out.push(format!(
+                "  {}  [{}]  ({})",
+                f.key,
+                f.count,
+                types.join(", ")
+            ));
+        }
+        self.hover_float = Some(HoverFloat {
+            lines: out,
+            col: 4,
+            row: 2,
+        });
     }
 
     // ── Git helpers ───────────────────────────────────────────────────────────
@@ -895,6 +976,15 @@ impl<B: Backend> App<B> {
                     .get(&win_idx)
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
+
+                // CSV/TSV table view takes over rendering for this window.
+                if let (Some(dialect), Some(layout)) = (
+                    self.table_docs.get(&doc_idx),
+                    self.table_layout.get(&doc_idx),
+                ) {
+                    render_table(grid, doc, sel, viewport, rect, *dialect, layout, theme);
+                    continue;
+                }
 
                 if diag_spans.is_empty() {
                     DocumentView::render_with_highlights(
@@ -1663,6 +1753,8 @@ impl<B: Backend> App<B> {
                         Message::Info(format!("theme: {} (available: {avail})", self.theme.name()));
                 }
             },
+            ExCommand::Table => self.toggle_table_view(),
+            ExCommand::Fields => self.show_jsonl_fields(),
             ExCommand::SessionSave(name) => {
                 let session = self.build_session();
                 let name = name.as_deref().unwrap_or("default");
@@ -3363,6 +3455,8 @@ fn make_app<B: Backend>(
         theme_path,
         lua_highlights: Vec::new(),
         config,
+        table_docs: HashMap::new(),
+        table_layout: HashMap::new(),
         lsp_manager: None,
         lsp_event_tx: None,
         diagnostics: HashMap::new(),
@@ -3594,6 +3688,110 @@ fn draw_cmd_completion(grid: &mut onda_render::Grid, comp: &CmdCompletion, ancho
         };
         grid.fill_rect(0, row, width, 1, style);
         grid.write_str(1, row, label, style);
+    }
+}
+
+/// Render a CSV/TSV document as an aligned virtual table (view-only; rope untouched).
+/// Header row is pinned at the top; columns are padded to their cached widths with
+/// `│` separators and per-column rainbow tinting; ragged rows are flagged.
+#[allow(clippy::too_many_arguments)]
+fn render_table(
+    grid: &mut onda_render::Grid,
+    doc: &Document,
+    sel: &Selection,
+    viewport: &Viewport,
+    rect: &Rect,
+    dialect: onda_data::Dialect,
+    layout: &onda_data::ColumnLayout,
+    theme: &onda_render::Theme,
+) {
+    use onda_render::Color;
+    const RAINBOW: [Color; 5] = [
+        Color::Cyan,
+        Color::Green,
+        Color::Yellow,
+        Color::Magenta,
+        Color::LightBlue,
+    ];
+    let header_style = theme.status_bg();
+    let text = theme.text();
+    let ragged_style = theme.diag_error();
+    let expected = layout.column_count();
+
+    let parse = |line_idx: usize| -> Vec<String> {
+        let s = doc.line_to_char(line_idx);
+        let len = doc.line_len_no_eol(line_idx);
+        let raw = doc.rope().slice(s..s + len).to_string();
+        let cleaned = onda_data::csv::clean_line(&raw).to_string();
+        onda_data::parse_fields(&cleaned, dialect.delimiter, dialect.quote)
+    };
+
+    let draw_row =
+        |grid: &mut onda_render::Grid, row: u16, fields: &[String], base: onda_render::Style| {
+            let mut col = rect.x;
+            let ragged = onda_data::csv::is_ragged(fields.len(), expected);
+            for (c, width) in layout.widths.iter().enumerate() {
+                if col >= rect.x + rect.width {
+                    break;
+                }
+                let cell = fields.get(c).map(|s| s.as_str()).unwrap_or("");
+                let mut style = base;
+                if base == text {
+                    style = base.fg(RAINBOW[c % RAINBOW.len()]);
+                }
+                if ragged {
+                    style = ragged_style;
+                }
+                let padded = format!("{cell:<width$}", width = *width);
+                col = grid.write_str(col, row, &padded, style);
+                if c + 1 < layout.widths.len() && col < rect.x + rect.width {
+                    col = grid.write_str(col, row, " │ ", theme.line_nr());
+                }
+            }
+            // Clear the rest of the row.
+            if col < rect.x + rect.width {
+                grid.fill_rect(
+                    col,
+                    row,
+                    rect.x + rect.width - col,
+                    1,
+                    onda_render::Style::RESET,
+                );
+            }
+        };
+
+    let total = doc.len_lines();
+    let has_header = dialect.has_header && total > 0;
+    // Pinned header occupies the first screen row when present.
+    let mut screen_row = rect.y;
+    if has_header {
+        let fields = parse(0);
+        draw_row(grid, screen_row, &fields, header_style);
+        screen_row += 1;
+    }
+
+    // Data rows: skip the header line; honor vertical scroll.
+    let first_data = if has_header { 1 } else { 0 };
+    let start = first_data + viewport.offset_line;
+    let cursor_line = doc.char_to_line(sel.primary().head);
+    let last_row = rect.y + rect.height;
+    let mut line = start;
+    while screen_row < last_row {
+        if line >= total {
+            grid.fill_rect(rect.x, screen_row, rect.width, 1, onda_render::Style::RESET);
+            screen_row += 1;
+            line += 1;
+            continue;
+        }
+        let fields = parse(line);
+        let base = if line == cursor_line {
+            theme.selection()
+        } else {
+            text
+        };
+        draw_row(grid, screen_row, &fields, base);
+        screen_row += 1;
+        line += 1;
     }
 }
 

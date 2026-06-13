@@ -68,6 +68,10 @@ pub enum ExCommand {
     GitDiscard,
     /// `:theme [name]` — switch theme, or report the current one when name omitted.
     Theme(Option<String>),
+    /// `:table` — toggle CSV/TSV virtual table view for the current buffer.
+    Table,
+    /// `:fields` — show the JSONL field schema overlay for the current buffer.
+    Fields,
     /// Custom command registered by a Lua plugin.
     LuaCommand(String, Vec<String>),
 }
@@ -153,6 +157,8 @@ impl ExCommand {
             "GitStage" | "gitstage" => Ok(ExCommand::GitStage),
             "GitUnstage" | "gitunstage" => Ok(ExCommand::GitUnstage),
             "GitDiscard" | "gitdiscard" => Ok(ExCommand::GitDiscard),
+            "table" | "csv" => Ok(ExCommand::Table),
+            "fields" => Ok(ExCommand::Fields),
             "theme" => Ok(ExCommand::Theme(None)),
             s if s.starts_with("theme ") => {
                 let name = s[6..].trim().to_string();
