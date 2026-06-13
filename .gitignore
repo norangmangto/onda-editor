@@ -12,7 +12,8 @@ Cargo.lock
 
 # Benchmark output
 /bench/results/
-/BENCH_REPORT.md
+# Note: BENCH_REPORT.md is a committed, published deliverable (Phase 0/5 exit
+# criterion) — regenerate with `cargo run -p xtask -- bench-compare`.
 
 # Editor state
 /.onda/
