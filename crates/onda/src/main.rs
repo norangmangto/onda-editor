@@ -368,6 +368,12 @@ struct App<B: Backend> {
     /// Active diff-review session (T24.2), if any.
     review: Option<ReviewState>,
 
+    // ── Persistent undo (T29.1) ─────────────────────────────────────────────────
+    /// Persistent undo store (Some only when `editor.persistent_undo` is on).
+    undo_store: Option<onda_session::UndoStore>,
+    /// Doc indices whose persisted undo tree we've already tried to load (lazy, once).
+    undo_loaded: std::collections::HashSet<usize>,
+
     // ── LSP ───────────────────────────────────────────────────────────────────
     /// LSP manager (None when tokio runtime unavailable, e.g. bench).
     #[allow(dead_code)]
@@ -461,6 +467,41 @@ impl<B: Backend> App<B> {
 
     fn undo(&mut self) -> &mut UndoHistory {
         &mut self.focused_win_mut().undo
+    }
+
+    /// Lazily load the persisted undo tree for `doc_idx` on first undo of a fresh
+    /// session (T29.1). No-op unless `editor.persistent_undo` is on; protects startup
+    /// by never touching disk until the user actually undoes.
+    fn maybe_load_persistent_undo(&mut self, doc_idx: usize) {
+        if self.undo_store.is_none() || self.undo_loaded.contains(&doc_idx) {
+            return;
+        }
+        self.undo_loaded.insert(doc_idx);
+        // Only restore when the in-memory history is empty (nothing this session).
+        if self.windows[self.focused_window].undo.can_undo() {
+            return;
+        }
+        if self.docs[doc_idx].path().is_none() {
+            return;
+        }
+        let content = self.docs[doc_idx].rope().to_string();
+        if let Some(store) = self.undo_store.as_ref() {
+            if let Some(tree) = store.load(&content) {
+                self.windows[self.focused_window].undo = tree;
+                self.message =
+                    Message::Info("restored undo history from a previous session".into());
+            }
+        }
+    }
+
+    /// Persist the focused window's undo tree, keyed by the just-saved content (T29.1).
+    fn persist_undo_on_save(&self, doc_idx: usize) {
+        if let Some(store) = self.undo_store.as_ref() {
+            if self.docs[doc_idx].path().is_some() {
+                let content = self.docs[doc_idx].rope().to_string();
+                store.save(&content, &self.windows[self.focused_window].undo);
+            }
+        }
     }
 
     fn viewport_mut(&mut self) -> &mut Viewport {
@@ -3008,6 +3049,7 @@ impl<B: Backend> App<B> {
                         // Refresh git gutter signs against the newly-saved content.
                         let doc_idx = self.focused_win().doc_idx;
                         self.request_git_signs(doc_idx);
+                        self.persist_undo_on_save(doc_idx);
                     }
                     Err(e) => {
                         self.message = Message::Error(format!("E: {e}"));
@@ -3026,6 +3068,8 @@ impl<B: Backend> App<B> {
             ExCommand::WriteQuit => match self.doc().save() {
                 Ok(()) => {
                     self.doc_mut().mark_saved();
+                    let doc_idx = self.focused_win().doc_idx;
+                    self.persist_undo_on_save(doc_idx);
                     self.running = false;
                 }
                 Err(e) => {
@@ -3491,6 +3535,7 @@ impl<B: Backend> App<B> {
             // ── Undo/Redo ─────────────────────────────────────────────────────
             Action::Undo => {
                 let doc_idx = self.focused_win().doc_idx;
+                self.maybe_load_persistent_undo(doc_idx);
                 for _ in 0..count {
                     let doc = &mut self.docs[doc_idx];
                     match self.windows[self.focused_window].undo.undo(doc) {
@@ -4835,6 +4880,11 @@ fn make_app<B: Backend>(
     let theme_watcher = theme_path
         .as_ref()
         .and_then(|p| spawn_theme_watcher(p, bg_tx.clone()));
+    let undo_store = if config.editor.persistent_undo {
+        onda_session::UndoStore::default_path().map(onda_session::UndoStore::new)
+    } else {
+        None
+    };
     App {
         docs: vec![initial_doc],
         windows: vec![win0],
@@ -4895,6 +4945,8 @@ fn make_app<B: Backend>(
         agent_pending_perm: None,
         agent_staging: onda_agent::StagingArea::new(),
         review: None,
+        undo_store,
+        undo_loaded: std::collections::HashSet::new(),
         lsp_manager: None,
         lsp_event_tx: None,
         diagnostics: HashMap::new(),

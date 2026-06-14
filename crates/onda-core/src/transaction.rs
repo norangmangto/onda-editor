@@ -1,4 +1,5 @@
 use ropey::Rope;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::selection::{Assoc, Selection};
@@ -12,7 +13,7 @@ pub enum ChangeSetError {
 }
 
 /// A single operation in a changeset.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Op {
     /// Keep N characters unchanged.
     Retain(usize),
@@ -25,7 +26,7 @@ pub enum Op {
 /// An ordered sequence of ops that transforms one document into another.
 ///
 /// All positions are in Unicode scalar values (char indices), matching ropey's API.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChangeSet {
     ops: Vec<Op>,
     /// Length of the document before the changeset is applied.
@@ -444,7 +445,7 @@ impl ChangeSetBuilder {
 }
 
 /// A transaction pairs a [`ChangeSet`] with the resulting [`Selection`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
     pub changes: ChangeSet,
     /// Selection after the transaction is applied. `None` means: map the current selection

@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::transaction::ChangeSet;
@@ -15,7 +16,7 @@ pub enum Assoc {
 ///
 /// `anchor` is where the selection started; `head` is where the cursor is now.
 /// When `anchor == head`, the range represents a pure cursor with no selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Range {
     /// The fixed end of the selection (where it started).
     pub anchor: usize,
@@ -114,7 +115,7 @@ impl Range {
 /// - Ranges are sorted by their `from()` position.
 /// - Overlapping or adjacent ranges are merged.
 /// - There is always at least one range.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Selection {
     ranges: SmallVec<[Range; 1]>,
     /// Index of the primary (last-active) cursor.

@@ -64,6 +64,9 @@ pub struct EditorConfig {
     pub clipboard: bool,
     #[serde(default)]
     pub mouse: bool,
+    /// Persist per-file undo history across sessions (T29.1). Default off for v0.1.
+    #[serde(default)]
+    pub persistent_undo: bool,
 }
 
 impl Default for EditorConfig {
@@ -77,6 +80,7 @@ impl Default for EditorConfig {
             auto_indent: default_auto_indent(),
             clipboard: default_clipboard(),
             mouse: false,
+            persistent_undo: false,
         }
     }
 }

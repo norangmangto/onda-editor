@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{document::Document, selection::Selection, transaction::Transaction};
@@ -13,7 +14,7 @@ pub enum UndoHistoryError {
 }
 
 /// A node in the undo tree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct UndoNode {
     /// Index of the parent node, or `None` for a root node.
     parent: Option<usize>,
@@ -39,6 +40,7 @@ struct UndoNode {
 /// most-recently-used child (highest `seq` among direct children).
 /// `undo_older` / `undo_newer` traverse the flat sequence order across ALL
 /// branches, enabling Vim-style `g-` / `g+` navigation.
+#[derive(Serialize, Deserialize)]
 pub struct UndoTree {
     nodes: Vec<UndoNode>,
     /// Index of the node we are currently "at" (i.e. the last applied node).
