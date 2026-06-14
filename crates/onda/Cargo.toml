@@ -17,6 +17,7 @@ onda-config.workspace = true
 onda-syntax.workspace = true
 onda-data.workspace = true
 onda-dap.workspace = true
+onda-agent.workspace = true
 onda-lsp.workspace = true
 onda-terminal.workspace = true
 onda-session.workspace = true

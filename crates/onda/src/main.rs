@@ -63,6 +63,10 @@ enum BgMessage {
     Dap(onda_dap::DapEvent),
     /// The debug adapter finished launching; carries the client handle.
     DapClientReady(onda_dap::DapClient),
+    /// Event from the ACP agent.
+    Agent(onda_agent::AgentEvent),
+    /// The agent finished connecting; carries the client handle.
+    AgentClientReady(onda_agent::AgentClient),
     /// The active theme file changed on disk (live reload, T18.1).
     ThemeReload,
 }
@@ -153,6 +157,24 @@ enum DapControl {
     Next,
     StepIn,
     StepOut,
+}
+
+/// Pre-formatted agent-panel render data: (styled lines, input, busy, title).
+type AgentPanelData = (Vec<(onda_render::Style, String)>, String, bool, String);
+
+/// One item in the agent conversation thread (W23).
+#[derive(Debug, Clone)]
+enum AgentItem {
+    User(String),
+    /// Streaming assistant text; chunks append to the last `Assistant` item.
+    Assistant(String),
+    Thought(String),
+    Tool {
+        title: String,
+        status: String,
+    },
+    Plan(Vec<String>),
+    Notice(String),
 }
 
 /// Active command-line completion (T18.3): a cycling candidate list with the
@@ -304,6 +326,28 @@ struct App<B: Backend> {
     dap_frames: Vec<onda_dap::StackFrame>,
     /// Latest variables (for `:DapVars`); flat for v1.
     dap_vars: Vec<onda_dap::Variable>,
+
+    // ── Agent panel (W23) ───────────────────────────────────────────────────────
+    /// Configured agents (agents.toml).
+    agent_registry: onda_agent::AgentRegistry,
+    /// Active agent client (None when not connected).
+    agent_client: Option<onda_agent::AgentClient>,
+    /// Name of the connected agent (for the panel title + permission scoping).
+    agent_name: Option<String>,
+    /// Whether the right-side agent panel is shown.
+    agent_panel_open: bool,
+    /// Whether keystrokes are routed to the panel input box.
+    agent_input_focused: bool,
+    /// The panel input buffer.
+    agent_input: String,
+    /// The conversation thread.
+    agent_thread: Vec<AgentItem>,
+    /// True between sending a prompt and `TurnEnded`.
+    agent_busy: bool,
+    /// Persisted permission rules.
+    agent_perms: onda_agent::PermissionStore,
+    /// A permission request awaiting a single-key decision (id + params).
+    agent_pending_perm: Option<(serde_json::Value, onda_agent::RequestPermissionParams)>,
 
     // ── LSP ───────────────────────────────────────────────────────────────────
     /// LSP manager (None when tokio runtime unavailable, e.g. bench).
@@ -934,6 +978,475 @@ impl<B: Backend> App<B> {
         }
     }
 
+    // ── Agent panel (W23) ───────────────────────────────────────────────────────
+
+    /// `:agent [name]` — with a name, connect + open + focus; without, toggle panel.
+    fn agent_command(&mut self, name: Option<String>) {
+        match name {
+            Some(n) => self.agent_connect(&n),
+            None => {
+                self.agent_panel_open = !self.agent_panel_open;
+                self.agent_input_focused = self.agent_panel_open;
+                self.compositor.buf.invalidate();
+            }
+        }
+    }
+
+    fn agent_connect(&mut self, name: &str) {
+        let cfg = match self.agent_registry.get(name) {
+            Some(c) => c.clone(),
+            None => {
+                let avail: Vec<&str> = self.agent_registry.names().collect();
+                self.message = Message::Error(format!(
+                    "unknown agent '{name}' (have: {})",
+                    avail.join(", ")
+                ));
+                return;
+            }
+        };
+        self.agent_panel_open = true;
+        self.agent_input_focused = true;
+        self.agent_name = Some(name.to_string());
+        self.agent_thread.clear();
+        self.agent_thread
+            .push(AgentItem::Notice(format!("connecting to {name}…")));
+        self.compositor.buf.invalidate();
+
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let bg_tx = self.bg_tx.clone();
+        let (etx, mut erx) = tokio::sync::mpsc::channel::<onda_agent::AgentEvent>(256);
+        let bridge_tx = bg_tx.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = erx.recv().await {
+                if bridge_tx.try_send(BgMessage::Agent(ev)).is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::spawn(async move {
+            match onda_agent::AgentClient::connect(&cfg, cwd, etx).await {
+                Ok(client) => {
+                    let _ = bg_tx.try_send(BgMessage::AgentClientReady(client));
+                }
+                Err(e) => {
+                    let _ = bg_tx.try_send(BgMessage::Agent(onda_agent::AgentEvent::Error {
+                        message: format!("connect failed: {e}"),
+                    }));
+                }
+            }
+        });
+    }
+
+    /// Send the input box as a prompt (resolving `@mentions`).
+    fn agent_send(&mut self) {
+        let text = self.agent_input.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let Some(client) = self.agent_client.as_ref() else {
+            self.agent_thread
+                .push(AgentItem::Notice("not connected (:agent <name>)".into()));
+            self.agent_input.clear();
+            return;
+        };
+        let blocks = self.agent_resolve_mentions(&text);
+        client.dispatch(onda_agent::AgentCommand::Prompt(blocks));
+        self.agent_thread.push(AgentItem::User(text));
+        self.agent_thread.push(AgentItem::Assistant(String::new()));
+        self.agent_busy = true;
+        self.agent_input.clear();
+    }
+
+    /// Resolve `@file`/`@selection`/`@buffer`/`@diagnostics` mentions into ACP content
+    /// blocks (text first, then attached resources). Open buffers are read live.
+    fn agent_resolve_mentions(&self, text: &str) -> Vec<onda_agent::ContentBlock> {
+        use onda_agent::mentions::{build_context, MentionKind, DEFAULT_MAX_LINES};
+        let mut blocks = vec![onda_agent::ContentBlock::text(text)];
+        for m in onda_agent::parse_mentions(text) {
+            match m.kind {
+                MentionKind::File | MentionKind::Buffer => {
+                    if let Some(arg) = &m.arg {
+                        // Prefer an open buffer (dirty content); else read disk.
+                        let content = self
+                            .docs
+                            .iter()
+                            .find(|d| {
+                                d.path().map(|p| p.ends_with(arg)).unwrap_or(false)
+                                    || d.name() == arg
+                            })
+                            .map(|d| d.rope().to_string())
+                            .or_else(|| std::fs::read_to_string(arg).ok());
+                        if let Some(c) = content {
+                            blocks.push(
+                                build_context(format!("file://{arg}"), None, &c, DEFAULT_MAX_LINES)
+                                    .block,
+                            );
+                        }
+                    }
+                }
+                MentionKind::Selection => {
+                    let sel = self.selection().primary();
+                    let (from, to) = (sel.from(), sel.to());
+                    if to > from {
+                        let content = self.doc().rope().slice(from..to).to_string();
+                        blocks.push(
+                            build_context("onda-selection://", None, &content, DEFAULT_MAX_LINES)
+                                .block,
+                        );
+                    }
+                }
+                MentionKind::Diagnostics => {
+                    let doc_idx = self.focused_win().doc_idx;
+                    if let Some(spans) = self.diagnostic_spans.get(&doc_idx) {
+                        let items: Vec<onda_agent::DiagnosticItem> = spans
+                            .iter()
+                            .map(|s| {
+                                let line = self.doc().char_to_line(s.from);
+                                onda_agent::DiagnosticItem {
+                                    line,
+                                    col: 0,
+                                    severity: match s.severity {
+                                        0 => onda_agent::Severity::Error,
+                                        1 => onda_agent::Severity::Warning,
+                                        _ => onda_agent::Severity::Info,
+                                    },
+                                    message: String::new(),
+                                }
+                            })
+                            .collect();
+                        let text =
+                            onda_agent::format_diagnostics(&items, onda_agent::Severity::Hint);
+                        if !text.is_empty() {
+                            blocks.push(
+                                build_context(
+                                    "onda-diagnostics://",
+                                    None,
+                                    &text,
+                                    DEFAULT_MAX_LINES,
+                                )
+                                .block,
+                            );
+                        }
+                    }
+                }
+                MentionKind::Terminal | MentionKind::Unknown => {}
+            }
+        }
+        blocks
+    }
+
+    /// Append/route an agent event into the thread.
+    fn handle_agent_event(&mut self, ev: onda_agent::AgentEvent) {
+        use onda_agent::AgentEvent as E;
+        match ev {
+            E::Initialized { .. } => {}
+            E::SessionCreated { .. } => {
+                self.agent_thread
+                    .push(AgentItem::Notice("session ready".into()));
+            }
+            E::MessageChunk { text } => {
+                if let Some(AgentItem::Assistant(s)) = self.agent_thread.last_mut() {
+                    s.push_str(&text);
+                } else {
+                    self.agent_thread.push(AgentItem::Assistant(text));
+                }
+            }
+            E::ThoughtChunk { text } => {
+                if let Some(AgentItem::Thought(s)) = self.agent_thread.last_mut() {
+                    s.push_str(&text);
+                } else {
+                    self.agent_thread.push(AgentItem::Thought(text));
+                }
+            }
+            E::ToolCallStarted(tc) => self.agent_thread.push(AgentItem::Tool {
+                title: tc.title,
+                status: format!("{:?}", tc.status).to_lowercase(),
+            }),
+            E::ToolCallUpdated(u) => {
+                if let Some(st) = u.status {
+                    if let Some(AgentItem::Tool { status, .. }) = self
+                        .agent_thread
+                        .iter_mut()
+                        .rev()
+                        .find(|i| matches!(i, AgentItem::Tool { .. }))
+                    {
+                        *status = format!("{st:?}").to_lowercase();
+                    }
+                }
+            }
+            E::Plan(entries) => self.agent_thread.push(AgentItem::Plan(
+                entries.into_iter().map(|e| e.content).collect(),
+            )),
+            E::PermissionRequest { request_id, params } => {
+                self.agent_handle_permission(request_id, params)
+            }
+            E::FileReadRequest { request_id, params } => {
+                self.agent_serve_file_read(request_id, params)
+            }
+            E::FileWriteRequest { request_id, .. } => {
+                // Direct writes require the review flow (T24.2); reject cleanly for now.
+                if let Some(client) = self.agent_client.as_ref() {
+                    client.dispatch(onda_agent::AgentCommand::RespondFileWrite {
+                        id: request_id,
+                        result: Err("writes require diff review (not yet wired)".into()),
+                    });
+                }
+                self.agent_thread.push(AgentItem::Notice(
+                    "agent proposed a file write (review not wired)".into(),
+                ));
+            }
+            E::UnknownRequest { request_id, .. } => {
+                if let Some(client) = self.agent_client.as_ref() {
+                    client.dispatch(onda_agent::AgentCommand::RespondUnknown { id: request_id });
+                }
+            }
+            E::TurnEnded { .. } => {
+                self.agent_busy = false;
+                self.agent_thread
+                    .push(AgentItem::Notice("— turn complete —".into()));
+            }
+            E::Error { message } => self
+                .agent_thread
+                .push(AgentItem::Notice(format!("error: {message}"))),
+            E::Malformed(_) => {}
+        }
+    }
+
+    /// Serve an `fs/read_text_file` from a live buffer (dirty content) or disk.
+    fn agent_serve_file_read(
+        &mut self,
+        request_id: serde_json::Value,
+        params: onda_agent::ReadTextFileParams,
+    ) {
+        let path = &params.path;
+        let content = self
+            .docs
+            .iter()
+            .find(|d| {
+                d.path()
+                    .map(|p| p.to_string_lossy() == *path)
+                    .unwrap_or(false)
+            })
+            .map(|d| d.rope().to_string())
+            .or_else(|| std::fs::read_to_string(path).ok());
+        if let Some(client) = self.agent_client.as_ref() {
+            client.dispatch(onda_agent::AgentCommand::RespondFileRead {
+                id: request_id,
+                content: content.ok_or_else(|| format!("cannot read {path}")),
+            });
+        }
+    }
+
+    /// Handle a permission request: auto-decide from the store, else prompt in-panel.
+    fn agent_handle_permission(
+        &mut self,
+        request_id: serde_json::Value,
+        params: onda_agent::RequestPermissionParams,
+    ) {
+        let agent = self.agent_name.clone().unwrap_or_else(|| "agent".into());
+        let target = onda_agent::Target::Command(params.tool_call.title.clone());
+        let tool = params.tool_call.kind;
+        if let Some(decision) = self.agent_perms.check(&agent, tool, &target) {
+            let allow = decision == onda_agent::Decision::Allow;
+            self.agent_respond_permission(request_id, &params, allow);
+            self.agent_thread.push(AgentItem::Notice(format!(
+                "permission {} (rule): {}",
+                if allow { "allowed" } else { "denied" },
+                params.tool_call.title
+            )));
+            return;
+        }
+        self.agent_thread.push(AgentItem::Notice(format!(
+            "[permission] {} — (a)llow once / (A)lways / (d)eny",
+            params.tool_call.title
+        )));
+        self.agent_pending_perm = Some((request_id, params));
+    }
+
+    /// Resolve the pending permission with a single-key choice.
+    fn agent_resolve_pending_perm(&mut self, key: char) {
+        let Some((id, params)) = self.agent_pending_perm.take() else {
+            return;
+        };
+        let agent = self.agent_name.clone().unwrap_or_else(|| "agent".into());
+        let target = onda_agent::Target::Command(params.tool_call.title.clone());
+        let tool = params.tool_call.kind;
+        let (allow, persist) = match key {
+            'a' => (true, false),
+            'A' => (true, true),
+            'd' => (false, false),
+            'D' => (false, true),
+            _ => {
+                self.agent_pending_perm = Some((id, params));
+                return;
+            }
+        };
+        if persist {
+            let kind = if allow {
+                onda_agent::PermissionOptionKind::AllowAlways
+            } else {
+                onda_agent::PermissionOptionKind::RejectAlways
+            };
+            self.agent_perms.apply_choice(&agent, tool, &target, kind);
+            if let Some(p) = agent_perms_path() {
+                let _ = self.agent_perms.save(&p);
+            }
+        }
+        self.agent_respond_permission(id, &params, allow);
+        self.agent_thread.push(AgentItem::Notice(format!(
+            "permission {}",
+            if allow { "allowed" } else { "denied" }
+        )));
+    }
+
+    fn agent_respond_permission(
+        &self,
+        id: serde_json::Value,
+        params: &onda_agent::RequestPermissionParams,
+        allow: bool,
+    ) {
+        let want = if allow {
+            [
+                onda_agent::PermissionOptionKind::AllowOnce,
+                onda_agent::PermissionOptionKind::AllowAlways,
+            ]
+        } else {
+            [
+                onda_agent::PermissionOptionKind::RejectOnce,
+                onda_agent::PermissionOptionKind::RejectAlways,
+            ]
+        };
+        let option_id = params
+            .options
+            .iter()
+            .find(|o| want.contains(&o.kind))
+            .or_else(|| params.options.first())
+            .map(|o| o.option_id.clone());
+        let outcome = match option_id {
+            Some(id) => onda_agent::PermissionOutcome::Selected { option_id: id },
+            None => onda_agent::PermissionOutcome::Cancelled,
+        };
+        if let Some(client) = self.agent_client.as_ref() {
+            client.dispatch(onda_agent::AgentCommand::RespondPermission { id, outcome });
+        }
+    }
+
+    /// Export the conversation transcript to a scratch buffer (`:agent-export`).
+    fn agent_export(&mut self) {
+        if self.agent_thread.is_empty() {
+            self.message = Message::Info("agent: no transcript".into());
+            return;
+        }
+        let mut text = String::from("# Agent transcript\n\n");
+        for item in &self.agent_thread {
+            match item {
+                AgentItem::User(s) => text.push_str(&format!("## you\n{s}\n\n")),
+                AgentItem::Assistant(s) => text.push_str(&format!("## agent\n{s}\n\n")),
+                AgentItem::Thought(s) => text.push_str(&format!("> (thinking) {s}\n\n")),
+                AgentItem::Tool { title, status } => {
+                    text.push_str(&format!("- tool: {title} [{status}]\n"))
+                }
+                AgentItem::Plan(entries) => {
+                    text.push_str("plan:\n");
+                    for e in entries {
+                        text.push_str(&format!("  - {e}\n"));
+                    }
+                    text.push('\n');
+                }
+                AgentItem::Notice(s) => text.push_str(&format!("_{s}_\n\n")),
+            }
+        }
+        let mut doc = Document::new_empty();
+        let cs = onda_core::transaction::ChangeSetBuilder::new(0)
+            .insert(&text)
+            .build();
+        let _ = doc.apply(&Transaction::new(cs));
+        let idx = self.docs.len();
+        self.docs.push(doc);
+        self.focused_win_mut().doc_idx = idx;
+        *self.selection_mut() = Selection::point(0);
+        self.message = Message::Info("agent: transcript exported to a new buffer".into());
+    }
+
+    /// Keystrokes while the panel input is focused. Returns true if consumed.
+    fn handle_agent_input_key(&mut self, key: &Key) -> bool {
+        // A pending permission steals single-key a/A/d/D.
+        if self.agent_pending_perm.is_some() {
+            if let Key::Char(c, _) = key {
+                if matches!(c, 'a' | 'A' | 'd' | 'D') {
+                    self.agent_resolve_pending_perm(*c);
+                    return true;
+                }
+            }
+        }
+        match key {
+            Key::Esc => {
+                self.agent_input_focused = false;
+                true
+            }
+            Key::Enter => {
+                self.agent_send();
+                true
+            }
+            Key::Backspace => {
+                self.agent_input.pop();
+                true
+            }
+            Key::Char(c, _) => {
+                self.agent_input.push(*c);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Width reserved for the agent panel (0 when closed), clamped to sane bounds.
+    fn agent_panel_width(&self, total: u16) -> u16 {
+        if !self.agent_panel_open {
+            return 0;
+        }
+        (total / 3).clamp(30, 64).min(total.saturating_sub(20))
+    }
+
+    /// Format the thread into styled panel lines (newest at the bottom).
+    fn agent_panel_lines(&self) -> Vec<(onda_render::Style, String)> {
+        use onda_render::{Color, Style};
+        let mut out = Vec::new();
+        let wrap = 36usize;
+        let push_wrapped =
+            |prefix: &str, text: &str, style: Style, out: &mut Vec<(Style, String)>| {
+                let full = format!("{prefix}{text}");
+                for chunk in wrap_text(&full, wrap) {
+                    out.push((style, chunk));
+                }
+            };
+        for item in &self.agent_thread {
+            match item {
+                AgentItem::User(s) => {
+                    push_wrapped("you: ", s, Style::default().fg(Color::LightCyan), &mut out)
+                }
+                AgentItem::Assistant(s) => push_wrapped("", s, self.theme.text(), &mut out),
+                AgentItem::Thought(s) => {
+                    push_wrapped("· ", s, Style::default().fg(Color::DarkGray), &mut out)
+                }
+                AgentItem::Tool { title, status } => out.push((
+                    Style::default().fg(Color::Yellow),
+                    format!("⚙ {title} [{status}]"),
+                )),
+                AgentItem::Plan(entries) => {
+                    out.push((Style::default().fg(Color::Magenta), "plan:".into()));
+                    for e in entries {
+                        out.push((Style::default().fg(Color::Magenta), format!("  • {e}")));
+                    }
+                }
+                AgentItem::Notice(s) => {
+                    out.push((Style::default().fg(Color::DarkGray), format!("— {s}")))
+                }
+            }
+        }
+        out
+    }
+
     // ── Git helpers ───────────────────────────────────────────────────────────
 
     /// Lazily spawn the background git worker and the std-thread bridge that
@@ -1154,8 +1667,12 @@ impl<B: Backend> App<B> {
         let msg_row = height.saturating_sub(1);
         let mode_ind = self.mode_indicator();
 
+        // Carve a right strip for the agent panel, if open.
+        let panel_width = self.agent_panel_width(width);
+        let editor_width = width - panel_width;
+
         // ── Phase 1: update viewports (no grid access yet) ────────────────────
-        let content_area = Rect::new(0, 0, width, content_height);
+        let content_area = Rect::new(0, 0, editor_width, content_height);
         let rects = self.layout.rects(content_area);
         let focused_win_id = WindowId(self.focused_window);
 
@@ -1233,6 +1750,18 @@ impl<B: Backend> App<B> {
                 highlights.insert(win_idx, spans);
             }
         }
+
+        // Agent panel content, formatted before the grid borrow.
+        let agent_panel: Option<AgentPanelData> = if panel_width > 0 {
+            Some((
+                self.agent_panel_lines(),
+                self.agent_input.clone(),
+                self.agent_busy,
+                self.agent_name.clone().unwrap_or_else(|| "Agent".into()),
+            ))
+        } else {
+            None
+        };
 
         // ── Phase 3: render into grid ─────────────────────────────────────────
         {
@@ -1348,6 +1877,22 @@ impl<B: Backend> App<B> {
             // Message line
             MessageLine::render(grid, msg_row, &msg, theme);
 
+            // Agent panel (right strip).
+            if let Some((lines, input, busy, title)) = &agent_panel {
+                onda_render::render_agent_panel(
+                    grid,
+                    editor_width,
+                    0,
+                    panel_width,
+                    content_height,
+                    title,
+                    lines,
+                    input,
+                    *busy,
+                    theme,
+                );
+            }
+
             // Command-line completion popup (above the command line).
             if self.mode == Mode::Command {
                 if let Some(comp) = self.cmd_completion.as_ref() {
@@ -1412,6 +1957,16 @@ impl<B: Backend> App<B> {
 
     fn cursor_screen_pos(&self, rects: &[(WindowId, Rect)]) -> (u16, u16) {
         let (width, height) = self.backend.size();
+
+        // When the agent input is focused, the cursor sits in the panel input line.
+        if self.agent_input_focused {
+            let pw = self.agent_panel_width(width);
+            let editor_width = width - pw;
+            let col = (editor_width as usize + 3 + self.agent_input.chars().count())
+                .min(width.saturating_sub(1) as usize) as u16;
+            let row = height.saturating_sub(3); // content_height - 1
+            return (col, row);
+        }
 
         if self.mode == Mode::Command {
             let prefix_len = 1usize; // ':' or '/'
@@ -1592,6 +2147,11 @@ impl<B: Backend> App<B> {
             .unwrap_or(false)
         {
             return self.handle_picker_key(key);
+        }
+
+        // Route to the agent panel input box when focused.
+        if self.agent_input_focused && self.handle_agent_input_key(&key) {
+            return Ok(());
         }
 
         match self.mode {
@@ -2122,6 +2682,8 @@ impl<B: Backend> App<B> {
             },
             ExCommand::Table => self.toggle_table_view(),
             ExCommand::Fields => self.show_jsonl_fields(),
+            ExCommand::Agent(name) => self.agent_command(name),
+            ExCommand::AgentExport => self.agent_export(),
             ExCommand::DapRun => self.dap_run(),
             ExCommand::DapStop => {
                 if let Some(client) = self.dap_client.as_ref() {
@@ -3498,6 +4060,10 @@ impl<B: Backend> App<B> {
                     }
                     self.message = Message::Info("DAP: session started".into());
                 }
+                BgMessage::Agent(ev) => self.handle_agent_event(ev),
+                BgMessage::AgentClientReady(client) => {
+                    self.agent_client = Some(client);
+                }
             }
         }
     }
@@ -3858,6 +4424,65 @@ fn load_dap_registry() -> onda_dap::DapRegistry {
     reg
 }
 
+// ── Agent config ─────────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct AgentsFile {
+    #[serde(default)]
+    agent: Vec<AgentToml>,
+}
+
+#[derive(serde::Deserialize)]
+struct AgentToml {
+    name: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: Vec<(String, String)>,
+}
+
+/// Load agents from `~/.config/onda/agents.toml`, with a built-in `claude` default.
+fn load_agent_registry() -> onda_agent::AgentRegistry {
+    let mut reg = onda_agent::AgentRegistry::new();
+    reg.add(onda_agent::AgentConfig {
+        name: "claude".into(),
+        command: "claude-code".into(),
+        args: vec!["acp".into()],
+        env: vec![],
+    });
+    if let Ok(home) = std::env::var("HOME") {
+        let path = PathBuf::from(home).join(".config/onda/agents.toml");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(file) = toml::from_str::<AgentsFile>(&text) {
+                for a in file.agent {
+                    reg.add(onda_agent::AgentConfig {
+                        name: a.name,
+                        command: a.command,
+                        args: a.args,
+                        env: a.env,
+                    });
+                }
+            }
+        }
+    }
+    reg
+}
+
+/// Path to the persisted agent permission rules.
+fn agent_perms_path() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".config/onda/agent-perms.json"))
+}
+
+fn load_agent_perms() -> onda_agent::PermissionStore {
+    match agent_perms_path() {
+        Some(p) => onda_agent::PermissionStore::load(&p),
+        None => onda_agent::PermissionStore::new(),
+    }
+}
+
 // ── Theme loading ──────────────────────────────────────────────────────────────
 
 /// Candidate on-disk paths for a theme file, in priority order.
@@ -4002,6 +4627,16 @@ fn make_app<B: Backend>(
         dap_thread: None,
         dap_frames: Vec::new(),
         dap_vars: Vec::new(),
+        agent_registry: load_agent_registry(),
+        agent_client: None,
+        agent_name: None,
+        agent_panel_open: false,
+        agent_input_focused: false,
+        agent_input: String::new(),
+        agent_thread: Vec::new(),
+        agent_busy: false,
+        agent_perms: load_agent_perms(),
+        agent_pending_perm: None,
         lsp_manager: None,
         lsp_event_tx: None,
         diagnostics: HashMap::new(),
@@ -4387,6 +5022,19 @@ fn format_unix_date(secs: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let year = if m <= 2 { y + 1 } else { y };
     format!("{year:04}-{m:02}-{d:02}")
+}
+
+/// Hard-wrap `text` into chunks of at most `width` chars (char-based, not word-aware
+/// — good enough for the narrow agent panel). Always yields at least one chunk.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .chunks(width.max(1))
+        .map(|c| c.iter().collect())
+        .collect()
 }
 
 /// Map a tree-sitter highlight scope to its theme scope-name suffix.

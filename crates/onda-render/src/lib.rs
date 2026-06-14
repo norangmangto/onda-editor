@@ -9,6 +9,7 @@ pub use grid::{Attribute, Cell, Color, DoubleBuffer, Grid, Style};
 pub use split::{draw_borders, Layout, Rect, SplitDir, WindowId};
 pub use theme::{Theme, ThemeError, BUILTIN_THEMES};
 pub use view::{
-    render_completion_menu, render_float, render_picker, Compositor, DiagnosticSpan, DocumentView,
-    HlSpan, Message, MessageLine, ModeIndicator, Statusline, Viewport,
+    render_agent_panel, render_completion_menu, render_float, render_picker, Compositor,
+    DiagnosticSpan, DocumentView, HlSpan, Message, MessageLine, ModeIndicator, Statusline,
+    Viewport,
 };

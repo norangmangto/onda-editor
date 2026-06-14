@@ -76,6 +76,10 @@ pub enum ExCommand {
     GitResetHunk,
     /// `:theme [name]` — switch theme, or report the current one when name omitted.
     Theme(Option<String>),
+    /// `:agent [name]` — connect to an agent (open panel), or toggle the panel.
+    Agent(Option<String>),
+    /// `:agent-export` — export the conversation transcript to a buffer.
+    AgentExport,
     /// `:DapRun` — launch a debug session for the current file.
     DapRun,
     /// `:DapStop` — end the debug session.
@@ -181,6 +185,16 @@ impl ExCommand {
             "GitBlame" | "gitblame" => Ok(ExCommand::GitBlame),
             "GitStageHunk" | "gitstagehunk" => Ok(ExCommand::GitStageHunk),
             "GitResetHunk" | "gitresethunk" => Ok(ExCommand::GitResetHunk),
+            "agent" => Ok(ExCommand::Agent(None)),
+            "agent-export" => Ok(ExCommand::AgentExport),
+            s if s.starts_with("agent ") => {
+                let name = s[6..].trim().to_string();
+                Ok(ExCommand::Agent(if name.is_empty() {
+                    None
+                } else {
+                    Some(name)
+                }))
+            }
             "DapRun" | "daprun" => Ok(ExCommand::DapRun),
             "DapStop" | "dapstop" => Ok(ExCommand::DapStop),
             "DapStack" | "dapstack" => Ok(ExCommand::DapStack),

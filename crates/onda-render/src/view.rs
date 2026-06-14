@@ -803,6 +803,67 @@ pub fn render_completion_menu(
     }
 }
 
+// ── Agent panel ──────────────────────────────────────────────────────────────
+
+/// Draw the right-side agent panel: a title bar (with a busy spinner), the
+/// conversation thread (pre-styled lines, scrolled to the bottom), and an input
+/// line. `lines` are `(style, text)` pairs the binary formats from the thread; this
+/// keeps `onda-render` free of an `onda-agent` dependency.
+#[allow(clippy::too_many_arguments)]
+pub fn render_agent_panel(
+    grid: &mut Grid,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    title: &str,
+    lines: &[(Style, String)],
+    input: &str,
+    busy: bool,
+    theme: &Theme,
+) {
+    if width < 2 || height < 3 {
+        return;
+    }
+    let bg = theme.float_bg();
+    let border = theme.float_border();
+    let title_style = theme.status_bg();
+
+    // Left separator column.
+    for r in 0..height {
+        grid.set(x, y + r, Cell::new("│", border));
+    }
+    let content_x = x + 1;
+    let content_w = width - 1;
+
+    // Title bar.
+    let spinner = if busy { "  ◐ thinking…" } else { "" };
+    let title_text = format!(" {title}{spinner}");
+    grid.fill_rect(content_x, y, content_w, 1, title_style);
+    grid.write_str(content_x, y, &title_text, title_style);
+
+    // Input line at the bottom.
+    let input_row = y + height - 1;
+    grid.fill_rect(content_x, input_row, content_w, 1, bg);
+    let prompt = format!("> {input}");
+    grid.write_str(content_x, input_row, &prompt, bg);
+
+    // Thread body between title and input, scrolled so the tail is visible.
+    let body_top = y + 1;
+    let body_rows = height.saturating_sub(2) as usize;
+    let start = lines.len().saturating_sub(body_rows);
+    for (i, (style, text)) in lines[start..].iter().enumerate() {
+        let row = body_top + i as u16;
+        grid.fill_rect(content_x, row, content_w, 1, bg);
+        let clipped: String = text.chars().take(content_w as usize).collect();
+        grid.write_str(content_x, row, &clipped, *style);
+    }
+    // Clear any remaining body rows.
+    for i in lines[start..].len()..body_rows {
+        grid.fill_rect(content_x, body_top + i as u16, content_w, 1, bg);
+    }
+}
+
 // ── Compositor ────────────────────────────────────────────────────────────────
 
 /// Owns the double-buffer and drives the full render pipeline.
@@ -911,6 +972,33 @@ mod tests {
         assert_eq!(c.style_at(4), None);
         assert_eq!(c.style_at(5), Some(blue));
         assert_eq!(c.style_at(9), None); // past end
+    }
+
+    #[test]
+    fn agent_panel_draws_title_thread_and_input() {
+        let mut grid = Grid::new(60, 10);
+        let theme = Theme::default_dark();
+        let s = Style::default();
+        let lines = vec![
+            (s, "you: hello".to_string()),
+            (s, "agent: hi there".to_string()),
+        ];
+        render_agent_panel(
+            &mut grid, 40, 0, 20, 10, "Agent", &lines, "type…", true, &theme,
+        );
+        // Separator column.
+        assert_eq!(grid.get(40, 0).unwrap().grapheme, "│");
+        // Title row contains "Agent" and the busy spinner.
+        let title: String = (41..60)
+            .filter_map(|c| grid.get(c, 0).map(|x| x.grapheme.clone()))
+            .collect();
+        assert!(title.contains("Agent"));
+        assert!(title.contains("thinking"));
+        // Input row (last) shows the prompt.
+        let input: String = (41..60)
+            .filter_map(|c| grid.get(c, 9).map(|x| x.grapheme.clone()))
+            .collect();
+        assert!(input.contains("> type"));
     }
 
     #[test]

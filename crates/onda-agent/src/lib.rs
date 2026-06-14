@@ -26,8 +26,9 @@ pub use mentions::{
 };
 pub use permissions::{Decision, PermissionStore, Rule, Scope, Target};
 pub use protocol::{
-    ContentBlock, PermissionOption, PermissionOutcome, PlanEntry, RequestPermissionParams,
-    StopReason, ToolCall, ToolCallStatus, ToolCallUpdate, ToolKind,
+    ContentBlock, PermissionOption, PermissionOptionKind, PermissionOutcome, PlanEntry,
+    ReadTextFileParams, RequestPermissionParams, StopReason, ToolCall, ToolCallStatus,
+    ToolCallUpdate, ToolKind,
 };
 pub use session::{AgentEvent, PendingKind, SessionState};
 pub use staging::{ProposedEdit, Resolution, StagingArea};
@@ -136,6 +137,12 @@ impl AgentClient {
 
     async fn send(&self, cmd: AgentCommand) -> Result<(), AgentError> {
         self.cmd_tx.send(cmd).await.map_err(|_| AgentError::Closed)
+    }
+
+    /// Non-blocking dispatch for callers outside an async context (the editor's
+    /// synchronous main loop). Returns false if the driver is gone or its queue full.
+    pub fn dispatch(&self, cmd: AgentCommand) -> bool {
+        self.cmd_tx.try_send(cmd).is_ok()
     }
 
     pub async fn prompt(&self, blocks: Vec<ContentBlock>) -> Result<(), AgentError> {
