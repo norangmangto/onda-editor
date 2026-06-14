@@ -100,9 +100,12 @@ audit-gap fixes were implemented. "Engine done" = pure, unit-tested logic crate;
 - **Remote editing `scp://`** (Phase 3 W17): no `russh` transport; needs a live SSH host.
 - **libvterm** (Phase 3 W17): terminal still uses `vt100`; vendoring + nvim/tmux/htop
   regression is a large FFI effort.
-- **Agent panel UI** (Phase 4 W23/T24.2): the `onda-agent` engine is built+tested but not
-  wired into the binary — no streaming panel, hunk-review screen, or permission-prompt UI;
-  no live Claude Code (needs the agent binary).
+- **Agent diff review** (Phase 4 T24.2): the agent panel (W23) is wired — streaming
+  thread, tool cards, input box, permission prompt (persisted), `@`-mention resolution,
+  fs/read from live buffers, `:agent-export`. **Still outstanding:** the hunk-level
+  diff-review screen for agent-proposed *writes* (the `StagingArea` engine exists but
+  file writes are currently rejected pending review), and live Claude Code (needs the
+  `claude-code acp` binary; conformance is via `onda-mock-agent`).
 - **Persistent undo** (Phase 5 T29.1): needs serde on core transaction types; default-off
   for v0.1, lowest priority.
 - **Release/launch** (W31/W32): clean-machine install matrix, Homebrew tap, docs site,
