@@ -96,18 +96,20 @@ audit-gap fixes were implemented. "Engine done" = pure, unit-tested logic crate;
   `dap.toml` + `docs/DAP.md`. Conformance via `onda-mock-dap`; lldb-dap/debugpy are the
   documented real targets (not run in CI). Conditional breakpoints + side panel deferred.
 
+- **Agent (Phase 4 W23 + T24.2)**: panel wired — streaming thread, tool cards, input
+  box, permission prompt (persisted), `@`-mention resolution, fs/read from live buffers,
+  `:agent-export`. Diff review (T24.2) done: agent writes stage into the rebase engine;
+  `:agent-review` gives per-hunk accept/reject/accept-all applied as one undo step, with
+  rejected hunks reported back to the agent.
+- **Persistent undo** (Phase 5 T29.1): done — content-hash-keyed `UndoStore`, opt-in,
+  persisted on save, lazily restored on first undo, mismatch/corrupt → clean fallback.
+
 ### Outstanding (not implemented — each is large and/or needs external infra)
 - **Remote editing `scp://`** (Phase 3 W17): no `russh` transport; needs a live SSH host.
 - **libvterm** (Phase 3 W17): terminal still uses `vt100`; vendoring + nvim/tmux/htop
   regression is a large FFI effort.
-- **Agent (Phase 4 W23 + T24.2)**: panel wired — streaming thread, tool cards, input
-  box, permission prompt (persisted), `@`-mention resolution, fs/read from live buffers,
-  `:agent-export`. **Diff review** (T24.2) done: agent writes stage into the rebase
-  engine; `:agent-review` gives per-hunk accept/reject/accept-all applied as one undo
-  step, with rejected hunks reported back to the agent. Only **live Claude Code** remains
-  external (needs the `claude-code acp` binary; conformance is via `onda-mock-agent`).
-- **Persistent undo** (Phase 5 T29.1): needs serde on core transaction types; default-off
-  for v0.1, lowest priority.
+- **Live Claude Code** (Phase 4): the agent path is proven against `onda-mock-agent`;
+  driving the real `claude-code acp` binary needs it installed (manual release check).
 - **Release/launch** (W31/W32): clean-machine install matrix, Homebrew tap, docs site,
   signed multi-platform artifacts, `v0.0.3`/`v0.1.0` tags + announcement — not codeable/
   verifiable in a sandbox.
