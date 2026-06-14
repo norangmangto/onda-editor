@@ -124,13 +124,39 @@ pub fn three_way_merge(base: &str, proposed: &str, current: &str) -> Resolution 
     Resolution::Clean(merged)
 }
 
+/// Reviewable change hunks transforming `base` into `proposed` (line-level diff).
+/// The editor's review UI presents these for per-hunk accept/reject.
+pub fn file_hunks(base: &str, proposed: &str) -> Vec<Hunk> {
+    diff_hunks(&split_lines(base), &split_lines(proposed))
+}
+
+/// Apply the selected `hunks` (a subset of `file_hunks(base, _)`, in order) to
+/// `base`, producing the reviewed content. Non-selected regions stay as in `base`.
+pub fn apply_selected(base: &str, hunks: &[Hunk]) -> String {
+    let base_lines = split_lines(base);
+    let refs: Vec<&Hunk> = hunks.iter().collect();
+    apply_hunks(&base_lines, &refs)
+}
+
+/// The base lines a hunk removes (for `-` display), given the base text.
+pub fn hunk_removed<'a>(hunk: &Hunk, base: &'a str) -> Vec<&'a str> {
+    base.split('\n')
+        .skip(hunk.base_start)
+        .take(hunk.base_len)
+        .collect()
+}
+
 /// A change region in *base* coordinates: replace `base[start..start+len]` with
-/// `replacement` lines.
+/// `replacement` lines. Public so the editor's review UI can show and selectively
+/// apply individual hunks (T24.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Hunk {
-    base_start: usize,
-    base_len: usize,
-    replacement: Vec<String>,
+pub struct Hunk {
+    /// 0-based first base line the hunk replaces.
+    pub base_start: usize,
+    /// Number of base lines replaced (0 = pure insertion).
+    pub base_len: usize,
+    /// The replacement lines.
+    pub replacement: Vec<String>,
 }
 
 /// Two hunks conflict if their base ranges overlap. Insertions (zero-length) at the
@@ -360,6 +386,30 @@ mod tests {
                 "roundtrip {base:?}->{other:?}"
             );
         }
+    }
+
+    #[test]
+    fn file_hunks_and_selective_apply() {
+        let base = "a\nb\nc\nd\n";
+        let proposed = "a\nB\nc\nD\n"; // two separate one-line changes
+        let hunks = file_hunks(base, proposed);
+        assert_eq!(hunks.len(), 2);
+        // Accept only the first hunk.
+        let accepted = vec![hunks[0].clone()];
+        assert_eq!(apply_selected(base, &accepted), "a\nB\nc\nd\n");
+        // Accept both → equals proposed.
+        assert_eq!(apply_selected(base, &hunks), proposed);
+        // Accept none → equals base.
+        assert_eq!(apply_selected(base, &[]), base);
+    }
+
+    #[test]
+    fn hunk_removed_lines() {
+        let base = "x\nold\ny\n";
+        let proposed = "x\nnew\ny\n";
+        let hunks = file_hunks(base, proposed);
+        assert_eq!(hunk_removed(&hunks[0], base), vec!["old"]);
+        assert_eq!(hunks[0].replacement, vec!["new".to_string()]);
     }
 
     #[test]

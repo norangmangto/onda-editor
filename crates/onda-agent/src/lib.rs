@@ -31,7 +31,9 @@ pub use protocol::{
     ToolCallUpdate, ToolKind,
 };
 pub use session::{AgentEvent, PendingKind, SessionState};
-pub use staging::{ProposedEdit, Resolution, StagingArea};
+pub use staging::{
+    apply_selected, file_hunks, hunk_removed, Hunk, ProposedEdit, Resolution, StagingArea,
+};
 use transport::{Incoming, JsonRpcError, Transport, TransportError};
 
 #[derive(Debug, Error)]

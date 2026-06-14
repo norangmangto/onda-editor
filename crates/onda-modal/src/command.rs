@@ -80,6 +80,8 @@ pub enum ExCommand {
     Agent(Option<String>),
     /// `:agent-export` — export the conversation transcript to a buffer.
     AgentExport,
+    /// `:agent-review` — review staged agent-proposed edits (per-hunk).
+    AgentReview,
     /// `:DapRun` — launch a debug session for the current file.
     DapRun,
     /// `:DapStop` — end the debug session.
@@ -187,6 +189,7 @@ impl ExCommand {
             "GitResetHunk" | "gitresethunk" => Ok(ExCommand::GitResetHunk),
             "agent" => Ok(ExCommand::Agent(None)),
             "agent-export" => Ok(ExCommand::AgentExport),
+            "agent-review" => Ok(ExCommand::AgentReview),
             s if s.starts_with("agent ") => {
                 let name = s[6..].trim().to_string();
                 Ok(ExCommand::Agent(if name.is_empty() {

@@ -162,6 +162,21 @@ enum DapControl {
 /// Pre-formatted agent-panel render data: (styled lines, input, busy, title).
 type AgentPanelData = (Vec<(onda_render::Style, String)>, String, bool, String);
 
+/// Active agent diff-review session (T24.2): one file's proposed change, per-hunk.
+#[derive(Debug, Clone)]
+struct ReviewState {
+    path: PathBuf,
+    /// The content the review diffs against (current buffer/disk at review start).
+    base: String,
+    hunks: Vec<onda_agent::Hunk>,
+    /// Per-hunk accept decision (default accept).
+    accept: Vec<bool>,
+    /// Currently focused hunk.
+    cursor: usize,
+    /// Other staged files queued for review after this one.
+    remaining: Vec<PathBuf>,
+}
+
 /// One item in the agent conversation thread (W23).
 #[derive(Debug, Clone)]
 enum AgentItem {
@@ -348,6 +363,10 @@ struct App<B: Backend> {
     agent_perms: onda_agent::PermissionStore,
     /// A permission request awaiting a single-key decision (id + params).
     agent_pending_perm: Option<(serde_json::Value, onda_agent::RequestPermissionParams)>,
+    /// Agent-proposed file edits awaiting review (T24.1 staging).
+    agent_staging: onda_agent::StagingArea,
+    /// Active diff-review session (T24.2), if any.
+    review: Option<ReviewState>,
 
     // ── LSP ───────────────────────────────────────────────────────────────────
     /// LSP manager (None when tokio runtime unavailable, e.g. bench).
@@ -1183,17 +1202,31 @@ impl<B: Backend> App<B> {
             E::FileReadRequest { request_id, params } => {
                 self.agent_serve_file_read(request_id, params)
             }
-            E::FileWriteRequest { request_id, .. } => {
-                // Direct writes require the review flow (T24.2); reject cleanly for now.
+            E::FileWriteRequest { request_id, params } => {
+                // Stage the proposed edit (T24.1) for review; do not touch the buffer.
+                let base = self
+                    .docs
+                    .iter()
+                    .find(|d| {
+                        d.path()
+                            .map(|p| p.to_string_lossy() == params.path)
+                            .unwrap_or(false)
+                    })
+                    .map(|d| d.rope().to_string())
+                    .or_else(|| std::fs::read_to_string(&params.path).ok())
+                    .unwrap_or_default();
+                self.agent_staging
+                    .stage(PathBuf::from(&params.path), base, params.content);
                 if let Some(client) = self.agent_client.as_ref() {
                     client.dispatch(onda_agent::AgentCommand::RespondFileWrite {
                         id: request_id,
-                        result: Err("writes require diff review (not yet wired)".into()),
+                        result: Ok(()),
                     });
                 }
-                self.agent_thread.push(AgentItem::Notice(
-                    "agent proposed a file write (review not wired)".into(),
-                ));
+                self.agent_thread.push(AgentItem::Notice(format!(
+                    "proposed edit to {} — :agent-review",
+                    params.path
+                )));
             }
             E::UnknownRequest { request_id, .. } => {
                 if let Some(client) = self.agent_client.as_ref() {
@@ -1442,6 +1475,211 @@ impl<B: Backend> App<B> {
                 AgentItem::Notice(s) => {
                     out.push((Style::default().fg(Color::DarkGray), format!("— {s}")))
                 }
+            }
+        }
+        out
+    }
+
+    // ── Agent diff review (T24.2) ───────────────────────────────────────────────
+
+    /// `:agent-review` — start reviewing staged agent edits, one file at a time.
+    fn agent_review_start(&mut self) {
+        let mut paths: Vec<PathBuf> = self.agent_staging.files().map(|(p, _)| p.clone()).collect();
+        paths.sort();
+        if paths.is_empty() {
+            self.message = Message::Info("no proposed edits to review".into());
+            return;
+        }
+        let first = paths.remove(0);
+        match self.build_review(&first, paths) {
+            Some(rs) => {
+                self.review = Some(rs);
+                self.agent_input_focused = false;
+                self.compositor.buf.invalidate();
+            }
+            None => self.message = Message::Info("proposed edit has no changes".into()),
+        }
+    }
+
+    /// Build a `ReviewState` for `path`, diffing the live buffer/disk against the
+    /// staged proposal. Returns None when there's nothing to review.
+    fn build_review(&self, path: &std::path::Path, remaining: Vec<PathBuf>) -> Option<ReviewState> {
+        let proposed = self.agent_staging.get(path)?.proposed.clone();
+        let base = self
+            .docs
+            .iter()
+            .find(|d| d.path().map(|p| p == path).unwrap_or(false))
+            .map(|d| d.rope().to_string())
+            .or_else(|| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        let hunks = onda_agent::file_hunks(&base, &proposed);
+        if hunks.is_empty() {
+            return None;
+        }
+        let accept = vec![true; hunks.len()];
+        Some(ReviewState {
+            path: path.to_path_buf(),
+            base,
+            hunks,
+            accept,
+            cursor: 0,
+            remaining,
+        })
+    }
+
+    /// Keystrokes while a review is active. Returns true if consumed.
+    fn handle_review_key(&mut self, key: &Key) -> bool {
+        let Some(rs) = self.review.as_mut() else {
+            return false;
+        };
+        match key {
+            Key::Esc | Key::Char('q', _) => {
+                self.review = None;
+                self.message = Message::Info("review cancelled".into());
+            }
+            Key::Char('j', _) | Key::Down => {
+                if rs.cursor + 1 < rs.hunks.len() {
+                    rs.cursor += 1;
+                }
+            }
+            Key::Char('k', _) | Key::Up => {
+                rs.cursor = rs.cursor.saturating_sub(1);
+            }
+            Key::Char('a', _) => rs.accept[rs.cursor] = true,
+            Key::Char('r', _) => rs.accept[rs.cursor] = false,
+            Key::Char('A', _) => rs.accept.iter_mut().for_each(|a| *a = true),
+            Key::Char('R', _) => rs.accept.iter_mut().for_each(|a| *a = false),
+            Key::Enter | Key::Char('y', _) => {
+                self.review_apply();
+            }
+            _ => {}
+        }
+        self.compositor.buf.invalidate();
+        true
+    }
+
+    /// Apply the accepted hunks of the active review to the buffer as one undo step,
+    /// then advance to the next staged file.
+    fn review_apply(&mut self) {
+        let Some(rs) = self.review.take() else { return };
+        let accepted: Vec<onda_agent::Hunk> = rs
+            .hunks
+            .iter()
+            .zip(rs.accept.iter())
+            .filter(|(_, a)| **a)
+            .map(|(h, _)| h.clone())
+            .collect();
+        let n_accepted = accepted.len();
+        let new_content = onda_agent::apply_selected(&rs.base, &accepted);
+
+        // Open the file into a buffer if it isn't already, then focus it.
+        let doc_idx = match self
+            .docs
+            .iter()
+            .position(|d| d.path().map(|p| p == rs.path).unwrap_or(false))
+        {
+            Some(i) => i,
+            None => match Document::open(&rs.path) {
+                Ok(doc) => {
+                    let i = self.docs.len();
+                    self.docs.push(doc);
+                    self.try_spawn_syntax_worker_for_doc(i);
+                    i
+                }
+                Err(e) => {
+                    self.message = Message::Error(format!("review apply: {e}"));
+                    self.agent_staging.remove(&rs.path);
+                    self.review_advance(rs.remaining);
+                    return;
+                }
+            },
+        };
+        self.focused_win_mut().doc_idx = doc_idx;
+
+        // Full-buffer replace as a single undo step (one per buffer, per T24.2/T11.5).
+        if new_content != rs.base {
+            let len = self.doc().len_chars();
+            let cs = onda_core::transaction::ChangeSetBuilder::new(len)
+                .delete(len)
+                .insert(&new_content)
+                .build();
+            let tx = Transaction::new(cs);
+            let sel_before = self.selection().clone();
+            if let Ok(inv) = self.doc_mut().apply(&tx) {
+                *self.selection_mut() = Selection::point(0);
+                let sel_after = self.selection().clone();
+                self.undo().push(tx, inv, sel_before, sel_after);
+            }
+        }
+        self.agent_staging.remove(&rs.path);
+        let total = rs.hunks.len();
+        self.message = Message::Info(format!(
+            "applied {n_accepted}/{total} hunks to {}",
+            rs.path.display()
+        ));
+        // Tell the agent which hunks were rejected (context for the next turn).
+        if n_accepted < total {
+            if let Some(client) = self.agent_client.as_ref() {
+                let _ = client.dispatch(onda_agent::AgentCommand::Prompt(vec![
+                    onda_agent::ContentBlock::text(format!(
+                        "[review] applied {n_accepted}/{total} hunks to {}; the rest were rejected.",
+                        rs.path.display()
+                    )),
+                ]));
+            }
+        }
+        self.review_advance(rs.remaining);
+    }
+
+    /// Move to the next staged file, or close review when done.
+    fn review_advance(&mut self, remaining: Vec<PathBuf>) {
+        let mut rest = remaining;
+        while let Some(next) = rest.first().cloned() {
+            rest.remove(0);
+            if let Some(rs) = self.build_review(&next, rest.clone()) {
+                self.review = Some(rs);
+                self.compositor.buf.invalidate();
+                return;
+            }
+            self.agent_staging.remove(&next);
+        }
+        self.review = None;
+        self.compositor.buf.invalidate();
+    }
+
+    /// Format the active review into styled overlay lines (header + hunks).
+    fn review_lines(&self) -> Vec<(onda_render::Style, String)> {
+        use onda_render::{Color, Style};
+        let mut out = Vec::new();
+        let Some(rs) = self.review.as_ref() else {
+            return out;
+        };
+        let accepted = rs.accept.iter().filter(|a| **a).count();
+        out.push((
+            Style::default().bold(),
+            format!(
+                "Review {}  ({} hunk(s), {accepted} accepted)  a/r toggle · A/R all · ⏎ apply · q cancel",
+                rs.path.display(),
+                rs.hunks.len()
+            ),
+        ));
+        out.push((self.theme.line_nr(), String::new()));
+        for (i, h) in rs.hunks.iter().enumerate() {
+            let mark = if rs.accept[i] { "✓" } else { "✗" };
+            let focus = if i == rs.cursor { "▶" } else { " " };
+            out.push((
+                if i == rs.cursor {
+                    Style::default().fg(Color::LightCyan).bold()
+                } else {
+                    self.theme.text()
+                },
+                format!("{focus} {mark} hunk {} @ line {}", i + 1, h.base_start + 1),
+            ));
+            for removed in onda_agent::hunk_removed(h, &rs.base) {
+                out.push((Style::default().fg(Color::Red), format!("  - {removed}")));
+            }
+            for added in &h.replacement {
+                out.push((Style::default().fg(Color::Green), format!("  + {added}")));
             }
         }
         out
@@ -1763,6 +2001,13 @@ impl<B: Backend> App<B> {
             None
         };
 
+        // Diff-review overlay lines, formatted before the grid borrow.
+        let review_lines: Vec<(onda_render::Style, String)> = if self.review.is_some() {
+            self.review_lines()
+        } else {
+            Vec::new()
+        };
+
         // ── Phase 3: render into grid ─────────────────────────────────────────
         {
             let theme = &self.theme;
@@ -1891,6 +2136,11 @@ impl<B: Backend> App<B> {
                     *busy,
                     theme,
                 );
+            }
+
+            // Diff-review overlay (centered, over everything else).
+            if !review_lines.is_empty() {
+                draw_review_overlay(grid, width, content_height, &review_lines, theme);
             }
 
             // Command-line completion popup (above the command line).
@@ -2147,6 +2397,11 @@ impl<B: Backend> App<B> {
             .unwrap_or(false)
         {
             return self.handle_picker_key(key);
+        }
+
+        // Route to the diff-review overlay when active.
+        if self.review.is_some() && self.handle_review_key(&key) {
+            return Ok(());
         }
 
         // Route to the agent panel input box when focused.
@@ -2684,6 +2939,7 @@ impl<B: Backend> App<B> {
             ExCommand::Fields => self.show_jsonl_fields(),
             ExCommand::Agent(name) => self.agent_command(name),
             ExCommand::AgentExport => self.agent_export(),
+            ExCommand::AgentReview => self.agent_review_start(),
             ExCommand::DapRun => self.dap_run(),
             ExCommand::DapStop => {
                 if let Some(client) = self.dap_client.as_ref() {
@@ -4637,6 +4893,8 @@ fn make_app<B: Backend>(
         agent_busy: false,
         agent_perms: load_agent_perms(),
         agent_pending_perm: None,
+        agent_staging: onda_agent::StagingArea::new(),
+        review: None,
         lsp_manager: None,
         lsp_event_tx: None,
         diagnostics: HashMap::new(),
@@ -4788,6 +5046,57 @@ fn run_editor(paths: Vec<PathBuf>) -> Result<()> {
 // ── Terminal rendering helper ──────────────────────────────────────────────────
 
 /// Overlay git gutter signs in the leftmost column of the line-number gutter.
+/// Draw the diff-review overlay: a bordered box of styled lines (header + hunks),
+/// scrolled so the focused hunk stays visible isn't tracked here — the line list is
+/// short enough to top-anchor; callers cap content.
+fn draw_review_overlay(
+    grid: &mut onda_render::Grid,
+    width: u16,
+    content_height: u16,
+    lines: &[(onda_render::Style, String)],
+    theme: &onda_render::Theme,
+) {
+    use onda_render::Style;
+    let bw = (width as i32 - 6).clamp(20, 100) as u16;
+    let bh = (content_height as i32 - 2).clamp(6, 40) as u16;
+    let x = (width.saturating_sub(bw)) / 2;
+    let y = 1u16;
+    let bg = theme.float_bg();
+    let border = theme.float_border();
+
+    // Border + fill.
+    grid.fill_rect(x, y, bw, bh, bg);
+    let top: String = std::iter::once('┌')
+        .chain(std::iter::repeat('─').take(bw.saturating_sub(2) as usize))
+        .chain(std::iter::once('┐'))
+        .collect();
+    let bottom: String = std::iter::once('└')
+        .chain(std::iter::repeat('─').take(bw.saturating_sub(2) as usize))
+        .chain(std::iter::once('┘'))
+        .collect();
+    grid.write_str(x, y, &top, border);
+    grid.write_str(x, y + bh - 1, &bottom, border);
+    for r in 1..bh - 1 {
+        grid.set(x, y + r, onda_render::Cell::new("│", border));
+        grid.set(x + bw - 1, y + r, onda_render::Cell::new("│", border));
+    }
+
+    // Content (top-anchored; scroll to keep the list end visible if it overflows).
+    let inner_w = bw.saturating_sub(4) as usize;
+    let rows = bh.saturating_sub(2) as usize;
+    let start = lines.len().saturating_sub(rows);
+    for (i, (style, text)) in lines[start..].iter().take(rows).enumerate() {
+        let row = y + 1 + i as u16;
+        let clipped: String = text.chars().take(inner_w).collect();
+        let st = if *style == Style::default() {
+            theme.text()
+        } else {
+            *style
+        };
+        grid.write_str(x + 2, row, &clipped, st);
+    }
+}
+
 /// Overlay debugger gutter markers: `●` verified / `◌` pending breakpoints, and `→`
 /// for the stopped frame line. Drawn over git signs (debugger state wins).
 #[allow(clippy::too_many_arguments)]
