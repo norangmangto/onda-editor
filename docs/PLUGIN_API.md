@@ -1,611 +1,434 @@
 # onda Plugin API
 
-> **Stability: unstable.** The API described here is in active development during
-> Phase 2. Breaking changes will occur without deprecation notices. Stability is
-> targeted for Phase 3. See [Migration / Compatibility](#migration--compatibility).
+> **Stability: `@unstable` (host API v0.1).** The interfaces described here are
+> versioned with the `onda:plugin` WIT package and may break without deprecation
+> until the Phase 5 release freeze (DESIGN.md §8 risk row). The host advertises its
+> API version; a plugin manifest declares `min-api-version` and **fails to load** if
+> the host cannot satisfy it. See [Migration / Compatibility](#migration--compatibility).
 
 ---
 
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Plugin Loader](#plugin-loader)
-3. [Sandbox Restrictions](#sandbox-restrictions)
-4. [API Reference](#api-reference)
-   - [onda.notify](#ondanotifymsg-level)
-   - [onda.log](#ondalogmsg)
-   - [onda.buf.get_lines](#ondabufget_linesbuf-start-end)
-   - [onda.buf.set_lines](#ondabufset_linesbuf-start-end-lines)
-   - [onda.win.get_cursor](#ondawinget_cursorwin)
-   - [onda.win.set_cursor](#ondawinset_cursorwin-pos)
-   - [onda.keymap.set](#ondakeymapsetmode-lhs-callback_id-opts)
-   - [onda.cmd.create](#ondacmdcreatename-callback_id-opts)
-   - [onda.ui.float](#ondauifloatopts)
-   - [onda.autocmd.create](#ondaautocmdcreateevent-pattern-callback_id)
-5. [Callback Registry Protocol](#callback-registry-protocol)
-6. [Performance Contract](#performance-contract)
-7. [Example Plugins](#example-plugins)
-8. [Migration / Compatibility](#migration--compatibility)
+2. [Execution & Threading Model](#execution--threading-model)
+3. [The WIT World](#the-wit-world)
+4. [Quickstart](#quickstart)
+5. [Manifest (`onda-plugin.toml`)](#manifest-onda-plugintoml)
+6. [Permission Model](#permission-model)
+7. [Shared Types](#shared-types)
+8. [Host Interfaces (plugins import)](#host-interfaces-plugins-import)
+9. [Guest Exports (the host calls)](#guest-exports-the-host-calls)
+10. [Performance Contract](#performance-contract)
+11. [Plugin Manager (install / list / remove)](#plugin-manager-install--list--remove)
+12. [Reference Plugins](#reference-plugins)
+13. [Migration / Compatibility](#migration--compatibility)
 
 ---
 
 ## Overview
 
-onda embeds a **Lua 5.4** runtime (via [mlua](https://github.com/mlua-rs/mlua))
-for user plugins. The runtime follows the same threading rules as the rest of the
-editor: **Lua runs on the main thread between frames, never inside the event loop
-itself.**
+onda plugins are **WebAssembly Components** (ADR-002), not scripts. The runtime is
+[`wasmtime`](https://wasmtime.dev) with the **Component Model**, and the host API is
+defined as typed WIT interfaces under `wit/onda/*.wit`. Any language with WIT
+bindings can target it; **Rust is first-class** (`wit-bindgen` + `wasm32-wasip2`).
 
-The execution model is:
+Why WASM and not an embedded scripting language (ADR-002, rejecting Lua):
 
-1. Before each frame, the main loop fires any pending Lua callbacks (keybindings,
-   commands, autocmds) that were triggered by input in the previous frame.
-2. Each call into Lua is bounded by the frame budget (500 µs).
-3. Lua functions that need to modify editor state do not call back into the editor
-   synchronously. Instead every mutating API function enqueues a `LuaApiCall` into
-   a bounded channel (capacity 1 024).
-4. After Lua returns, the main loop drains the channel and applies the queued calls
-   to `App` in order.
+- **Sandboxing** — a plugin is a capability-confined component. A crash or hang is
+  contained by the host; it cannot take down the editor.
+- **Multi-language** — Rust / Python / JS / Go can all compile to a component.
+- **Near-native speed** with predictable, interruptible execution.
 
-Read-only API calls (`buf.get_lines`, `win.get_cursor`) are answered synchronously
-from a snapshot of editor state. See [implementation note](#ondabufget_linesbuf-start-end)
-for current limitations.
+The plugin crate is `onda-plugin`. The full WIT reference lives in `wit/README.md`;
+the typed surface is `wit/onda/{world,types,host,guest}.wit`.
 
-The sandboxed Lua VM loads only a safe subset of the Lua standard library. No file
-I/O, no subprocess execution, no reflection via the `debug` library.
+> The previous Lua (`mlua`) plugin system and the `onda.*` Lua API have been
+> **removed** (ADR-002). If you are looking for `onda.buf.get_lines` /
+> `_onda_callbacks` / `runtime/plugins/*.lua`, those no longer exist — the
+> equivalents are the `buffer`, `commands`, and `keymap` WIT interfaces below.
 
 ---
 
-## Plugin Loader
+## Execution & Threading Model
 
-`PluginLoader::load_all` scans two directories at startup, in this order:
+The threading rules are the same as the rest of the editor (AGENTS.md rule 2 +
+ADR-002): **no host call may block the caller, and nothing a plugin does is an await
+point that can stall the render path.**
 
-| Priority | Path | Purpose |
-|---|---|---|
-| 1 (user) | `$XDG_CONFIG_HOME/onda/plugins/*.lua` | per-user plugins |
-| 1 (user, fallback) | `~/.config/onda/plugins/*.lua` | if `XDG_CONFIG_HOME` is unset |
-| 2 (project) | `<cwd>/.onda/plugins/*.lua` | per-project plugins |
-
-Rules:
-
-- Only files with the `.lua` extension are loaded. Other files in those directories
-  are silently ignored.
-- If a directory does not exist it is skipped without error.
-- Both locations are scanned every time an onda session starts. There is no hot-reload
-  during a session.
-- A syntax or runtime error in a plugin is logged to the editor message line and to
-  the tracing subscriber. The plugin is skipped; the editor continues loading
-  remaining plugins. Errors never crash the editor.
-- Both directories are loaded unconditionally. Project plugins do not shadow or
-  replace user plugins; they are additive.
+1. Plugin handlers run on the **main thread, between frames** — never inside the
+   event loop's input path.
+2. Each handler runs under an **epoch deadline (default 5ms, T18.2)**. Exceeding it
+   suspends and demotes the plugin (a busy loop is trapped, not awaited).
+3. **Reads** (`buffer.text`, `selection.get`, `editor.cursor`, …) are answered from
+   a **snapshot** prepared before the plugin's budget begins — they are consistent
+   and synchronous, never racing the live buffer.
+4. **Writes** (`buffer.apply`, `selection.set`, `decorations.set`, …) are **queued**
+   and applied by the main loop between frames. Buffer mutation goes through
+   `onda-core`'s `Transaction`/`ChangeSet` — there is **no raw rope access**, and a
+   batch of edits lands as **one undo step**.
 
 ---
 
-## Sandbox Restrictions
+## The WIT World
 
-The Lua VM is created with a restricted standard library:
+A plugin is a component targeting the `plugin` world (`wit/onda/world.wit`):
 
-**Loaded:** `string`, `table`, `math`, `utf8`, `package`
+```wit
+package onda:plugin@0.1.0;
 
-**Not loaded at all:** `io` (standard channels `io.stdin`/`io.stdout`/`io.stderr`
-may be present), `os` (partial — see below), `debug`, `coroutine`, `ffi`
+world plugin {
+    import types; import log; import buffer; import selection; import editor;
+    import commands; import keymap; import decorations; import ui; import config;
+    // Capability-gated — present only when the manifest declares + user approves.
+    import fs; import http;
+    export guest;
+}
+```
 
-In addition, the following functions are set to `nil` after library load:
+The plugin **imports** the host interfaces and **exports** `guest` (its lifecycle and
+handlers). `fs` and `http` are linked into the instance **only** when the manifest
+declares them and the grant is in place — an ungranted import is a **link-time
+failure**, so declaration is enforcement.
 
-| Symbol | Reason |
+**v0 non-goals** (intentionally absent): arbitrary UI windows beyond
+float/picker/statusline; raw filesystem/network outside the capability-gated
+`fs`/`http`; raw buffer/rope access; any synchronous host call that can block a frame.
+
+---
+
+## Quickstart
+
+A condensed version of `docs/plugin-book/quickstart.md`.
+
+**Prerequisite:** `rustup target add wasm32-wasip2`
+
+```toml
+# Cargo.toml
+[package]
+name = "my-plugin"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+```
+
+```rust
+// src/lib.rs
+wit_bindgen::generate!({ world: "plugin", path: "wit/onda" });
+
+use exports::onda::plugin::guest::{Event, Guest};
+use onda::plugin::{buffer, log};
+use onda::plugin::types::NotifyLevel;
+
+struct Plugin;
+
+impl Guest for Plugin {
+    fn init() {
+        log::debug("my-plugin activated");
+    }
+
+    fn handle_event(ev: Event) {
+        if let Event::BufferOpen(b) = ev {
+            let n = buffer::line_count(b.buf).unwrap_or(0);
+            log::notify(&format!("{} has {n} lines", b.path), NotifyLevel::Info);
+        }
+    }
+
+    fn run_command(_id: u64, _args: Vec<String>) {}
+    fn run_keymap(_id: u64) {}
+}
+
+export!(Plugin);
+```
+
+Import paths mirror the package: host interfaces are `onda::plugin::<iface>`, the
+guest trait is `exports::onda::plugin::guest::Guest`.
+
+```sh
+cargo build --release --target wasm32-wasip2
+onda plugin install ./my-plugin     # local dir, or github:user/repo[@rev]
+```
+
+---
+
+## Manifest (`onda-plugin.toml`)
+
+Every plugin ships a manifest alongside its `.wasm` component. It is parsed by
+`onda-plugin::manifest`; an unsatisfiable `min-api-version` makes the plugin fail to
+load (the host API is currently **v0.1**).
+
+```toml
+[plugin]
+name = "git-blame-inline"
+version = "0.1.0"
+entry = "git_blame_inline.wasm"   # the component file, relative to the plugin dir
+min-api-version = "0.1"           # host must satisfy this (major must match, minor >=)
+
+[permissions]
+buffer = "read"                   # none | read | write
+filesystem = ["./.git"]           # project-root-relative whitelist (capability)
+network = false                   # capability — gates the `http` import
+shell = false                     # reserved; no shell interface in v0
+
+[activation]
+events = ["buffer-open", "cursor-hold"]   # lazy activation — protects startup
+```
+
+`activation.events` are the [guest events](#guest-exports-the-host-calls) the plugin
+subscribes to. Declaring them up front lets the host avoid instantiating a plugin
+until something it cares about happens.
+
+---
+
+## Permission Model
+
+Capabilities are **declared in the manifest** and (intended to be) **approved by the
+user**. Enforcement is at link time and at the host boundary:
+
+| Permission | Effect |
 |---|---|
-| `io.open` | filesystem read/write |
-| `io.lines` | filesystem read |
-| `io.popen` | subprocess I/O |
-| `io.tmpfile` | filesystem write |
-| `os.execute` | arbitrary subprocess execution |
-| `os.remove` | filesystem mutation |
-| `os.rename` | filesystem mutation |
-| `os.exit` | would terminate the editor process |
-| `loadfile` | load arbitrary Lua from the filesystem |
-| `dofile` | load and run arbitrary Lua from the filesystem |
-| `debug` (the whole table) | reflection / sandbox escape |
-| `package.loadlib` | native C extension loading |
+| `buffer = "none" \| "read" \| "write"` | Whether `buffer.apply` / `selection.set` are honored. |
+| `filesystem = [paths]` | Wires in the `fs` interface, scoped to those paths via `cap-std` preopens. `..` escapes are **rejected by the host**. An empty/absent list means `fs` is not linked. |
+| `network = true` | Wires in the `http` interface (host-mediated; no raw sockets). |
+| `shell` | Reserved. There is no shell interface in v0. |
 
-The global `require` is replaced with a whitelist implementation. Only these module
-names are allowed:
+The effective grant is `request ∩ grant`; an import the plugin was not granted
+**fails to link**, so a plugin literally cannot call a capability it didn't declare.
 
-- `string`
-- `table`
-- `math`
-- `utf8`
-- `bit32`
-- Any name starting with `onda.` (resolved from pre-loaded injected tables, not the
-  filesystem)
-
-Attempting `require` of any other module returns a Lua runtime error:
-
-```
-sandbox: require of 'io' is not allowed
-```
-
-`onda.*` sub-namespaces (`onda.buf`, `onda.win`, etc.) are injected as globals
-directly and do not need to be `require`d.
+> **Current limitation (see `docs/BACKLOG.md`).** `discover` currently **auto-grants
+> the declared capabilities** — the install-time and first-use approval *prompt* is
+> not yet wired. The path-scoping, `..`-rejection, and link-time enforcement above
+> are all live; only the interactive consent UI is outstanding.
 
 ---
 
-## API Reference
+## Shared Types
 
-All functions live under the global `onda` table, which is injected into every
-plugin VM at startup.
+From `wit/onda/types.wit`. **Positions are char indices** (0-based, UTF-8 scalar
+boundaries) — there are no line/col footguns in v0.
+
+| Type | Definition |
+|---|---|
+| `char-idx` | `u32` — a character index into a buffer. |
+| `buffer-id` | `u64` — stable for the lifetime of an open buffer. |
+| `window-id` | `u64` — a window handle. |
+| `range` | `{ anchor: char-idx, head: char-idx }` — half-open; `anchor == head` is a caret, `anchor` may be `> head`. |
+| `selection` | `{ ranges: list<range>, primary: u32 }` — **always 1..N ranges** (ADR-006); `primary` indexes the main cursor. |
+| `notify-level` | `info \| warn \| error`. |
+| `mode` | `normal \| insert \| visual \| visual-line \| visual-block \| command` (read-only). |
+| `style` | `{ fg: option<string>, bg: option<string>, bold: bool, italic: bool, underline: bool }`. Colors are `#rrggbb` or theme-scope/ANSI names; empty = inherit. |
+| `host-error` | `invalid-handle \| out-of-bounds \| permission-denied(string) \| rejected(string)`. Plugins must handle these without panicking. |
 
 ---
 
-### onda.notify(msg, level)
+## Host Interfaces (plugins import)
 
-Display a message in the editor message line.
+Every fallible call returns `result<_, host-error>`. None of these block.
 
-**Parameters**
-
-| Name | Type | Required | Description |
-|---|---|---|---|
-| `msg` | `string` | yes | The message text to display. |
-| `level` | `string` | no | Severity level. One of `"info"`, `"warn"`, `"error"`. Defaults to `"info"` when omitted or unrecognised. |
-
-**Returns:** nothing
-
-**Behaviour:** Enqueues a `Notify` API call. The message is rendered by the main
-loop on the next frame drain.
-
-**Example**
-
-```lua
-onda.notify("Plugin loaded successfully")
-onda.notify("File not found", "warn")
-onda.notify("Critical failure", "error")
+### `log`
+```wit
+notify: func(msg: string, level: notify-level);   // message line
+debug:  func(msg: string);                         // ONDA_LOG file, never the screen
 ```
 
----
+### `buffer`
+Read from a snapshot; mutate transactionally.
+```wit
+current:    func() -> buffer-id;
+len:        func(buf) -> result<char-idx, host-error>;
+line-count: func(buf) -> result<u32, host-error>;
+text:       func(buf, range) -> result<string, host-error>;   // by char range
+lines:      func(buf, start: u32, end: u32) -> result<list<string>, host-error>;
+record edit { range, text }                                    // anchor==head = insert; empty text = delete
+apply:      func(buf, edits: list<edit>) -> result<_, host-error>;  // ONE transaction / undo step
+```
+`apply` is rejected if the buffer changed under the plugin since its snapshot — edits
+are expressed in the pre-edit coordinate space and the host orders/maps them.
 
-### onda.log(msg)
+### `selection`
+```wit
+get: func(buf) -> result<selection, host-error>;
+set: func(buf, sel: selection) -> result<_, host-error>;
+```
+Selections are full multi-range values — never assume a single cursor (ADR-006).
 
-Convenience alias for `onda.notify(msg, "info")`.
-
-**Parameters**
-
-| Name | Type | Required | Description |
-|---|---|---|---|
-| `msg` | `string` | yes | The message text to display. |
-
-**Returns:** nothing
-
-**Example**
-
-```lua
-onda.log("debug: value = " .. tostring(x))
+### `editor`
+```wit
+current-window: func() -> window-id;
+current-mode:   func() -> mode;
+cursor:         func(win) -> result<char-idx, host-error>;
+set-cursor:     func(win, pos: char-idx) -> result<_, host-error>;
 ```
 
+### `commands` / `keymap`
+The guest exports the handlers; registration just declares them by `id`.
+```wit
+// commands
+create: func(name: string, id: u64, desc: option<string>, nargs: u8);  // :name → run-command(id, args)
+// keymap
+set:    func(mode: string, lhs: string, id: u64, desc: option<string>); // lhs → run-keymap(id)
+```
+
+### `decorations` — the perf-critical surface (T17.2)
+**Batch only.** Submit the whole decoration set for a namespace in one call;
+replacing a namespace clears the plugin's previous decorations in it (no per-item
+add/remove churn). The compositor diffs the batch onto the cell grid.
+```wit
+record virt-text { at: char-idx, text: string, style }   // virtual text after a char
+record sign      { line: u32, text: string, style }      // gutter sign
+record highlight { range, style }                        // inline highlight over a range
+record batch     { namespace: string, virt-texts: list<virt-text>,
+                   signs: list<sign>, highlights: list<highlight> }
+set:       func(buf, batch) -> result<_, host-error>;
+clear:     func(buf, namespace: string);
+set-group: func(group: string, style);   // define/override a theme highlight group
+```
+`set-group` is the replacement for the old Lua `onda.highlight.set` — see
+`docs/THEMES.md`. Overrides persist across `:theme` switches.
+
+### `ui`
+```wit
+float:              func(title: string, lines: list<string>, width: u16, height: u16);  // read-only float
+record picker-item  { label: string, detail: option<string> }
+pick:               func(title: string, items: list<picker-item>, id: u64);  // result → picker-result event
+statusline-segment: func(id: string, text: string, style);  // owned statusline segment
+```
+
+### `config`
+Typed reads from the merged `config.toml` (global + project overlay, DESIGN §5.7).
+```wit
+get-string: func(key: string) -> option<string>;
+get-bool:   func(key: string) -> option<bool>;
+get-int:    func(key: string) -> option<s64>;
+```
+
+### `fs` — capability-gated
+Linked only when `filesystem` is declared + granted. Paths resolve against the
+project root through `cap-std` preopens; `..` escapes are rejected.
+```wit
+read:     func(path: string) -> result<list<u8>, host-error>;
+write:    func(path: string, data: list<u8>) -> result<_, host-error>;
+read-dir: func(dir: string) -> result<list<string>, host-error>;
+```
+
+### `http` — capability-gated
+Linked only when `network = true`. Host-mediated; no raw sockets.
+```wit
+record response { status: u16, body: list<u8> }
+get:  func(url: string) -> result<response, host-error>;
+post: func(url: string, body: list<u8>, content-type: string) -> result<response, host-error>;
+```
+> **Current limitation:** the host `http` implementation is **v0-stubbed**
+> (`docs/BACKLOG.md`). The interface links and the capability gate works, but real
+> request execution is not yet implemented.
+
 ---
 
-### onda.buf.get_lines(buf, start, end)
+## Guest Exports (the host calls)
 
-Read lines from a buffer.
+From `wit/onda/guest.wit`. Handlers run on the main thread under the 5ms epoch
+deadline and reach editor state only through the host interfaces above.
 
-**Parameters**
+```wit
+init:         func();                                  // once, on first activation
+handle-event: func(ev: event);                         // a subscribed event fired
+run-command:  func(id: u64, args: list<string>);       // a :name command was invoked
+run-keymap:   func(id: u64);                            // a registered key sequence was pressed
+```
 
-| Name | Type | Description |
+**Events** (`event` variant — subscribe via the manifest `activation.events`):
+
+| Event | Payload | Fires when |
 |---|---|---|
-| `buf` | `integer` | Buffer ID. `0` conventionally refers to the current buffer. |
-| `start` | `integer` | First line index (0-based, inclusive). |
-| `end` | `integer` | Last line index (0-based, exclusive). `-1` means the last line. |
-
-**Returns:** `string[]` — a Lua array of line strings.
-
-**Implementation note (Phase 2):** The snapshot wiring is not yet connected. This
-function currently returns an empty table (`{}`) regardless of arguments. The
-call signature and semantics are final; the implementation will be completed in
-Phase 3. Plugins that use `get_lines` should handle an empty result gracefully.
-
-**Example**
-
-```lua
-local lines = onda.buf.get_lines(0, 0, -1)
-for i, line in ipairs(lines) do
-    -- process each line
-end
-```
-
----
-
-### onda.buf.set_lines(buf, start, end, lines)
-
-Replace a range of lines in a buffer.
-
-**Parameters**
-
-| Name | Type | Description |
-|---|---|---|
-| `buf` | `integer` | Buffer ID. |
-| `start` | `integer` | First line to replace (0-based, inclusive). |
-| `end` | `integer` | First line after the replaced range (0-based, exclusive). |
-| `lines` | `string[]` | Replacement lines. May be empty to delete the range. |
-
-**Returns:** nothing
-
-**Behaviour:** Enqueues a `BufSetLines` API call. The buffer mutation is applied by
-the main loop on the next frame drain and goes through `onda-core`'s
-`Transaction`/`ChangeSet` mechanism (ADR compliance — no direct rope mutation).
-
-**Example**
-
-```lua
--- Replace lines 2–4 (0-based) with two new lines
-onda.buf.set_lines(0, 2, 4, { "first replacement line", "second replacement line" })
-
--- Delete line 0
-onda.buf.set_lines(0, 0, 1, {})
-```
-
----
-
-### onda.win.get_cursor(win)
-
-Get the cursor position in a window.
-
-**Parameters**
-
-| Name | Type | Description |
-|---|---|---|
-| `win` | `integer` | Window ID. |
-
-**Returns:** `{ row: integer, col: integer }` — a table with `row` and `col` fields
-(both 0-based).
-
-**Implementation note (Phase 2):** The snapshot wiring is not yet connected. This
-function always returns `{ row = 0, col = 0 }`. The call signature and return shape
-are final.
-
-**Example**
-
-```lua
-local pos = onda.win.get_cursor(0)
-onda.notify("cursor at row=" .. pos.row .. " col=" .. pos.col)
-```
-
----
-
-### onda.win.set_cursor(win, pos)
-
-Move the cursor in a window.
-
-**Parameters**
-
-| Name | Type | Description |
-|---|---|---|
-| `win` | `integer` | Window ID. |
-| `pos` | `{ row: integer, col: integer }` | Target position. Missing keys default to `0`. |
-
-**Returns:** nothing
-
-**Behaviour:** Enqueues a `WinSetCursor` API call.
-
-**Example**
-
-```lua
--- Move cursor to line 10, column 0
-onda.win.set_cursor(0, { row = 9, col = 0 })
-```
-
----
-
-### onda.keymap.set(mode, lhs, callback_id, opts)
-
-Register a keybinding that fires a Lua callback.
-
-**Parameters**
-
-| Name | Type | Description |
-|---|---|---|
-| `mode` | `string` | Vim mode string. Common values: `"n"` (normal), `"i"` (insert), `"v"` (visual). |
-| `lhs` | `string` | Key sequence to bind, using onda key notation (e.g. `"<Space>rb"`, `"<C-p>"`). |
-| `callback_id` | `integer` | Numeric ID that maps to a function in `_onda_callbacks`. See [Callback Registry Protocol](#callback-registry-protocol). |
-| `opts` | `table?` | Optional options table. |
-
-**`opts` fields**
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `noremap` | `boolean` | `true` | Prevent recursive mapping. |
-| `silent` | `boolean` | `false` | Suppress display of the key sequence in the message line. |
-| `desc` | `string` | `nil` | Human-readable description shown in key listing commands. |
-
-**Returns:** nothing
-
-**Behaviour:** Enqueues a `KeymapSet` API call. When the registered key sequence is
-pressed, the runtime fires `_onda_callbacks[callback_id]()`.
-
-**Example**
-
-```lua
-_onda_callbacks = _onda_callbacks or {}
-local MY_CALLBACK_ID = 2001
-
-_onda_callbacks[MY_CALLBACK_ID] = function()
-    onda.notify("My keybinding fired!")
-end
-
-onda.keymap.set("n", "<Space>x", MY_CALLBACK_ID, {
-    noremap = true,
-    silent  = true,
-    desc    = "My custom action",
-})
-```
-
----
-
-### onda.cmd.create(name, callback_id, opts)
-
-Register a custom editor command (callable as `:Name` from the command line).
-
-**Parameters**
-
-| Name | Type | Description |
-|---|---|---|
-| `name` | `string` | Command name. Must start with an uppercase letter by convention. |
-| `callback_id` | `integer` | Numeric ID that maps to a function in `_onda_callbacks`. See [Callback Registry Protocol](#callback-registry-protocol). |
-| `opts` | `table?` | Optional options table. |
-
-**`opts` fields**
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `nargs` | `integer` | `0` | Number of arguments the command accepts. |
-| `desc` | `string` | `nil` | Human-readable description. |
-
-**Returns:** nothing
-
-**Behaviour:** Enqueues a `CmdCreate` API call. When the command is invoked, the
-runtime calls `_onda_callbacks[callback_id](args)` where `args` is a 1-based Lua
-array of string arguments.
-
-**Example**
-
-```lua
-_onda_callbacks = _onda_callbacks or {}
-local GREET_ID = 3001
-
-_onda_callbacks[GREET_ID] = function(args)
-    local name = args[1] or "world"
-    onda.notify("Hello, " .. name .. "!")
-end
-
-onda.cmd.create("Greet", GREET_ID, {
-    nargs = 1,
-    desc  = "Greet someone by name",
-})
--- Usage: :Greet Alice
-```
-
----
-
-### onda.ui.float(opts)
-
-Open a floating window displaying static content.
-
-**Parameters**
-
-`opts` is a required table with the following fields:
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `title` | `string` | `""` | Title shown in the floating window border. |
-| `lines` | `string[]` | `{}` | Lines of content to display. |
-| `width` | `integer` | `40` | Width of the floating window in columns. |
-| `height` | `integer` | `10` | Height of the floating window in rows. |
-
-**Returns:** nothing
-
-**Behaviour:** Enqueues a `UiFloat` API call. The compositor opens the window on the
-next frame drain. There is no return value or window handle; interaction with the
-opened window is not yet supported in Phase 2.
-
-**Example**
-
-```lua
-onda.ui.float({
-    title  = "Help",
-    lines  = { "Line one", "Line two", "Line three" },
-    width  = 50,
-    height = 5,
-})
-```
-
----
-
-### onda.autocmd.create(event, pattern, callback_id)
-
-Register an automatic command that fires on an editor event.
-
-**Parameters**
-
-| Name | Type | Description |
-|---|---|---|
-| `event` | `string` | Event name (e.g. `"BufEnter"`, `"BufWrite"`, `"CursorMoved"`). The full event list will be documented when the autocmd system stabilises in Phase 3. |
-| `pattern` | `string` | File pattern filter (e.g. `"*.rs"`, `"*"`). |
-| `callback_id` | `integer` | Numeric ID that maps to a function in `_onda_callbacks`. |
-
-**Returns:** nothing
-
-**Behaviour:** Enqueues an `AutocmdCreate` API call. When the matched event fires on
-a file matching `pattern`, the runtime calls `_onda_callbacks[callback_id]()`.
-
-**Example**
-
-```lua
-_onda_callbacks = _onda_callbacks or {}
-local ON_BUF_ENTER_ID = 4001
-
-_onda_callbacks[ON_BUF_ENTER_ID] = function()
-    onda.notify("Entered a Rust buffer", "info")
-end
-
-onda.autocmd.create("BufEnter", "*.rs", ON_BUF_ENTER_ID)
-```
-
----
-
-### onda.highlight.set(group, opts)
-
-Define or override a theme highlight group (T18.1). Overrides apply immediately and
-persist across `:theme` switches (re-applied on top of every newly-loaded theme).
-
-**Parameters**
-
-| Name | Type | Description |
-|---|---|---|
-| `group` | `string` | Scope name, e.g. `"syntax.keyword"`, `"ui.statusline"` (see `docs/THEMES.md`). |
-| `opts` | `table` | `{ fg, bg, bold, italic, underline }`. `fg`/`bg` are `#rrggbb` or ANSI names; flags are booleans (default false). |
-
-**Returns:** nothing
-
-**Behaviour:** Enqueues a `HighlightSet` API call applied between frames; triggers a
-full damage-tracked re-render.
-
-**Example**
-
-```lua
-onda.highlight.set("syntax.keyword", { fg = "#ff79c6", bold = true })
-onda.highlight.set("ui.statusline", { fg = "black", bg = "#88c0d0" })
-```
-
----
-
-## Callback Registry Protocol
-
-onda's API functions that need to call back into Lua (`keymap.set`, `cmd.create`,
-`autocmd.create`) do not accept Lua functions directly. Instead they take a numeric
-`callback_id`. The plugin is responsible for registering the actual function in the
-global `_onda_callbacks` table before (or at the same time as) the API call.
-
-```lua
--- Initialise the registry if another plugin created it first.
-_onda_callbacks = _onda_callbacks or {}
-
-local MY_ID = 9001                        -- pick a unique integer
-_onda_callbacks[MY_ID] = function()       -- register the function
-    onda.notify("fired!")
-end
-onda.keymap.set("n", "<Space>z", MY_ID)   -- pass only the id
-```
-
-When the runtime fires the callback (`fire_keybinding`, `fire_command`) it looks up
-`_onda_callbacks[id]` and calls it.
-
-**Choosing IDs:** There is no allocation mechanism in Phase 2. Use large, plugin-specific
-integers to avoid collisions with other plugins. The bundled runtime plugins use the
-range 1001–1004; user plugins should use values above 2000 or use a naming convention
-derived from the plugin name.
+| `buffer-open` | `{ buf, path }` | a buffer is opened |
+| `buffer-save` | `{ buf, path }` | a buffer is saved |
+| `buffer-change` | `{ buf, path }` | a buffer's text changed (post-transaction) |
+| `cursor-hold` | `{ buf, pos }` | the cursor was idle for the hold interval |
+| `mode-change` | `mode` | the editor mode changed |
+| `picker-result` | `{ id, index: option<u32> }` | a `ui.pick` this plugin opened resolved (or was cancelled) |
 
 ---
 
 ## Performance Contract
 
-Lua execution runs on the main thread. The per-callback budget is **500 microseconds
-(`LUA_FRAME_BUDGET_US`)**.
+Plugin execution runs on the main thread; every µs spent there is a µs not available
+to rendering (16ms frame budget, 60fps).
 
-- If a keybinding callback exceeds 500 µs, a warning is emitted via the tracing
-  subscriber (`warn!`). The editor continues normally; there is no hard abort in the
-  current implementation.
-- The `drain_calls` method is called once per frame. The channel holds up to 1 024
-  queued `LuaApiCall` values. If a plugin enqueues more than 1 024 calls in a single
-  frame, excess calls are silently dropped (`try_send` is used, not blocking `send`).
-- `onda.notify` and other enqueueing functions return immediately; they do not block
-  waiting for the main loop to process the call.
-- Avoid loops over large data sets inside plugin callbacks. If you need to process a
-  whole file, do it incrementally across multiple keybinding invocations or wait for
-  `buf.get_lines` snapshot wiring to be completed in Phase 3.
-- The render pipeline must hit 60 fps (16 ms frame budget). Every µs spent in Lua is
-  time not available to rendering. Keep callbacks short.
+- **Per-handler budget: 5ms (epoch deadline).** Wasmtime epoch interruption + a
+  watchdog trap a handler that overruns; the plugin is suspended/demoted rather than
+  allowed to stall a frame. Do heavy work incrementally across events.
+- **Reads are snapshot-consistent and synchronous**; **writes are queued** and applied
+  between frames. A host call never awaits.
+- **Decorations must be batched** — submit the full namespace set per frame's worth of
+  work via `decorations.set`; never one host call per item.
+- **Memory is bounded** per instance (the `Store` enforces a memory limit).
+- All errors come back as `host-error`; a plugin that panics is contained, but should
+  handle errors and keep running.
 
 ---
 
-## Example Plugins
+## Plugin Manager (install / list / remove)
 
-Three reference plugins ship in `runtime/plugins/`. They demonstrate the correct
-patterns for using the API.
+`onda-plugin::manager` (`PluginManager`) manages a plugin store dir plus a
+`plugins.lock`. Sources:
 
-### rainbow_brackets.lua
+- `github:user/repo[@rev]`
+- a git URL (including `file://`)
+- a local directory
 
-**Location:** `runtime/plugins/rainbow_brackets.lua`
+Install is **staging → promote**: a bad manifest or a missing entry component can't
+half-install. The resolved commit sha is recorded in the lockfile.
 
-Demonstrates: `onda.notify`, `onda.keymap.set`, `onda.cmd.create`
+```sh
+onda plugin install github:user/repo@v0.1.0
+onda plugin install ./my-plugin
+onda plugin list
+onda plugin remove my-plugin
+```
 
-Registers a normal-mode keybinding (`<Space>rb`) and an editor command
-(`:RainbowToggle`) that both call the same toggle function. The toggle flips a
-module-level boolean and notifies the user of the new state. The actual decoration
-logic is a stub pending render-layer integration in a later phase.
+> **Outstanding** (`docs/BACKLOG.md`): `update` (re-resolve lockfile),
+> `onda plugin dev --watch`, and a `cargo generate` template are not yet implemented.
 
-Key patterns shown:
-- Using `_onda_callbacks = _onda_callbacks or {}` to safely initialise the shared
-  registry table.
-- Registering the same callback ID for both a keymap and a command.
-- `noremap = true, silent = true` as the default keybinding option set.
+---
 
-### word_count.lua
+## Reference Plugins
 
-**Location:** `runtime/plugins/word_count.lua`
+Working WASM components under `plugins/` (built to `wasm32-wasip2`):
 
-Demonstrates: `onda.buf.get_lines`, `onda.notify`, `onda.cmd.create`
-
-Registers `:WordCount`. The command handler calls `onda.buf.get_lines(0, 0, -1)`
-to read all lines of the current buffer, counts whitespace-delimited tokens with
-`string.gmatch`, and reports the total via `onda.notify`.
-
-Key patterns shown:
-- Passing `0` as the buffer ID for "current buffer".
-- Passing `-1` as the end index to read to the last line.
-- Handling the Phase 2 stub state: when `get_lines` returns `{}` the word count
-  is simply 0, which is a valid (if incomplete) result.
-
-### project_todos.lua
-
-**Location:** `runtime/plugins/project_todos.lua`
-
-Demonstrates: `onda.notify`, `onda.cmd.create` (Phase 3 stub)
-
-Registers `:ProjectTodos`. The command body is a Phase 3 stub that notifies the
-user to use `:grep TODO` as a workaround. The plugin is intentionally minimal; it
-documents the intended Phase 3 shape in its source comments
-(`onda.ui.float`-based picker).
-
-Key patterns shown:
-- How to stub a Phase 3 feature with a useful fallback message today.
-- Minimal plugin structure: one callback, one command.
+| Plugin | Demonstrates |
+|---|---|
+| `todo-highlighter` | decoration batch + event flow — visibly marks `TODO`/`FIXME` lines |
+| `git-blame-inline` | `fs` capability + virtual text + `cursor-hold` (shows the branch at the cursor line; real per-line blame awaits a host `vcs` interface, deferred) |
+| `http-client` | `network` capability + command + picker (host HTTP is v0-stubbed) |
+| `hostile-test` | the containment fixture — a busy loop trapped by the epoch budget; an ungranted capability that fails to link |
 
 ---
 
 ## Migration / Compatibility
 
-**Phase 2 (current):** The API is unstable. The following aspects are known to be
-incomplete or subject to change:
+**Now (host API v0.1, `@unstable`):**
 
-- `onda.buf.get_lines` always returns `{}`. Snapshot wiring is not connected.
-- `onda.win.get_cursor` always returns `{ row = 0, col = 0 }`. Snapshot wiring is
-  not connected.
-- `onda.ui.float` opens a window but there is no API to interact with it, close it
-  programmatically, or receive input from it.
-- `onda.autocmd.create` is registered but the full event vocabulary is not
-  documented; only the registration call is stable.
-- The `_onda_callbacks` integer ID protocol is a Phase 2 workaround. Phase 3 will
-  introduce a cleaner function-reference or named-callback mechanism.
-- No plugin versioning, no dependency declaration, no load-order guarantees.
+- The interface set in `wit/onda/*.wit` is the contract. Breaking changes are allowed
+  until the Phase 5 freeze; `min-api-version` gates compatibility (major must match,
+  host minor must be `>=` the requested minor).
+- Capability **consent UI** is not wired yet — declared capabilities are auto-granted
+  at discovery (link-time enforcement and path-scoping are live).
+- Plugins currently **instantiate eagerly at startup** so their command tables are
+  known; event-driven lazy activation per `activation.events` is outstanding.
+- Plugin **keymaps, picker contributions, and statusline segments** are received but
+  not yet fully applied.
+- The host `http` implementation is a v0 stub; a `vcs` interface for real blame is
+  planned.
 
-**Phase 3 (planned):**
+**Coming (Phase 3→5):** install-time + first-use permission prompts; true
+event-driven lazy activation; keymap/picker/statusline contribution wiring; a real
+`http` host impl and a `vcs` interface; an API stability freeze with a migration guide
+at the Phase 5 release.
 
-- `buf.get_lines` and `win.get_cursor` will return real data from the buffer
-  snapshot prepared before each Lua frame.
-- The callback protocol will be replaced or supplemented with a cleaner surface.
-- `onda.ui.float` will gain interaction support (input handling, close callbacks).
-- The full autocmd event list will be documented and stabilised.
-- A migration guide will be published at the time of the Phase 3 release.
-
-**Recommendation for plugin authors today:** write plugins against the current API,
-accept that `get_lines` / `get_cursor` return stub values, and use `onda.notify` as
-the primary output mechanism. Follow the `_onda_callbacks` pattern shown in the
-reference plugins. Avoid relying on specific callback ID ranges; use values above
-2000.
+See `docs/BACKLOG.md` ("Outstanding — plugin follow-ups") for the live status of each
+item, and `wit/README.md` for the design-review notes behind the interface set.

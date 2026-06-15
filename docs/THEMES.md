@@ -54,12 +54,26 @@ of crashing.
 
 Any scope a theme omits falls back to a built-in dark default, so partial themes are fine.
 
-## Lua: custom highlight groups
+## Plugins: custom highlight groups
 
-Plugins can define or override any highlight group; overrides persist across theme
-switches (re-applied on top of every newly-loaded theme):
+WASM plugins (ADR-002) can define or override any highlight group through the
+`decorations.set-group` host call; overrides persist across theme switches
+(re-applied on top of every newly-loaded theme). A `style` is
+`{ fg, bg, bold, italic, underline }` where `fg`/`bg` are `#rrggbb` or ANSI names
+and the flags are booleans:
 
-```lua
-onda.highlight.set("syntax.keyword", { fg = "#ff0000", bold = true })
-onda.highlight.set("ui.statusline", { fg = "black", bg = "#88c0d0" })
+```rust
+use onda::plugin::decorations;
+use onda::plugin::types::Style;
+
+decorations::set_group("syntax.keyword", &Style {
+    fg: Some("#ff0000".into()), bg: None,
+    bold: true, italic: false, underline: false,
+});
+decorations::set_group("ui.statusline", &Style {
+    fg: Some("black".into()), bg: Some("#88c0d0".into()),
+    bold: false, italic: false, underline: false,
+});
 ```
+
+See `docs/PLUGIN_API.md` and `wit/onda/*.wit` for the full plugin surface.

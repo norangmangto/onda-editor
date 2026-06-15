@@ -2,21 +2,21 @@
   "results": [
     {
       "name": "startup_ms",
-      "median_ms": 0.0,
-      "mean_ms": 0.0,
-      "min_ms": 0.0,
-      "max_ms": 0.0,
-      "runs": 0,
-      "budget_ms": 40.0
+      "median_ms": 27.263917,
+      "mean_ms": 196.96499590000002,
+      "min_ms": 16.004333,
+      "max_ms": 1747.087125,
+      "runs": 10,
+      "budget_ms": null
     },
     {
       "name": "large_file_open_ms",
-      "median_ms": 0.0,
-      "mean_ms": 0.0,
-      "min_ms": 0.0,
-      "max_ms": 0.0,
-      "runs": 0,
-      "budget_ms": 2000.0
+      "median_ms": 15.102292,
+      "mean_ms": 15.210683399999999,
+      "min_ms": 14.578000000000001,
+      "max_ms": 15.73225,
+      "runs": 5,
+      "budget_ms": null
     },
     {
       "name": "dap_on_keypress_p99_ms",
@@ -91,6 +91,6 @@
       "budget_ms": 40.0
     }
   ],
-  "git_sha": "initial",
-  "timestamp": "2026-06-13"
+  "git_sha": "30d4cf7",
+  "timestamp": "2026-06-15"
 }
