@@ -2744,9 +2744,15 @@ impl<B: Backend> App<B> {
 
             // ── Operator + motion ─────────────────────────────────────────────
             Action::ApplyOperatorMotion(op, motion) => {
-                // vim: `cw`/`cW` behave like `ce`/`cE` (change to word end, inclusive)
-                // so the trailing whitespace is kept.
-                let motion = if op == Operator::Change {
+                // vim: `cw`/`cW` behave like `ce`/`cE` (change to word end) — but only
+                // when the cursor sits on a non-blank; on whitespace `cw` acts like `dw`.
+                let on_nonblank = self
+                    .doc()
+                    .rope()
+                    .get_char(self.selection().primary().head)
+                    .map(|c| !c.is_whitespace())
+                    .unwrap_or(false);
+                let motion = if op == Operator::Change && on_nonblank {
                     match motion {
                         Motion::WordForward => Motion::WordEnd,
                         Motion::BigWordForward => Motion::BigWordEnd,
@@ -2766,17 +2772,26 @@ impl<B: Backend> App<B> {
                 let primary = self.selection().primary();
                 let motion_head = motion_sel.primary().head;
                 let lo = primary.head.min(motion_head);
-                let mut hi = primary.head.max(motion_head);
-                // `delete()` treats the range as inclusive [from, to]. For exclusive
-                // motions the target char is not part of the span, so drop it.
-                if !motion.is_inclusive() {
-                    if hi == lo {
-                        return Ok(()); // motion didn't move → nothing to operate on
+                let hi = primary.head.max(motion_head);
+
+                if motion.is_linewise() {
+                    // `dj`/`dk`/`dG`/`dgg`: operate on whole lines spanning the cursor
+                    // line through the motion's target line.
+                    let op_sel = Selection::new(vec![onda_core::Range::new(lo, hi)], 0);
+                    self.apply_operator(op, &op_sel, true)?;
+                } else {
+                    // `delete()` treats the range as inclusive [from, to]. For exclusive
+                    // motions the target char is not part of the span, so drop it.
+                    let mut hi = hi;
+                    if !motion.is_inclusive() {
+                        if hi == lo {
+                            return Ok(()); // motion didn't move → nothing to operate on
+                        }
+                        hi -= 1;
                     }
-                    hi -= 1;
+                    let op_sel = Selection::new(vec![onda_core::Range::new(lo, hi)], 0);
+                    self.apply_operator(op, &op_sel, false)?;
                 }
-                let op_sel = Selection::new(vec![onda_core::Range::new(lo, hi)], 0);
-                self.apply_operator(op, &op_sel, false)?;
             }
 
             // ── Operator + text object ─────────────────────────────────────────
@@ -5350,6 +5365,51 @@ mod edit_integration_tests {
         *app.selection_mut() = Selection::point(4); // on 'b' of "bar"
         keys(&mut app, "db"); // delete [0,4) → "foo "
         assert_eq!(body(&app), "bar\n");
+    }
+
+    // ── Linewise operator motions (dj/dk/dG/dgg) ─────────────────────────────
+
+    #[test]
+    fn dj_deletes_two_lines() {
+        let mut app = app_with("one\ntwo\nthree\n");
+        *app.selection_mut() = Selection::point(0); // line 0
+        keys(&mut app, "dj"); // delete lines 0..1
+        assert_eq!(body(&app), "three\n");
+    }
+
+    #[test]
+    fn dk_deletes_current_and_previous_line() {
+        let mut app = app_with("one\ntwo\nthree\n");
+        *app.selection_mut() = Selection::point(4); // line 1 ("two")
+        keys(&mut app, "dk"); // delete lines 0..1
+        assert_eq!(body(&app), "three\n");
+    }
+
+    #[test]
+    fn d_capital_g_deletes_to_end_linewise() {
+        let mut app = app_with("one\ntwo\nthree\n");
+        *app.selection_mut() = Selection::point(4); // line 1
+        keys(&mut app, "dG"); // delete from line 1 to last line
+        assert_eq!(body(&app), "one\n");
+    }
+
+    #[test]
+    fn dgg_deletes_to_start_linewise() {
+        let mut app = app_with("one\ntwo\nthree\n");
+        *app.selection_mut() = Selection::point(8); // line 2 ("three")
+        keys(&mut app, "dgg"); // delete lines 0..2 (all content)
+        assert_eq!(body(&app), "");
+    }
+
+    #[test]
+    fn cw_on_whitespace_behaves_like_dw() {
+        // cw→ce only applies on a non-blank; on whitespace it stays exclusive `w`.
+        let mut app = app_with("foo  bar\n");
+        *app.selection_mut() = Selection::point(3); // on the first space
+        keys(&mut app, "cw");
+        assert_eq!(app.mode, Mode::Insert);
+        // Deletes the run of whitespace up to "bar" (not into the word).
+        assert_eq!(body(&app), "foobar\n");
     }
 
     // ── Visual mode ─────────────────────────────────────────────────────────

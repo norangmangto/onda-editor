@@ -50,6 +50,22 @@ impl Motion {
         )
     }
 
+    /// Whether this motion is *linewise* when used as an operator target (vim
+    /// semantics): `dj`/`dk`/`dG`/`dgg` operate on whole lines, not a charwise
+    /// span. Line-oriented vertical motions are linewise; everything else is
+    /// charwise.
+    pub fn is_linewise(self) -> bool {
+        matches!(
+            self,
+            Motion::Up
+                | Motion::Down
+                | Motion::DocumentStart
+                | Motion::DocumentEnd
+                | Motion::HalfPageDown
+                | Motion::HalfPageUp
+        )
+    }
+
     /// Apply this motion to a single range, returning the new range.
     ///
     /// `count` is the repetition count (≥ 1).

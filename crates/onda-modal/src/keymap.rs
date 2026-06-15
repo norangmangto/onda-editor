@@ -377,6 +377,9 @@ pub struct KeymapState {
     pending_visual_textobj_inner: bool,
     /// Pending visual-mode text-object outer: `a` was pressed in visual mode.
     pending_visual_textobj_outer: bool,
+    /// Pending `g` under an operator: `d`/`c`/`y` then `g`, waiting for the second
+    /// `g` to form `dgg`/`cgg`/`ygg` (linewise to document start).
+    pending_op_g: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,6 +419,7 @@ impl KeymapState {
         self.pending_textobj_outer = false;
         self.pending_visual_textobj_inner = false;
         self.pending_visual_textobj_outer = false;
+        self.pending_op_g = false;
     }
 
     /// Process one key in the given mode. Returns what should happen.
@@ -634,6 +638,21 @@ impl KeymapState {
 
         let count = self.count.unwrap_or(1);
 
+        // Pending `dg…`: a `g` was seen after an operator; expect a second `g`.
+        if self.pending_op_g {
+            self.pending_op_g = false;
+            if let (Some(op), Key::Char('g', _)) = (self.pending_operator, key) {
+                self.pending_operator = None;
+                self.count = None;
+                return PendingResult::Action(
+                    Action::ApplyOperatorMotion(op, Motion::DocumentStart),
+                    count,
+                );
+            }
+            self.reset();
+            return PendingResult::NoMatch;
+        }
+
         // Handle pending operator waiting for motion
         if let Some(op) = self.pending_operator {
             // i{char} or a{char} → text object
@@ -682,6 +701,12 @@ impl KeymapState {
                 self.pending_operator = None;
                 self.count = None;
                 return PendingResult::Action(Action::OperatorLine(op), count);
+            }
+
+            // `g` prefix under an operator → wait for the second `g` (`dgg`).
+            if matches!(key, Key::Char('g', _)) {
+                self.pending_op_g = true;
+                return PendingResult::NeedMore;
             }
 
             // Map key to motion
@@ -810,6 +835,7 @@ impl KeymapState {
             || self.pending_textobj_outer
             || self.pending_visual_textobj_inner
             || self.pending_visual_textobj_outer
+            || self.pending_op_g
     }
 }
 
