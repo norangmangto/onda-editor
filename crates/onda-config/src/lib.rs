@@ -140,7 +140,7 @@ pub struct ConfigLoadResult {
 /// Attempt to read and parse a TOML config file. Returns `None` if the file
 /// does not exist, `Some(Ok(config))` on success, or `Some(Err(warning))`
 /// on a parse / read error.
-fn try_load(path: &PathBuf) -> Option<Result<Config, String>> {
+fn try_load(path: &PathBuf) -> Option<Result<toml::Value, String>> {
     if !path.exists() {
         return None;
     }
@@ -150,8 +150,8 @@ fn try_load(path: &PathBuf) -> Option<Result<Config, String>> {
             path.display(),
             e
         ))),
-        Ok(text) => match toml::from_str::<Config>(&text) {
-            Ok(cfg) => Some(Ok(cfg)),
+        Ok(text) => match toml::from_str::<toml::Value>(&text) {
+            Ok(val) => Some(Ok(val)),
             Err(e) => Some(Err(format!(
                 "onda-config: parse error in {}: {}",
                 path.display(),
@@ -161,35 +161,36 @@ fn try_load(path: &PathBuf) -> Option<Result<Config, String>> {
     }
 }
 
-/// Merge `overlay` on top of `base`: non-default fields in overlay win.
-/// We re-serialise to TOML and re-deserialise using the `#[serde(default)]`
-/// machinery so that only keys explicitly present in the overlay file override
-/// the base. The raw TOML tables are merged at the map level.
-fn merge(base: Config, overlay: Config) -> Config {
-    // Merge editor — field-by-field (overlay wins for every field it touched,
-    // but since we already parsed with defaults we use the overlay values
-    // directly; callers load home first then project, so overlay = project).
-    //
-    // A full deep-merge would require tracking which fields were explicitly
-    // set vs defaulted. For Phase 0 correctness we simply let the project
-    // config override the entire struct it specifies. That is: if the project
-    // file contains an [editor] section the whole EditorConfig from that file
-    // is used; otherwise the home value is kept.
-    //
-    // We detect "was the section present?" by re-parsing the raw TOML values.
-    // For simplicity and correctness, overlay wins on a per-top-level-section
-    // basis (editor / keys / theme).
-    Config {
-        editor: overlay.editor,
-        keys: {
-            let mut normal = base.keys.normal;
-            normal.extend(overlay.keys.normal);
-            let mut insert = base.keys.insert;
-            insert.extend(overlay.keys.insert);
-            KeysConfig { normal, insert }
-        },
-        theme: overlay.theme,
+/// Deep-merge `overlay` into `base` at the raw-TOML level: nested tables are
+/// merged key-by-key (so an `[editor]` section that sets only `tab_width` keeps
+/// the base's other editor keys); scalars and arrays are replaced wholesale.
+///
+/// Merging *raw values* — before `#[serde(default)]` fills anything in — is what
+/// lets a project file override only the keys it actually specifies, instead of
+/// resetting absent sections to their defaults.
+fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base_t), toml::Value::Table(over_t)) => {
+            for (k, v) in over_t {
+                match base_t.get_mut(&k) {
+                    Some(existing) => deep_merge(existing, v),
+                    None => {
+                        base_t.insert(k, v);
+                    }
+                }
+            }
+        }
+        (base_slot, overlay) => *base_slot = overlay,
     }
+}
+
+/// Merge parsed config documents (lowest priority first) into a single `Config`.
+fn merge_values(docs: Vec<toml::Value>) -> Result<Config, toml::de::Error> {
+    let mut acc = toml::Value::Table(toml::map::Map::new());
+    for doc in docs {
+        deep_merge(&mut acc, doc);
+    }
+    acc.try_into()
 }
 
 // ---------------------------------------------------------------------------
@@ -228,15 +229,13 @@ impl Config {
             v
         };
 
-        let mut accumulated = Config::default();
+        let mut docs: Vec<toml::Value> = Vec::new();
         let mut warning: Option<String> = None;
 
         for path in &candidates {
             match try_load(path) {
                 None => {} // file absent — skip silently
-                Some(Ok(cfg)) => {
-                    accumulated = merge(accumulated, cfg);
-                }
+                Some(Ok(val)) => docs.push(val),
                 Some(Err(msg)) => {
                     warn!("{}", msg);
                     // Keep whatever we have so far; record the first warning.
@@ -247,10 +246,19 @@ impl Config {
             }
         }
 
-        ConfigLoadResult {
-            config: accumulated,
-            warning,
-        }
+        let config = match merge_values(docs) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                let msg = format!("onda-config: invalid config: {e}");
+                warn!("{}", msg);
+                if warning.is_none() {
+                    warning = Some(msg);
+                }
+                Config::default()
+            }
+        };
+
+        ConfigLoadResult { config, warning }
     }
 }
 
@@ -333,15 +341,15 @@ line_numbers = "relative"
         assert!(try_load(&path).is_none());
     }
 
+    fn val(s: &str) -> toml::Value {
+        toml::from_str(s).unwrap()
+    }
+
     #[test]
     fn merge_keys_are_combined() {
-        let mut base = Config::default();
-        base.keys.normal.insert("k".into(), "move_up".into());
-
-        let mut overlay = Config::default();
-        overlay.keys.normal.insert("j".into(), "move_down".into());
-
-        let merged = merge(base, overlay);
+        let home = val("[keys.normal]\nk = \"move_up\"\n");
+        let project = val("[keys.normal]\nj = \"move_down\"\n");
+        let merged = merge_values(vec![home, project]).unwrap();
         assert_eq!(
             merged.keys.normal.get("k").map(String::as_str),
             Some("move_up")
@@ -354,19 +362,35 @@ line_numbers = "relative"
 
     #[test]
     fn overlay_editor_and_theme_override_base() {
-        let mut base = Config::default();
-        base.editor.tab_width = 8;
-        base.theme = "base-theme".into();
-
-        let mut overlay = Config::default();
-        overlay.editor.tab_width = 2;
-        overlay.editor.expand_tab = false;
-        overlay.theme = "project-theme".into();
-
-        let merged = merge(base, overlay);
+        let home = val("theme = \"base-theme\"\n[editor]\ntab_width = 8\n");
+        let project =
+            val("theme = \"project-theme\"\n[editor]\ntab_width = 2\nexpand_tab = false\n");
+        let merged = merge_values(vec![home, project]).unwrap();
         assert_eq!(merged.editor.tab_width, 2);
         assert!(!merged.editor.expand_tab);
         assert_eq!(merged.theme, "project-theme");
+    }
+
+    #[test]
+    fn project_without_editor_section_keeps_home_editor() {
+        // Regression: a project file that omits [editor] must NOT reset the home
+        // editor settings to defaults.
+        let home = val("[editor]\ntab_width = 2\nexpand_tab = false\n");
+        let project = val("theme = \"project-theme\"\n"); // no [editor]
+        let merged = merge_values(vec![home, project]).unwrap();
+        assert_eq!(merged.editor.tab_width, 2, "home tab_width must survive");
+        assert!(!merged.editor.expand_tab, "home expand_tab must survive");
+        assert_eq!(merged.theme, "project-theme");
+    }
+
+    #[test]
+    fn deep_merge_combines_nested_editor_keys() {
+        // home sets tab_width, project sets scrolloff — both kept.
+        let home = val("[editor]\ntab_width = 8\n");
+        let project = val("[editor]\nscrolloff = 9\n");
+        let merged = merge_values(vec![home, project]).unwrap();
+        assert_eq!(merged.editor.tab_width, 8);
+        assert_eq!(merged.editor.scrolloff, 9);
     }
 
     #[test]
