@@ -117,6 +117,19 @@ impl Cell {
         }
     }
 
+    /// The trailing column occupied by a wide (width-2) grapheme. It carries
+    /// `width: 0` as a sentinel: the backend skips it when flushing (the wide
+    /// grapheme already paints both columns), but it still participates in the
+    /// damage diff so that when the wide char is replaced by narrow content the
+    /// stale right-half is redrawn (otherwise it ghosts).
+    pub fn wide_continuation(style: Style) -> Self {
+        Self {
+            grapheme: " ".to_string(),
+            width: 0,
+            style,
+        }
+    }
+
     pub fn set_grapheme(&mut self, g: impl Into<String>) {
         let g = g.into();
         self.width = g.width().max(1) as u8;
@@ -197,19 +210,12 @@ impl Grid {
                     style,
                 },
             );
-            x += w as u16;
-            // Fill wide char's second column with a blank
-            if w == 2 && x < self.width {
-                self.set(
-                    x - 1 + 1,
-                    row,
-                    Cell {
-                        grapheme: " ".to_string(),
-                        width: 1,
-                        style,
-                    },
-                );
+            // Mark the wide char's trailing column as a continuation sentinel so a
+            // later narrow overwrite redraws it (avoids ghosting the right half).
+            if w == 2 && x + 1 < self.width {
+                self.set(x + 1, row, Cell::wide_continuation(style));
             }
+            x += w as u16;
         }
         x
     }
@@ -361,5 +367,34 @@ mod tests {
         db.invalidate();
         // Now all cells are "changed"
         assert!(db.diff().count() > 0);
+    }
+
+    #[test]
+    fn wide_char_marks_continuation_column() {
+        let mut g = Grid::new(10, 1);
+        g.write_str(0, 0, "가", Style::default()); // width-2 grapheme
+        assert_eq!(g.get(0, 0).unwrap().width, 2);
+        // Trailing column is a width-0 sentinel, not a normal space.
+        assert_eq!(g.get(1, 0).unwrap().width, 0);
+    }
+
+    #[test]
+    fn replacing_wide_char_with_narrow_redraws_right_half() {
+        // Regression: a wide char (cols 0–1) replaced by a narrow char at col 0
+        // must register the trailing column as changed so the terminal clears the
+        // stale right half instead of ghosting it.
+        let mut g = Grid::new(10, 1);
+        g.write_str(0, 0, "가", Style::default());
+        let prev = g.clone(); // the wide-char frame
+
+        // Now the line is just "x": narrow char + cleared tail.
+        g.set(0, 0, Cell::new("x", Style::default()));
+        g.fill_rect(1, 0, g.width() - 1, 1, Style::RESET);
+
+        let changed: Vec<(u16, u16)> = g.diff(&prev).map(|(c, r, _)| (c, r)).collect();
+        assert!(
+            changed.contains(&(1, 0)),
+            "continuation column must be redrawn, got {changed:?}"
+        );
     }
 }

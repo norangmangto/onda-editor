@@ -163,6 +163,13 @@ impl Backend for TerminalBackend {
         let mut last_style: Option<Style> = None;
 
         for (col, row, cell) in cells {
+            // Width-0 cells are the trailing column of a wide grapheme; the wide
+            // grapheme already painted both columns, so emitting here would draw
+            // over its right half. They exist only for damage tracking.
+            if cell.width == 0 {
+                continue;
+            }
+
             // Only move cursor when not at the expected next position
             if last_pos != Some((col, row)) {
                 queue!(self.out, cursor::MoveTo(col, row))?;

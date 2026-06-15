@@ -244,6 +244,11 @@ impl DocumentView {
                         style,
                     },
                 );
+                // Mark a wide char's trailing column so a later narrow overwrite
+                // redraws it instead of leaving a ghosted right half.
+                if w == 2 && col + 1 < grid.width() {
+                    grid.set(col + 1, abs_row, Cell::wide_continuation(style));
+                }
                 col += w;
             }
 
@@ -340,6 +345,11 @@ impl DocumentView {
                         style,
                     },
                 );
+                // Mark a wide char's trailing column so a later narrow overwrite
+                // redraws it instead of leaving a ghosted right half.
+                if w == 2 && col + 1 < grid.width() {
+                    grid.set(col + 1, abs_row, Cell::wide_continuation(style));
+                }
                 col += w;
             }
 
