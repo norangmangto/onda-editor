@@ -874,6 +874,75 @@ pub fn render_agent_panel(
     }
 }
 
+/// Render the IDE shell's left chrome: a vertical activity bar (view switcher)
+/// at `[0, activity_w)` plus a sidebar panel at `[activity_w, activity_w + width)`.
+///
+/// `views` are short activity-bar labels (1–2 cells); `active` is the selected
+/// index. `title`/`body` fill the sidebar; `focused` highlights it. A `│` border
+/// closes the right edge so the editor area abuts cleanly.
+#[allow(clippy::too_many_arguments)]
+pub fn render_sidebar(
+    grid: &mut Grid,
+    activity_w: u16,
+    width: u16,
+    height: u16,
+    views: &[&str],
+    active: usize,
+    title: &str,
+    body: &[(Style, String)],
+    focused: bool,
+    theme: &Theme,
+) {
+    if width < 2 || height == 0 {
+        return;
+    }
+    let bg = theme.float_bg();
+    let border = theme.float_border();
+    let active_style = theme.status_visual();
+    let inactive = theme.line_nr();
+
+    // Activity bar (far left): one label per row.
+    for r in 0..height {
+        grid.fill_rect(0, r, activity_w, 1, bg);
+    }
+    for (i, label) in views.iter().enumerate() {
+        if i as u16 >= height {
+            break;
+        }
+        let style = if i == active { active_style } else { inactive };
+        grid.fill_rect(0, i as u16, activity_w, 1, style);
+        grid.write_str(0, i as u16, label, style);
+    }
+
+    // Sidebar panel.
+    let sx = activity_w;
+    let sw = width;
+    let title_style = if focused {
+        theme.status_visual()
+    } else {
+        theme.status_bg()
+    };
+    grid.fill_rect(sx, 0, sw, 1, title_style);
+    let header: String = format!(" {title}").chars().take(sw as usize).collect();
+    grid.write_str(sx, 0, &header, title_style);
+
+    let body_top = 1u16;
+    let body_rows = height.saturating_sub(1) as usize;
+    for r in 0..body_rows {
+        grid.fill_rect(sx, body_top + r as u16, sw, 1, bg);
+    }
+    for (i, (style, text)) in body.iter().take(body_rows).enumerate() {
+        let clipped: String = text.chars().take(sw.saturating_sub(1) as usize).collect();
+        grid.write_str(sx, body_top + i as u16, &clipped, *style);
+    }
+
+    // Right border column.
+    let bx = sx + sw - 1;
+    for r in 0..height {
+        grid.set(bx, r, Cell::new("│", border));
+    }
+}
+
 // ── Compositor ────────────────────────────────────────────────────────────────
 
 /// Owns the double-buffer and drives the full render pipeline.
@@ -1103,5 +1172,58 @@ mod tests {
             changed.contains(&(1, 0)),
             "trailing column must be redrawn, got {changed:?}"
         );
+    }
+
+    #[test]
+    fn sidebar_lays_out_activity_bar_title_and_border() {
+        let theme = Theme::default_dark();
+        let mut grid = Grid::new(40, 10);
+        let views = ["E", "S", "G", "R", "A"];
+        render_sidebar(
+            &mut grid,
+            3,
+            20,
+            10,
+            &views,
+            2,
+            "SOURCE CONTROL",
+            &[],
+            false,
+            &theme,
+        );
+        // Activity bar: each label on its own row at column 0.
+        assert_eq!(grid.get(0, 0).unwrap().grapheme, "E");
+        assert_eq!(grid.get(0, 2).unwrap().grapheme, "G");
+        assert_eq!(grid.get(0, 4).unwrap().grapheme, "A");
+        // Sidebar title starts just after the activity bar (col 3).
+        let title: String = (3..23)
+            .filter_map(|c| grid.get(c, 0).map(|x| x.grapheme.clone()))
+            .collect();
+        assert!(title.contains("SOURCE CONTROL"), "got {title:?}");
+        // Right border column at activity_w + width - 1 = 3 + 20 - 1 = 22.
+        assert_eq!(grid.get(22, 5).unwrap().grapheme, "│");
+    }
+
+    #[test]
+    fn sidebar_renders_body_lines() {
+        let theme = Theme::default_dark();
+        let mut grid = Grid::new(40, 10);
+        let body = vec![(Style::default(), "  hello.rs".to_string())];
+        render_sidebar(
+            &mut grid,
+            3,
+            20,
+            10,
+            &["E"],
+            0,
+            "EXPLORER",
+            &body,
+            true,
+            &theme,
+        );
+        let row1: String = (3..23)
+            .filter_map(|c| grid.get(c, 1).map(|x| x.grapheme.clone()))
+            .collect();
+        assert!(row1.contains("hello.rs"), "got {row1:?}");
     }
 }

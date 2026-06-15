@@ -133,10 +133,57 @@ impl WindowState {
 
 // ── PickerKind ────────────────────────────────────────────────────────────────
 
+/// Fixed width of the IDE-shell activity bar (the view switcher column).
+const ACTIVITY_BAR_W: u16 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PickerKind {
     File,
     Buffer,
+}
+
+/// Which view the IDE-shell sidebar is showing (Phase 6 W33; activity bar order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarView {
+    Explorer,
+    Search,
+    SourceControl,
+    Run,
+    Agent,
+}
+
+impl SidebarView {
+    /// Activity-bar order.
+    const ALL: [SidebarView; 5] = [
+        SidebarView::Explorer,
+        SidebarView::Search,
+        SidebarView::SourceControl,
+        SidebarView::Run,
+        SidebarView::Agent,
+    ];
+    /// Short activity-bar label (1–2 cells).
+    fn label(self) -> &'static str {
+        match self {
+            SidebarView::Explorer => "E",
+            SidebarView::Search => "S",
+            SidebarView::SourceControl => "G",
+            SidebarView::Run => "R",
+            SidebarView::Agent => "A",
+        }
+    }
+    /// Sidebar header title.
+    fn title(self) -> &'static str {
+        match self {
+            SidebarView::Explorer => "EXPLORER",
+            SidebarView::Search => "SEARCH",
+            SidebarView::SourceControl => "SOURCE CONTROL",
+            SidebarView::Run => "RUN & DEBUG",
+            SidebarView::Agent => "AGENT",
+        }
+    }
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|v| *v == self).unwrap_or(0)
+    }
 }
 
 /// DAP execution-control actions (F5/F10/F11/F12).
@@ -407,6 +454,17 @@ struct App<B: Backend> {
 
     /// Last buffer char-length we reparsed syntax for, per doc (change detector).
     doc_last_len: HashMap<usize, usize>,
+
+    // ── IDE shell (Phase 6 W33) ──────────────────────────────────────────────────
+    /// Whether the left chrome (activity bar + sidebar) is shown. Off by default so
+    /// the editor keeps its full-width, vim-first layout until opted in (`<C-b>`).
+    sidebar_open: bool,
+    /// Active sidebar view (Explorer/Search/SCM/Run/Agent).
+    sidebar_view: SidebarView,
+    /// Sidebar width in columns (activity bar is a fixed extra 3).
+    sidebar_width: u16,
+    /// True when keystrokes are routed to the sidebar instead of the editor.
+    sidebar_focused: bool,
 
     // ── Soft wrap ─────────────────────────────────────────────────────────────
     #[allow(dead_code)]
@@ -1422,6 +1480,41 @@ impl<B: Backend> App<B> {
     }
 
     /// Keystrokes while the panel input is focused. Returns true if consumed.
+    /// Keystrokes while the IDE-shell sidebar has focus (Phase 6 W33). Returns true
+    /// when consumed. View content interaction (file tree, etc.) arrives in W34+.
+    fn handle_sidebar_key(&mut self, key: &Key) -> bool {
+        match key {
+            Key::Esc => self.sidebar_focused = false, // back to the editor, keep open
+            Key::Char('q', _) => {
+                self.sidebar_open = false;
+                self.sidebar_focused = false;
+            }
+            Key::Char('j', _) | Key::Down | Key::Tab => self.cycle_sidebar_view(1),
+            Key::Char('k', _) | Key::Up => self.cycle_sidebar_view(-1),
+            Key::Char(c, _) if ('1'..='5').contains(c) => {
+                let i = (*c as u8 - b'1') as usize;
+                self.sidebar_view = SidebarView::ALL[i];
+            }
+            Key::Char('>', _) | Key::Char('L', _) => {
+                self.sidebar_width = (self.sidebar_width + 4).min(80);
+            }
+            Key::Char('<', _) | Key::Char('H', _) => {
+                self.sidebar_width = self.sidebar_width.saturating_sub(4).max(16);
+            }
+            _ => return true, // consume all other keys while the sidebar is focused
+        }
+        self.compositor.buf.invalidate();
+        true
+    }
+
+    /// Move the active sidebar view by `delta` (wrapping).
+    fn cycle_sidebar_view(&mut self, delta: isize) {
+        let n = SidebarView::ALL.len() as isize;
+        let cur = self.sidebar_view.index() as isize;
+        let next = (cur + delta).rem_euclid(n) as usize;
+        self.sidebar_view = SidebarView::ALL[next];
+    }
+
     fn handle_agent_input_key(&mut self, key: &Key) -> bool {
         // A pending permission steals single-key a/A/d/D.
         if self.agent_pending_perm.is_some() {
@@ -1459,6 +1552,28 @@ impl<B: Backend> App<B> {
             return 0;
         }
         (total / 3).clamp(30, 64).min(total.saturating_sub(20))
+    }
+
+    /// Width of the left IDE chrome (activity bar + sidebar); 0 when closed.
+    fn left_chrome_width(&self) -> u16 {
+        if self.sidebar_open {
+            ACTIVITY_BAR_W + self.sidebar_width
+        } else {
+            0
+        }
+    }
+
+    /// Placeholder sidebar body per view (real content arrives in W34+).
+    fn sidebar_body(&self) -> Vec<(onda_render::Style, String)> {
+        let dim = self.theme.line_nr();
+        let line = |s: &str| (dim, format!("  {s}"));
+        match self.sidebar_view {
+            SidebarView::Explorer => vec![line("(file tree — W34)")],
+            SidebarView::Search => vec![line("(live grep — W35)")],
+            SidebarView::SourceControl => vec![line("(git — W38)")],
+            SidebarView::Run => vec![line("(debug — W40)")],
+            SidebarView::Agent => vec![line("(use :agent for the panel)")],
+        }
     }
 
     /// Format the thread into styled panel lines (newest at the bottom).
@@ -1795,9 +1910,18 @@ impl<B: Backend> App<B> {
         // Carve a right strip for the agent panel, if open.
         let panel_width = self.agent_panel_width(width);
         let editor_width = width - panel_width;
+        // Carve a left strip for the IDE shell (activity bar + sidebar), if open.
+        let chrome_w = self
+            .left_chrome_width()
+            .min(editor_width.saturating_sub(20));
 
         // ── Phase 1: update viewports (no grid access yet) ────────────────────
-        let content_area = Rect::new(0, 0, editor_width, content_height);
+        let content_area = Rect::new(
+            chrome_w,
+            0,
+            editor_width.saturating_sub(chrome_w),
+            content_height,
+        );
         let rects = self.layout.rects(content_area);
         let focused_win_id = WindowId(self.focused_window);
 
@@ -1895,10 +2019,34 @@ impl<B: Backend> App<B> {
             Vec::new()
         };
 
+        // IDE-shell sidebar data, formatted before the grid borrow.
+        let sidebar_body: Vec<(onda_render::Style, String)> = if chrome_w > 0 {
+            self.sidebar_body()
+        } else {
+            Vec::new()
+        };
+
         // ── Phase 3: render into grid ─────────────────────────────────────────
         {
             let theme = &self.theme;
             let grid = self.compositor.buf.current_mut();
+
+            // IDE shell: activity bar + sidebar in the left chrome strip.
+            if chrome_w > 0 {
+                let views: Vec<&str> = SidebarView::ALL.iter().map(|v| v.label()).collect();
+                onda_render::render_sidebar(
+                    grid,
+                    ACTIVITY_BAR_W,
+                    self.sidebar_width,
+                    content_height,
+                    &views,
+                    self.sidebar_view.index(),
+                    self.sidebar_view.title(),
+                    &sidebar_body,
+                    self.sidebar_focused,
+                    theme,
+                );
+            }
 
             // Draw borders
             if rects.len() > 1 {
@@ -2209,7 +2357,19 @@ impl<B: Backend> App<B> {
     fn handle_mouse_event(&mut self, ev: MouseEvent) -> Result<()> {
         let (width, height) = self.backend.size();
         let content_height = height.saturating_sub(2);
-        let content_area = Rect::new(0, 0, width, content_height);
+        // Match render_frame's editor area: inset by the agent panel (right) and the
+        // IDE chrome (left) so clicks map to the right cell.
+        let panel_width = self.agent_panel_width(width);
+        let editor_width = width - panel_width;
+        let chrome_w = self
+            .left_chrome_width()
+            .min(editor_width.saturating_sub(20));
+        let content_area = Rect::new(
+            chrome_w,
+            0,
+            editor_width.saturating_sub(chrome_w),
+            content_height,
+        );
         let rects = self.layout.rects(content_area);
 
         match ev.kind {
@@ -2300,6 +2460,11 @@ impl<B: Backend> App<B> {
 
         // Route to the agent panel input box when focused.
         if self.agent_input_focused && self.handle_agent_input_key(&key) {
+            return Ok(());
+        }
+
+        // Route to the IDE-shell sidebar when it has focus.
+        if self.sidebar_focused && self.handle_sidebar_key(&key) {
             return Ok(());
         }
 
@@ -3666,6 +3831,14 @@ impl<B: Backend> App<B> {
                 self.picker = Some(picker);
                 self.picker_kind = PickerKind::Buffer;
             }
+            Action::ToggleSidebar => {
+                // `<space>e` opens the sidebar and jumps focus into it. Within the
+                // sidebar, `<Esc>` returns to the editor (keeps it open) and `q`
+                // closes it.
+                self.sidebar_open = true;
+                self.sidebar_focused = true;
+                self.compositor.buf.invalidate();
+            }
 
             // ── Ex commands (dispatched via command mode) ─────────────────────
             Action::WriteFile
@@ -4766,6 +4939,10 @@ fn make_app<B: Backend>(
         plugin_idle_fired: false,
         plugin_decorations: HashMap::new(),
         doc_last_len: HashMap::new(),
+        sidebar_open: false,
+        sidebar_view: SidebarView::Explorer,
+        sidebar_width: 30,
+        sidebar_focused: false,
         soft_wrap: false,
         #[cfg(feature = "bench")]
         tracer: LatencyTracer::default(),
@@ -6017,6 +6194,49 @@ mod edit_integration_tests {
         keys(&mut app, "$"); // end of line (on 'f')
         keys(&mut app, "p"); // paste "abc" after cursor
         assert_eq!(body(&app), "abcdefabc\n");
+    }
+
+    // ── IDE shell sidebar (W33) ──────────────────────────────────────────────
+
+    #[test]
+    fn sidebar_toggle_focus_cycle() {
+        let mut app = app_with("x\n");
+        assert!(!app.sidebar_open);
+        // `<space>e` opens + focuses.
+        keys(&mut app, " e");
+        assert!(app.sidebar_open && app.sidebar_focused);
+        // Focused: `<Esc>` returns to the editor but keeps it open.
+        app.handle_key(Key::Esc).unwrap();
+        assert!(app.sidebar_open && !app.sidebar_focused);
+        // `<space>e` while open+unfocused refocuses.
+        keys(&mut app, " e");
+        assert!(app.sidebar_focused);
+        // `q` in the sidebar closes it.
+        app.handle_key(Key::char('q')).unwrap();
+        assert!(!app.sidebar_open && !app.sidebar_focused);
+    }
+
+    #[test]
+    fn sidebar_view_switching() {
+        let mut app = app_with("x\n");
+        keys(&mut app, " e"); // open + focus, default Explorer
+        assert_eq!(app.sidebar_view, SidebarView::Explorer);
+        app.handle_key(Key::char('j')).unwrap(); // next view
+        assert_eq!(app.sidebar_view, SidebarView::Search);
+        app.handle_key(Key::char('3')).unwrap(); // jump to 3rd view
+        assert_eq!(app.sidebar_view, SidebarView::SourceControl);
+        app.handle_key(Key::char('k')).unwrap(); // prev
+        assert_eq!(app.sidebar_view, SidebarView::Search);
+    }
+
+    #[test]
+    fn editor_keys_pass_through_when_sidebar_open_but_unfocused() {
+        let mut app = app_with("abc\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, " e"); // open + focus
+        app.handle_key(Key::Esc).unwrap(); // unfocus → editor active
+        keys(&mut app, "x"); // should edit the buffer
+        assert_eq!(body(&app), "bc\n");
     }
 }
 

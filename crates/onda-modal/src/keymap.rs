@@ -172,6 +172,9 @@ pub enum Action {
     OpenFilePicker,
     OpenBufferPicker,
 
+    // IDE shell (Phase 6 W33): toggle/focus the activity bar + sidebar.
+    ToggleSidebar,
+
     // Command-line operations (dispatched to app)
     WriteFile,
     Quit,
@@ -259,6 +262,7 @@ impl Keymap {
             let mut sp: HashMap<Key, KeymapNode> = HashMap::new();
             sp.insert(Key::char('f'), KeymapNode::Leaf(Action::OpenFilePicker));
             sp.insert(Key::char('b'), KeymapNode::Leaf(Action::OpenBufferPicker));
+            sp.insert(Key::char('e'), KeymapNode::Leaf(Action::ToggleSidebar));
             m.insert(Key::char(' '), KeymapNode::Node(sp));
         }
 
