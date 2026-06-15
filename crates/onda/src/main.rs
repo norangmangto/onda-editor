@@ -5011,4 +5011,84 @@ mod insert_newline_tests {
         app.handle_key(Key::char('z')).unwrap();
         assert_eq!(body(&app), "first\nz\nsecond\n");
     }
+
+    fn head(app: &App<NullBackend>) -> usize {
+        app.selection().primary().head
+    }
+
+    /// Each typed char inserts at the cursor and advances it by exactly one.
+    #[test]
+    fn typing_inserts_and_advances_cursor() {
+        let mut app = app_with("");
+        app.mode = Mode::Insert;
+        for c in "hi".chars() {
+            app.handle_key(Key::char(c)).unwrap();
+        }
+        assert_eq!(body(&app), "hi");
+        assert_eq!(head(&app), 2);
+    }
+
+    /// Typing in the middle of a line splices, not overwrites.
+    #[test]
+    fn typing_midline_splices() {
+        let mut app = app_with("ad");
+        app.mode = Mode::Insert;
+        *app.selection_mut() = Selection::point(1); // between 'a' and 'd'
+        app.handle_key(Key::char('b')).unwrap();
+        app.handle_key(Key::char('c')).unwrap();
+        assert_eq!(body(&app), "abcd");
+        assert_eq!(head(&app), 3);
+    }
+
+    /// Backspace at the start of a line joins it with the previous line.
+    #[test]
+    fn backspace_at_line_start_joins_lines() {
+        let mut app = app_with("ab\ncd\n");
+        app.mode = Mode::Insert;
+        *app.selection_mut() = Selection::point(3); // start of "cd"
+        app.handle_key(Key::Backspace).unwrap();
+        assert_eq!(body(&app), "abcd\n");
+        assert_eq!(head(&app), 2); // at the join point
+    }
+
+    /// Backspace mid-line removes the char before the cursor.
+    #[test]
+    fn backspace_midline_deletes_prev_char() {
+        let mut app = app_with("abc");
+        app.mode = Mode::Insert;
+        *app.selection_mut() = Selection::point(2); // between 'b' and 'c'
+        app.handle_key(Key::Backspace).unwrap();
+        assert_eq!(body(&app), "ac");
+        assert_eq!(head(&app), 1);
+    }
+
+    /// Leaving insert mode (<Esc>) moves the cursor left one column, vim-style.
+    #[test]
+    fn esc_moves_cursor_left() {
+        let mut app = app_with("");
+        app.mode = Mode::Insert;
+        app.handle_key(Key::char('a')).unwrap();
+        app.handle_key(Key::char('b')).unwrap();
+        assert_eq!(head(&app), 2);
+        app.handle_key(Key::Esc).unwrap();
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(head(&app), 1);
+    }
+
+    /// A full edit sequence: type, split with <Enter>, type more — text and cursor
+    /// stay coherent (the bug class that escaped tests entirely before).
+    #[test]
+    fn mixed_insert_sequence_stays_coherent() {
+        let mut app = app_with("");
+        app.mode = Mode::Insert;
+        for c in "abc".chars() {
+            app.handle_key(Key::char(c)).unwrap();
+        }
+        app.handle_key(Key::Enter).unwrap();
+        for c in "def".chars() {
+            app.handle_key(Key::char(c)).unwrap();
+        }
+        assert_eq!(body(&app), "abc\ndef");
+        assert_eq!(head(&app), 7);
+    }
 }

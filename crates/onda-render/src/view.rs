@@ -1046,4 +1046,62 @@ mod tests {
         assert_eq!(grid.get(0, 0).unwrap().style.fg, kw.fg);
         assert_ne!(grid.get(3, 0).unwrap().style.fg, kw.fg);
     }
+
+    fn plain_vp() -> Viewport {
+        Viewport {
+            offset_line: 0,
+            offset_col: 0,
+            scrolloff: 0,
+            line_nr_width: 0,
+        }
+    }
+
+    fn render(grid: &mut Grid, doc: &Document, sel: &Selection, theme: &Theme) {
+        let h = grid.height();
+        DocumentView::render_with_highlights(
+            grid,
+            doc,
+            sel,
+            &plain_vp(),
+            ModeIndicator::Normal,
+            0,
+            h,
+            &[],
+            &[],
+            theme,
+        );
+    }
+
+    #[test]
+    fn wide_chars_emit_width0_continuation_columns() {
+        let mut grid = Grid::new(20, 2);
+        let doc = doc_with("가나\n"); // two width-2 graphemes
+        let sel = Selection::point(100); // off-screen
+        render(&mut grid, &doc, &sel, &Theme::default_dark());
+        assert_eq!(grid.get(0, 0).unwrap().grapheme, "가");
+        assert_eq!(grid.get(0, 0).unwrap().width, 2);
+        assert_eq!(grid.get(1, 0).unwrap().width, 0); // continuation
+        assert_eq!(grid.get(2, 0).unwrap().grapheme, "나");
+        assert_eq!(grid.get(2, 0).unwrap().width, 2);
+        assert_eq!(grid.get(3, 0).unwrap().width, 0); // continuation
+    }
+
+    #[test]
+    fn wide_to_narrow_redraws_trailing_column() {
+        // Regression for the ghosting bug: when a line of wide chars is replaced by
+        // narrow content, the wide chars' trailing columns must register as damage.
+        let theme = Theme::default_dark();
+        let off = Selection::point(100);
+        let mut grid = Grid::new(20, 2);
+        render(&mut grid, &doc_with("가나\n"), &off, &theme);
+        let prev = grid.clone();
+        // Same buffer now holds a short ASCII line where the wide chars were.
+        render(&mut grid, &doc_with("x\n"), &off, &theme);
+        let changed: Vec<(u16, u16)> = grid.diff(&prev).map(|(c, r, _)| (c, r)).collect();
+        // col 1 was the right half of "가"; it must be redrawn (cleared), not ghosted.
+        assert!(
+            changed.contains(&(1, 0)),
+            "trailing column must be redrawn, got {changed:?}"
+        );
+    }
 }

@@ -369,4 +369,57 @@ mod tests {
         d.apply(&tx).unwrap();
         assert_eq!(d.rope().to_string(), "hello world");
     }
+
+    /// Apply `open_line` and return (resulting text, cursor head).
+    fn open(text: &str, cursor: usize, above: bool) -> (String, usize) {
+        let mut d = doc(text);
+        let sel = Selection::point(cursor);
+        let (tx, new_sel) = open_line(&d, &sel, above);
+        d.apply(&tx).unwrap();
+        (d.rope().to_string(), new_sel.primary().head)
+    }
+
+    #[test]
+    fn open_below_midfile_cursor_on_new_line() {
+        // Regression: cursor must land on the *new* empty line, not the line below it.
+        let (text, cur) = open("first\nsecond\n", 0, false);
+        assert_eq!(text, "first\n\nsecond\n");
+        assert_eq!(cur, 6); // start of the new empty line (line 1)
+    }
+
+    #[test]
+    fn open_below_from_midline_cursor() {
+        // Cursor in the middle of a line: open below still goes after the whole line.
+        let (text, cur) = open("first\nsecond\n", 2, false); // cursor on 'r' of first
+        assert_eq!(text, "first\n\nsecond\n");
+        assert_eq!(cur, 6);
+    }
+
+    #[test]
+    fn open_below_last_line_no_trailing_newline() {
+        let (text, cur) = open("first\nsecond", 8, false); // cursor on last line
+        assert_eq!(text, "first\nsecond\n");
+        assert_eq!(cur, 13); // start of the new empty trailing line (after the \n)
+    }
+
+    #[test]
+    fn open_below_empty_doc() {
+        let (text, cur) = open("", 0, false);
+        assert_eq!(text, "\n");
+        assert_eq!(cur, 1);
+    }
+
+    #[test]
+    fn open_above_first_line() {
+        let (text, cur) = open("first\nsecond\n", 0, true);
+        assert_eq!(text, "\nfirst\nsecond\n");
+        assert_eq!(cur, 0);
+    }
+
+    #[test]
+    fn open_above_second_line() {
+        let (text, cur) = open("first\nsecond\n", 6, true); // start of "second"
+        assert_eq!(text, "first\n\nsecond\n");
+        assert_eq!(cur, 6);
+    }
 }
