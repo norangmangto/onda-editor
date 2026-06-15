@@ -2736,6 +2736,17 @@ impl<B: Backend> App<B> {
 
             // ── Operator + motion ─────────────────────────────────────────────
             Action::ApplyOperatorMotion(op, motion) => {
+                // vim: `cw`/`cW` behave like `ce`/`cE` (change to word end, inclusive)
+                // so the trailing whitespace is kept.
+                let motion = if op == Operator::Change {
+                    match motion {
+                        Motion::WordForward => Motion::WordEnd,
+                        Motion::BigWordForward => Motion::BigWordEnd,
+                        m => m,
+                    }
+                } else {
+                    motion
+                };
                 let rope = self.doc().rope().clone();
                 let (motion_sel, _) = motion.apply_to_selection(
                     &rope,
@@ -2746,11 +2757,17 @@ impl<B: Backend> App<B> {
                 );
                 let primary = self.selection().primary();
                 let motion_head = motion_sel.primary().head;
-                let op_range = onda_core::Range::new(
-                    primary.head.min(motion_head),
-                    primary.head.max(motion_head),
-                );
-                let op_sel = Selection::new(vec![op_range], 0);
+                let lo = primary.head.min(motion_head);
+                let mut hi = primary.head.max(motion_head);
+                // `delete()` treats the range as inclusive [from, to]. For exclusive
+                // motions the target char is not part of the span, so drop it.
+                if !motion.is_inclusive() {
+                    if hi == lo {
+                        return Ok(()); // motion didn't move → nothing to operate on
+                    }
+                    hi -= 1;
+                }
+                let op_sel = Selection::new(vec![onda_core::Range::new(lo, hi)], 0);
                 self.apply_operator(op, &op_sel, false)?;
             }
 
@@ -2785,21 +2802,35 @@ impl<B: Backend> App<B> {
 
             // ── Line operator ─────────────────────────────────────────────────
             Action::OperatorLine(op) => {
-                let sel = self.selection().clone();
+                // `count` lines starting at the cursor line (e.g. `2dd`).
+                let head = self.selection().primary().head;
+                let doc = self.doc();
+                let cur_line = doc.char_to_line(head);
+                let last_line =
+                    (cur_line + count.saturating_sub(1)).min(doc.len_lines().saturating_sub(1));
+                let end_char = doc.line_to_char(last_line);
+                let sel = Selection::new(vec![onda_core::Range::new(head, end_char)], 0);
                 self.apply_operator(op, &sel, true)?;
             }
 
             // ── Selection operator ────────────────────────────────────────────
             Action::OperatorSelection(op) => {
                 let sel = self.selection().clone();
-                self.apply_operator(op, &sel, false)?;
+                // Visual-line operates on whole lines; charwise/block on the range.
+                let linewise = self.mode == Mode::VisualLine;
+                self.apply_operator(op, &sel, linewise)?;
                 self.mode = Mode::Normal;
             }
 
             // ── Immediate edits ───────────────────────────────────────────────
             Action::DeleteChar => {
-                let tx = onda_modal::operator::delete_char_at_cursor(self.doc(), self.selection());
-                if !tx.changes.is_empty() {
+                // `x` deletes `count` chars at the cursor (clamped to the line).
+                for _ in 0..count {
+                    let tx =
+                        onda_modal::operator::delete_char_at_cursor(self.doc(), self.selection());
+                    if tx.changes.is_empty() {
+                        break;
+                    }
                     let sel_before = self.selection().clone();
                     let inv = self.doc_mut().apply(&tx)?;
                     let new_sel = self.selection().map(&tx.changes);
@@ -5090,5 +5121,261 @@ mod insert_newline_tests {
         }
         assert_eq!(body(&app), "abc\ndef");
         assert_eq!(head(&app), 7);
+    }
+}
+
+#[cfg(test)]
+mod edit_integration_tests {
+    use super::*;
+
+    fn app_with(text: &str) -> App<NullBackend> {
+        let (bg_tx, bg_rx) = mpsc::sync_channel(64);
+        let backend = NullBackend::new(120, 40);
+        let (w, h) = backend.size();
+        let compositor = Compositor::new(w, h);
+        let mut doc = Document::new_empty();
+        let cs = onda_core::transaction::ChangeSetBuilder::new(0)
+            .insert(text)
+            .build();
+        doc.apply(&Transaction::new(cs)).unwrap();
+        make_app(
+            doc,
+            backend,
+            compositor,
+            bg_tx,
+            bg_rx,
+            Config::default(),
+            false,
+        )
+    }
+
+    fn body(app: &App<NullBackend>) -> String {
+        app.doc().rope().to_string()
+    }
+    fn head(app: &App<NullBackend>) -> usize {
+        app.selection().primary().head
+    }
+    fn keys(app: &mut App<NullBackend>, s: &str) {
+        for c in s.chars() {
+            app.handle_key(Key::char(c)).unwrap();
+        }
+    }
+
+    // ── Motions ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn motion_l_h_clamped_to_line() {
+        let mut app = app_with("abc\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "l");
+        assert_eq!(head(&app), 1);
+        keys(&mut app, "h");
+        assert_eq!(head(&app), 0);
+        keys(&mut app, "h"); // already at line start → clamped
+        assert_eq!(head(&app), 0);
+    }
+
+    #[test]
+    fn motion_word_forward_back() {
+        let mut app = app_with("foo bar baz\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "w");
+        assert_eq!(head(&app), 4); // start of "bar"
+        keys(&mut app, "w");
+        assert_eq!(head(&app), 8); // start of "baz"
+        keys(&mut app, "b");
+        assert_eq!(head(&app), 4); // back to "bar"
+    }
+
+    #[test]
+    fn motion_line_start_end() {
+        let mut app = app_with("hello world\n");
+        *app.selection_mut() = Selection::point(5);
+        keys(&mut app, "0");
+        assert_eq!(head(&app), 0);
+        keys(&mut app, "$");
+        assert_eq!(head(&app), 10); // last char of "hello world" (before \n)
+    }
+
+    #[test]
+    fn motion_gg_and_g() {
+        let mut app = app_with("l1\nl2\nl3\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "G");
+        assert_eq!(app.doc().char_to_line(head(&app)), 2); // last line
+        keys(&mut app, "gg");
+        assert_eq!(app.doc().char_to_line(head(&app)), 0); // first line
+    }
+
+    // ── Delete / change / yank-paste ────────────────────────────────────────
+
+    #[test]
+    fn x_deletes_char_under_cursor() {
+        let mut app = app_with("abc\n");
+        *app.selection_mut() = Selection::point(1);
+        keys(&mut app, "x");
+        assert_eq!(body(&app), "ac\n");
+        assert_eq!(head(&app), 1);
+    }
+
+    #[test]
+    fn count_3x_deletes_three_chars() {
+        let mut app = app_with("abcdef\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "3x");
+        assert_eq!(body(&app), "def\n");
+    }
+
+    #[test]
+    fn dw_deletes_word() {
+        let mut app = app_with("foo bar\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "dw");
+        assert_eq!(body(&app), "bar\n");
+    }
+
+    #[test]
+    fn dd_deletes_line() {
+        let mut app = app_with("one\ntwo\nthree\n");
+        *app.selection_mut() = Selection::point(4); // on "two"
+        keys(&mut app, "dd");
+        assert_eq!(body(&app), "one\nthree\n");
+    }
+
+    #[test]
+    fn count_2dd_deletes_two_lines() {
+        let mut app = app_with("one\ntwo\nthree\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "2dd");
+        assert_eq!(body(&app), "three\n");
+    }
+
+    #[test]
+    fn capital_d_deletes_to_end_of_line() {
+        let mut app = app_with("hello world\n");
+        *app.selection_mut() = Selection::point(5); // at the space
+        keys(&mut app, "D");
+        assert_eq!(body(&app), "hello\n");
+    }
+
+    #[test]
+    fn cw_changes_word_then_insert() {
+        let mut app = app_with("foo bar\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "cw");
+        assert_eq!(app.mode, Mode::Insert);
+        keys(&mut app, "baz");
+        app.handle_key(Key::Esc).unwrap();
+        assert_eq!(body(&app), "baz bar\n");
+    }
+
+    #[test]
+    fn yy_then_p_duplicates_line() {
+        let mut app = app_with("alpha\nbeta\n");
+        *app.selection_mut() = Selection::point(0); // on "alpha"
+        keys(&mut app, "yy");
+        keys(&mut app, "p");
+        assert_eq!(body(&app), "alpha\nalpha\nbeta\n");
+    }
+
+    #[test]
+    fn dd_then_p_moves_line_down() {
+        let mut app = app_with("one\ntwo\n");
+        *app.selection_mut() = Selection::point(0); // on "one"
+        keys(&mut app, "dd"); // yanks "one\n", buffer = "two\n"
+        keys(&mut app, "p"); // paste below current line
+        assert_eq!(body(&app), "two\none\n");
+    }
+
+    #[test]
+    fn j_joins_lines() {
+        let mut app = app_with("foo\nbar\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "J");
+        assert_eq!(body(&app), "foo bar\n");
+    }
+
+    #[test]
+    fn r_replaces_char() {
+        let mut app = app_with("cat\n");
+        *app.selection_mut() = Selection::point(0);
+        app.handle_key(Key::char('r')).unwrap();
+        app.handle_key(Key::char('b')).unwrap();
+        assert_eq!(body(&app), "bat\n");
+    }
+
+    // ── Undo / redo / dot-repeat ────────────────────────────────────────────
+
+    #[test]
+    fn undo_then_redo_roundtrips_an_edit() {
+        let mut app = app_with("abc\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "x"); // "bc\n"
+        assert_eq!(body(&app), "bc\n");
+        keys(&mut app, "u"); // undo → "abc\n"
+        assert_eq!(body(&app), "abc\n");
+        app.handle_key(Key::ctrl('r')).unwrap(); // redo → "bc\n"
+        assert_eq!(body(&app), "bc\n");
+    }
+
+    // ── Operator + motion inclusivity (vim exclusive/inclusive) ──────────────
+
+    #[test]
+    fn de_is_inclusive_word_end() {
+        let mut app = app_with("foo bar\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "de"); // WordEnd inclusive → deletes "foo"
+        assert_eq!(body(&app), " bar\n");
+    }
+
+    #[test]
+    fn d_dollar_deletes_to_line_end_inclusive() {
+        let mut app = app_with("hello world\n");
+        *app.selection_mut() = Selection::point(6); // on 'w'
+        keys(&mut app, "d$");
+        assert_eq!(body(&app), "hello \n");
+    }
+
+    #[test]
+    fn db_deletes_backward_exclusive_of_cursor() {
+        let mut app = app_with("foo bar\n");
+        *app.selection_mut() = Selection::point(4); // on 'b' of "bar"
+        keys(&mut app, "db"); // delete [0,4) → "foo "
+        assert_eq!(body(&app), "bar\n");
+    }
+
+    // ── Visual mode ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn visual_select_and_delete() {
+        let mut app = app_with("abcdef\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "v"); // visual from col 0
+        keys(&mut app, "ll"); // extend over a,b,c
+        keys(&mut app, "d"); // delete selection
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(body(&app), "def\n");
+    }
+
+    #[test]
+    fn visual_line_delete() {
+        let mut app = app_with("one\ntwo\nthree\n");
+        *app.selection_mut() = Selection::point(4); // on "two"
+        keys(&mut app, "V"); // visual-line
+        keys(&mut app, "d");
+        assert_eq!(body(&app), "one\nthree\n");
+    }
+
+    #[test]
+    fn visual_yank_then_paste() {
+        let mut app = app_with("abcdef\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "v");
+        keys(&mut app, "ll"); // select "abc"
+        keys(&mut app, "y"); // yank, back to normal
+        assert_eq!(app.mode, Mode::Normal);
+        keys(&mut app, "$"); // end of line (on 'f')
+        keys(&mut app, "p"); // paste "abc" after cursor
+        assert_eq!(body(&app), "abcdefabc\n");
     }
 }

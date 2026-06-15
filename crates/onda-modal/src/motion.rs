@@ -35,6 +35,21 @@ pub enum Motion {
 }
 
 impl Motion {
+    /// Whether this motion is *inclusive* when used as an operator target (vim
+    /// semantics): the character at the target position is part of the operated
+    /// span. Inclusive motions are `e`/`E`, `$`, and forward `f`/`t`. Everything
+    /// else (`w`, `b`, `0`, `^`, …) is exclusive — the target char is not deleted.
+    pub fn is_inclusive(self) -> bool {
+        matches!(
+            self,
+            Motion::WordEnd
+                | Motion::BigWordEnd
+                | Motion::LineEnd
+                | Motion::FindChar(_)
+                | Motion::TillChar(_)
+        )
+    }
+
     /// Apply this motion to a single range, returning the new range.
     ///
     /// `count` is the repetition count (≥ 1).

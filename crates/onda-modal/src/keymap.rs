@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 
-use crate::{key::Key, mode::Mode, motion::Motion, operator::Operator};
+use crate::{
+    key::{Key, KeyMod},
+    mode::Mode,
+    motion::Motion,
+    operator::Operator,
+};
 
 /// Text object selector for operator+textobj commands (e.g. `diw`, `ca"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -708,7 +713,9 @@ impl KeymapState {
                 self.pending_find = Some(FindKind::TillBack);
                 return PendingResult::NeedMore;
             }
-            Key::Char('r', _) => {
+            // Plain `r` starts a replace; Ctrl-r must fall through to the keymap
+            // (Redo), so don't swallow modified variants here.
+            Key::Char('r', m) if !m.contains(KeyMod::CTRL) => {
                 self.pending_replace = true;
                 return PendingResult::NeedMore;
             }
@@ -772,14 +779,15 @@ impl KeymapState {
         if let Some(action) = last_action {
             let action = action.clone();
             self.pending_keys.clear();
-            self.count = None;
 
-            // Operator prefix: set pending and wait for motion
+            // Operator prefix: set pending and wait for motion. Keep `count` so the
+            // following motion/doubling (e.g. `2dd`, `3dw`) can consume it.
             if let Action::PendingOperator(op) = action {
                 self.pending_operator = Some(op);
                 return PendingResult::NeedMore;
             }
 
+            self.count = None;
             return PendingResult::Action(action, count);
         }
 
