@@ -42,8 +42,8 @@ TASKS:
     ci              Run fmt check, clippy, tests, and deny
     bench           Run benchmarks and print results
     bench --check   Check benchmarks against bench/baseline.json (exit 1 on >5%
-                    regression OR on any measured Phase 3 gate exceeding its budget:
-                    dap_on_keypress_p99_ms<10, git_blame_render_ms<2, theme_switch_ms<5)
+                    regression OR on any measured gate exceeding its budget:
+                    git_blame_render_ms<2, theme_switch_ms<5)
     install         Build release + copy binary to ~/.local/bin and runtime/
                     (themes, queries) to ~/.local/share/onda (idempotent)
     bundle          Build release + assemble dist/ (binary + runtime/) for packaging
@@ -165,8 +165,6 @@ fn extra_gates() -> Vec<BenchResult> {
         budget_ms: Some(budget_ms),
     };
     vec![
-        // DAP attached: keypress → render p99 must stay under the 10ms input budget.
-        gate("dap_on_keypress_p99_ms", 10.0),
         // Git blame annotation render cost for a 500-line file.
         gate("git_blame_render_ms", 2.0),
         // Full-screen re-render on `:theme` switch.

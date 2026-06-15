@@ -53,12 +53,6 @@ pub const COMMAND_NAMES: &[&str] = &[
     "agent",
     "agent-review",
     "agent-export",
-    "DapRun",
-    "DapStop",
-    "DapStack",
-    "DapVars",
-    "DapEval",
-    "DapBreakpoint",
 ];
 
 /// What a `<Tab>` press in the command line should complete.

@@ -61,10 +61,6 @@ enum BgMessage {
     Git(onda_git::GitEvent),
     /// The repo `.git` directory changed on disk (external `git` command, etc.).
     GitRepoChanged,
-    /// Event from the DAP debug adapter.
-    Dap(onda_dap::DapEvent),
-    /// The debug adapter finished launching; carries the client handle.
-    DapClientReady(onda_dap::DapClient),
     /// Event from the ACP agent.
     Agent(onda_agent::AgentEvent),
     /// The agent finished connecting; carries the client handle.
@@ -150,15 +146,6 @@ enum GitPickerAction {
     Stage,
     Unstage,
     Discard,
-}
-
-/// DAP execution-control actions (F5/F10/F11/F12).
-#[derive(Debug, Clone, Copy)]
-enum DapControl {
-    Continue,
-    Next,
-    StepIn,
-    StepOut,
 }
 
 /// Pre-formatted agent-panel render data: (styled lines, input, busy, title).
@@ -325,24 +312,6 @@ struct App<B: Backend> {
     table_docs: HashMap<usize, onda_data::Dialect>,
     /// Cached per-column layout for table docs (computed on `:table` enable).
     table_layout: HashMap<usize, onda_data::ColumnLayout>,
-
-    // ── DAP debugger (W15) ──────────────────────────────────────────────────────
-    /// Configured debug adapters (dap.toml).
-    dap_registry: onda_dap::DapRegistry,
-    /// Active debug session client (None when not debugging).
-    dap_client: Option<onda_dap::DapClient>,
-    /// Breakpoints per absolute file path (1-based lines), with optional condition.
-    breakpoints: HashMap<PathBuf, Vec<(u32, Option<String>)>>,
-    /// Adapter-verified breakpoint lines per path (for the ●/◌ gutter distinction).
-    bp_verified: HashMap<PathBuf, Vec<u32>>,
-    /// Current stop: (path, 1-based line) of the focused frame → `→` gutter marker.
-    dap_stop_line: Option<(PathBuf, u32)>,
-    /// Focused thread id at the current stop.
-    dap_thread: Option<i64>,
-    /// Latest call stack (for `:DapStack`).
-    dap_frames: Vec<onda_dap::StackFrame>,
-    /// Latest variables (for `:DapVars`); flat for v1.
-    dap_vars: Vec<onda_dap::Variable>,
 
     // ── Agent panel (W23) ───────────────────────────────────────────────────────
     /// Configured agents (agents.toml).
@@ -769,277 +738,6 @@ impl<B: Backend> App<B> {
             col: 4,
             row: 2,
         });
-    }
-
-    // ── DAP debugger (W15) ──────────────────────────────────────────────────────
-
-    /// Toggle a breakpoint on the current line (`<F9>`); resend to a live session.
-    fn dap_toggle_breakpoint(&mut self) {
-        let Some(path) = self.doc().path().map(|p| p.to_path_buf()) else {
-            self.message = Message::Error("breakpoints need a saved file".into());
-            return;
-        };
-        let line = (self.doc().char_to_line(self.selection().primary().head) + 1) as u32;
-        let entry = self.breakpoints.entry(path.clone()).or_default();
-        if let Some(pos) = entry.iter().position(|(l, _)| *l == line) {
-            entry.remove(pos);
-            self.message = Message::Info(format!("breakpoint cleared at {line}"));
-        } else {
-            entry.push((line, None));
-            entry.sort_by_key(|(l, _)| *l);
-            self.message = Message::Info(format!("breakpoint set at {line}"));
-        }
-        self.dap_send_breakpoints(&path);
-    }
-
-    /// Send the breakpoints for `path` to the live session, if any.
-    fn dap_send_breakpoints(&self, path: &std::path::Path) {
-        if let Some(client) = self.dap_client.as_ref() {
-            let bps = self
-                .breakpoints
-                .get(path)
-                .map(|v| {
-                    v.iter()
-                        .map(|(l, c)| onda_dap::SourceBreakpoint {
-                            line: *l,
-                            condition: c.clone(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            client.dispatch(onda_dap::DapCommand::SetBreakpoints {
-                path: path.to_path_buf(),
-                breakpoints: bps,
-            });
-        }
-    }
-
-    /// `:DapRun` — launch the adapter for the current file's language.
-    fn dap_run(&mut self) {
-        if self.dap_client.is_some() {
-            self.message = Message::Info("a debug session is already active".into());
-            return;
-        }
-        let Some(path) = self.doc().path().map(|p| p.to_path_buf()) else {
-            self.message = Message::Error("DapRun needs a saved file".into());
-            return;
-        };
-        let lang = self.current_language_name().unwrap_or_default();
-        let cfg = match self
-            .dap_registry
-            .for_language(&lang)
-            .or_else(|| self.dap_registry.by_name("lldb-dap"))
-        {
-            Some(c) => c.clone(),
-            None => {
-                self.message = Message::Error(format!("no debug adapter for '{lang}'"));
-                return;
-            }
-        };
-        // Fill in `program` from the current file if the adapter didn't pin one.
-        let mut launch = cfg.launch.clone();
-        if launch.get("program").is_none() {
-            if let Some(obj) = launch.as_object_mut() {
-                obj.insert(
-                    "program".into(),
-                    serde_json::Value::String(path.to_string_lossy().into_owned()),
-                );
-            }
-        }
-        let adapter_name = cfg.name.clone();
-        let cfg = onda_dap::AdapterConfig { launch, ..cfg };
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let bg_tx = self.bg_tx.clone();
-
-        // events: tokio channel → bridge task → BgMessage::Dap.
-        let (etx, mut erx) = tokio::sync::mpsc::channel::<onda_dap::DapEvent>(256);
-        let bridge_tx = bg_tx.clone();
-        tokio::spawn(async move {
-            while let Some(ev) = erx.recv().await {
-                if bridge_tx.try_send(BgMessage::Dap(ev)).is_err() {
-                    break;
-                }
-            }
-        });
-        // launch task → DapClientReady (or an error event).
-        tokio::spawn(async move {
-            match onda_dap::DapClient::launch(&cfg, cwd, etx).await {
-                Ok(client) => {
-                    let _ = bg_tx.try_send(BgMessage::DapClientReady(client));
-                }
-                Err(e) => {
-                    let _ = bg_tx.try_send(BgMessage::Dap(onda_dap::DapEvent::Error(format!(
-                        "launch failed: {e}"
-                    ))));
-                }
-            }
-        });
-        self.message = Message::Info(format!("DAP: launching {adapter_name}…"));
-    }
-
-    /// Dispatch a control command to the live session for the focused thread.
-    fn dap_control(&mut self, cmd: DapControl) {
-        let Some(client) = self.dap_client.as_ref() else {
-            self.message = Message::Info("no active debug session (:DapRun)".into());
-            return;
-        };
-        let tid = self.dap_thread.unwrap_or(1);
-        let dispatched = match cmd {
-            DapControl::Continue => {
-                client.dispatch(onda_dap::DapCommand::Continue { thread_id: tid })
-            }
-            DapControl::Next => client.dispatch(onda_dap::DapCommand::Next { thread_id: tid }),
-            DapControl::StepIn => client.dispatch(onda_dap::DapCommand::StepIn { thread_id: tid }),
-            DapControl::StepOut => {
-                client.dispatch(onda_dap::DapCommand::StepOut { thread_id: tid })
-            }
-        };
-        if dispatched {
-            // Clear the stop marker until the next stop arrives.
-            self.dap_stop_line = None;
-        }
-    }
-
-    /// Open a float listing the current call stack (`:DapStack`).
-    fn dap_show_stack(&mut self) {
-        if self.dap_frames.is_empty() {
-            self.message = Message::Info("no call stack (not stopped)".into());
-            return;
-        }
-        let mut lines = vec!["Call stack:".to_string()];
-        for (i, f) in self.dap_frames.iter().enumerate() {
-            let loc = f
-                .source
-                .as_ref()
-                .and_then(|s| s.path.as_deref().or(s.name.as_deref()))
-                .map(|p| format!("{p}:{}", f.line))
-                .unwrap_or_else(|| format!("line {}", f.line));
-            lines.push(format!(
-                "  {} {}  ({loc})",
-                if i == 0 { "→" } else { " " },
-                f.name
-            ));
-        }
-        self.hover_float = Some(HoverFloat {
-            lines,
-            col: 4,
-            row: 2,
-        });
-    }
-
-    /// Open a float listing current-frame variables (`:DapVars`).
-    fn dap_show_vars(&mut self) {
-        if self.dap_vars.is_empty() {
-            self.message = Message::Info("no variables (not stopped)".into());
-            return;
-        }
-        let mut lines = vec!["Variables (locals):".to_string()];
-        for v in &self.dap_vars {
-            let ty =
-                v.ty.as_deref()
-                    .map(|t| format!(": {t}"))
-                    .unwrap_or_default();
-            lines.push(format!("  {}{ty} = {}", v.name, v.value));
-        }
-        self.hover_float = Some(HoverFloat {
-            lines,
-            col: 4,
-            row: 2,
-        });
-    }
-
-    /// `:DapEval <expr>` — evaluate in the stopped frame; result shown in a float.
-    fn dap_eval(&mut self, expr: String) {
-        let Some(client) = self.dap_client.as_ref() else {
-            self.message = Message::Info("no active debug session".into());
-            return;
-        };
-        let frame_id = self.dap_frames.first().map(|f| f.id);
-        client.dispatch(onda_dap::DapCommand::Evaluate {
-            expression: expr,
-            frame_id,
-        });
-    }
-
-    fn handle_dap_event(&mut self, ev: onda_dap::DapEvent) {
-        use onda_dap::DapEvent;
-        match ev {
-            DapEvent::Stopped { thread_id, reason } => {
-                self.dap_thread = thread_id;
-                self.message = Message::Info(format!("DAP: stopped ({reason})"));
-                // Pull the call stack for the focused thread → drives the stop marker.
-                if let Some(client) = self.dap_client.as_ref() {
-                    client.dispatch(onda_dap::DapCommand::StackTrace {
-                        thread_id: thread_id.unwrap_or(1),
-                    });
-                }
-            }
-            DapEvent::StackTrace(frames) => {
-                if let Some(top) = frames.first() {
-                    if let Some(p) = top.source.as_ref().and_then(|s| s.path.clone()) {
-                        self.dap_stop_line = Some((PathBuf::from(p), top.line));
-                    }
-                    // Auto-fetch scopes → variables for the top frame.
-                    if let Some(client) = self.dap_client.as_ref() {
-                        client.dispatch(onda_dap::DapCommand::Scopes { frame_id: top.id });
-                    }
-                }
-                self.dap_frames = frames;
-            }
-            DapEvent::Scopes(scopes) => {
-                if let (Some(client), Some(first)) = (self.dap_client.as_ref(), scopes.first()) {
-                    client.dispatch(onda_dap::DapCommand::Variables {
-                        variables_reference: first.variables_reference,
-                    });
-                }
-            }
-            DapEvent::Variables(vars) => {
-                self.dap_vars = vars;
-            }
-            DapEvent::BreakpointsSet(bps) => {
-                // Record verified lines for the gutter (keyed by the focused doc path).
-                if let Some(path) = self.doc().path().map(|p| p.to_path_buf()) {
-                    let verified: Vec<u32> = bps
-                        .iter()
-                        .filter(|b| b.verified)
-                        .filter_map(|b| b.line)
-                        .collect();
-                    self.bp_verified.insert(path, verified);
-                }
-            }
-            DapEvent::Continued => {
-                self.dap_stop_line = None;
-                self.dap_frames.clear();
-                self.dap_vars.clear();
-            }
-            DapEvent::Evaluated { result } => {
-                self.hover_float = Some(HoverFloat {
-                    lines: vec!["eval:".into(), result],
-                    col: 4,
-                    row: 2,
-                });
-            }
-            DapEvent::Output { category, text } => {
-                self.message_history
-                    .push(format!("[dap:{category}] {}", text.trim_end()));
-            }
-            DapEvent::Exited { code } => {
-                self.message = Message::Info(format!("DAP: program exited ({code})"));
-            }
-            DapEvent::Terminated => {
-                self.dap_client = None;
-                self.dap_stop_line = None;
-                self.dap_frames.clear();
-                self.dap_vars.clear();
-                self.dap_thread = None;
-                self.message = Message::Info("DAP: session ended".into());
-            }
-            DapEvent::Error(msg) => {
-                self.message = Message::Error(format!("dap: {msg}"));
-            }
-            // AdapterReady/ConfigReady/Threads/Malformed: handshake/internal — ignored.
-            _ => {}
-        }
     }
 
     // ── Agent panel (W23) ───────────────────────────────────────────────────────
@@ -2150,20 +1848,6 @@ impl<B: Backend> App<B> {
                         draw_plugin_virt_text(grid, rect, viewport, doc, &batch.virt_texts);
                     }
                 }
-
-                // Debugger gutter markers (breakpoints ●/◌, stop →) take precedence.
-                if let Some(path) = self.docs[doc_idx].path() {
-                    let bps = self.breakpoints.get(path);
-                    let verified = self.bp_verified.get(path);
-                    let stop = self
-                        .dap_stop_line
-                        .as_ref()
-                        .filter(|(p, _)| p.as_path() == path)
-                        .map(|(_, l)| *l);
-                    if bps.is_some() || stop.is_some() {
-                        draw_dap_markers(grid, rect, viewport, bps, verified, stop, theme);
-                    }
-                }
             }
 
             // Statusline
@@ -3005,19 +2689,6 @@ impl<B: Backend> App<B> {
             ExCommand::Agent(name) => self.agent_command(name),
             ExCommand::AgentExport => self.agent_export(),
             ExCommand::AgentReview => self.agent_review_start(),
-            ExCommand::DapRun => self.dap_run(),
-            ExCommand::DapStop => {
-                if let Some(client) = self.dap_client.as_ref() {
-                    client.dispatch(onda_dap::DapCommand::Disconnect);
-                }
-                self.dap_client = None;
-                self.dap_stop_line = None;
-                self.message = Message::Info("DAP: stopped".into());
-            }
-            ExCommand::DapStack => self.dap_show_stack(),
-            ExCommand::DapVars => self.dap_show_vars(),
-            ExCommand::DapEval(expr) => self.dap_eval(expr),
-            ExCommand::DapBreakpoint => self.dap_toggle_breakpoint(),
             ExCommand::SessionSave(name) => {
                 let session = self.build_session();
                 let name = name.as_deref().unwrap_or("default");
@@ -3240,31 +2911,6 @@ impl<B: Backend> App<B> {
     }
 
     fn handle_normal_key(&mut self, key: Key) -> Result<()> {
-        // Debugger function keys (W15): F9 toggles a breakpoint; F5/F10/F11/F12 control.
-        match key {
-            Key::F(9) => {
-                self.dap_toggle_breakpoint();
-                return Ok(());
-            }
-            Key::F(5) => {
-                self.dap_control(DapControl::Continue);
-                return Ok(());
-            }
-            Key::F(10) => {
-                self.dap_control(DapControl::Next);
-                return Ok(());
-            }
-            Key::F(11) => {
-                self.dap_control(DapControl::StepIn);
-                return Ok(());
-            }
-            Key::F(12) => {
-                self.dap_control(DapControl::StepOut);
-                return Ok(());
-            }
-            _ => {}
-        }
-
         let viewport_height = {
             let (_, h) = self.backend.size();
             h.saturating_sub(2) as usize
@@ -4439,16 +4085,6 @@ impl<B: Backend> App<B> {
                 BgMessage::ThemeReload => {
                     self.reload_theme_file();
                 }
-                BgMessage::Dap(ev) => self.handle_dap_event(ev),
-                BgMessage::DapClientReady(client) => {
-                    self.dap_client = Some(client);
-                    // Flush all breakpoints to the freshly-launched session.
-                    let paths: Vec<PathBuf> = self.breakpoints.keys().cloned().collect();
-                    for p in paths {
-                        self.dap_send_breakpoints(&p);
-                    }
-                    self.message = Message::Info("DAP: session started".into());
-                }
                 BgMessage::Agent(ev) => self.handle_agent_event(ev),
                 BgMessage::AgentClientReady(client) => {
                     self.agent_client = Some(client);
@@ -4751,75 +4387,6 @@ impl<B: Backend> App<B> {
     }
 }
 
-// ── DAP config ───────────────────────────────────────────────────────────────
-
-#[derive(serde::Deserialize)]
-struct DapFile {
-    #[serde(default)]
-    adapter: Vec<DapAdapterToml>,
-}
-
-#[derive(serde::Deserialize)]
-struct DapAdapterToml {
-    name: String,
-    command: String,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    languages: Vec<String>,
-    #[serde(default)]
-    env: Vec<(String, String)>,
-    #[serde(default)]
-    launch: Option<toml::Value>,
-}
-
-/// Load debug adapters from `~/.config/onda/dap.toml`, falling back to built-in
-/// defaults for `lldb-dap` (rust/c/cpp) and `debugpy` (python).
-fn load_dap_registry() -> onda_dap::DapRegistry {
-    let mut reg = onda_dap::DapRegistry::new();
-    // Built-in defaults.
-    reg.add(onda_dap::AdapterConfig {
-        name: "lldb-dap".into(),
-        command: "lldb-dap".into(),
-        args: vec![],
-        env: vec![],
-        languages: vec!["rust".into(), "c".into(), "cpp".into()],
-        launch: serde_json::json!({ "request": "launch", "stopOnEntry": false }),
-    });
-    reg.add(onda_dap::AdapterConfig {
-        name: "debugpy".into(),
-        command: "python".into(),
-        args: vec!["-m".into(), "debugpy.adapter".into()],
-        env: vec![],
-        languages: vec!["python".into()],
-        launch: serde_json::json!({ "type": "python", "request": "launch" }),
-    });
-
-    if let Ok(home) = std::env::var("HOME") {
-        let path = PathBuf::from(home).join(".config/onda/dap.toml");
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(file) = toml::from_str::<DapFile>(&text) {
-                for a in file.adapter {
-                    let launch = a
-                        .launch
-                        .as_ref()
-                        .and_then(|v| serde_json::to_value(v).ok())
-                        .unwrap_or(serde_json::Value::Null);
-                    reg.add(onda_dap::AdapterConfig {
-                        name: a.name,
-                        command: a.command,
-                        args: a.args,
-                        env: a.env,
-                        languages: a.languages,
-                        launch,
-                    });
-                }
-            }
-        }
-    }
-    reg
-}
-
 // ── Agent config ─────────────────────────────────────────────────────────────
 
 #[derive(serde::Deserialize)]
@@ -5020,14 +4587,6 @@ fn make_app<B: Backend>(
         config,
         table_docs: HashMap::new(),
         table_layout: HashMap::new(),
-        dap_registry: load_dap_registry(),
-        dap_client: None,
-        breakpoints: HashMap::new(),
-        bp_verified: HashMap::new(),
-        dap_stop_line: None,
-        dap_thread: None,
-        dap_frames: Vec::new(),
-        dap_vars: Vec::new(),
         agent_registry: load_agent_registry(),
         agent_client: None,
         agent_name: None,
@@ -5233,37 +4792,6 @@ fn draw_review_overlay(
             *style
         };
         grid.write_str(x + 2, row, &clipped, st);
-    }
-}
-
-/// Overlay debugger gutter markers: `●` verified / `◌` pending breakpoints, and `→`
-/// for the stopped frame line. Drawn over git signs (debugger state wins).
-#[allow(clippy::too_many_arguments)]
-fn draw_dap_markers(
-    grid: &mut onda_render::Grid,
-    rect: &Rect,
-    viewport: &Viewport,
-    breakpoints: Option<&Vec<(u32, Option<String>)>>,
-    verified: Option<&Vec<u32>>,
-    stop_line: Option<u32>,
-    theme: &onda_render::Theme,
-) {
-    use onda_render::{Cell, Color, Style};
-    let bp_style = Style::default().fg(Color::Red);
-    let stop_style = theme.line_nr_current().fg(Color::Cyan);
-    for screen_row in 0..rect.height {
-        let doc_line = viewport.offset_line + screen_row as usize;
-        let line1 = (doc_line + 1) as u32;
-        let row = rect.y + screen_row;
-        if stop_line == Some(line1) {
-            grid.set(rect.x, row, Cell::new("→", stop_style));
-        } else if let Some(bps) = breakpoints {
-            if bps.iter().any(|(l, _)| *l == line1) {
-                let is_verified = verified.map(|v| v.contains(&line1)).unwrap_or(false);
-                let glyph = if is_verified { "●" } else { "◌" };
-                grid.set(rect.x, row, Cell::new(glyph, bp_style));
-            }
-        }
     }
 }
 
