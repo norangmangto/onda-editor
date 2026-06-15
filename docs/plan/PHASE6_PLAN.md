@@ -1,13 +1,11 @@
-# onda — Phase 6 Plan: IDE Shell & Croft-Parity (Draft)
+# onda — Phase 6 Plan: IDE Shell & Croft-Parity
 
-**Status:** **DRAFT — needs user approval before starting.** Derived from the Croft /
-Fresh competitive analysis (2026-06-15). Two items (DAP debugger, remote SSH) reverse
-or pull forward previously-deferred decisions and are explicitly gated — see
-*Decisions needed* below.
-**Duration:** ~8 weeks | **Milestone:** onda is a *complete* terminal IDE — file tree,
-command palette, full LSP UX, source-control and previews — without losing vim-first
-speed or the plugin/agent platform.
-**Design doc:** `docs/DESIGN.md` v0.3 | **Agent rules:** `AGENTS.md` | **Prereq:** Phase 5 green
+**Status:** Approved (decisions recorded below, 2026-06-15). Derived from the Croft /
+Fresh competitive analysis.
+**Duration:** ~8 weeks | **Milestone:** **v0.2** — onda is a *complete* terminal IDE:
+file tree, command palette, full LSP UX, source-control, previews, and a debugger —
+without losing vim-first speed or the plugin/agent platform.
+**Design doc:** `docs/DESIGN.md` v0.3 | **Agent rules:** `AGENTS.md` | **Prereq:** Phase 5 green (v0.1)
 
 ## Why this phase
 
@@ -46,7 +44,8 @@ not as hard-wired in-process features. Mouse is supported but never required.
 ```
 T33.0 harness ─► W33 Layout/shell ─► W34 File explorer ─┐
                           └─► W35 Command palette ───────┼─► W37 Plugin UI API ─► W38 SCM ─► W39 Previews
-                          └─► W36 LSP UX ────────────────┘                         W40 Env parity (gated)
+                          └─► W36 LSP UX ────────────────┘
+W40 DAP debugger (core) — independent, can run in parallel
 ```
 
 ---
@@ -111,25 +110,38 @@ T33.0 harness ─► W33 Layout/shell ─► W34 File explorer ─┐
 - **Accept:** open an image and a PDF inline on a supporting terminal; graceful
   degradation verified on a non-graphics terminal.
 
-## W40 — Environment parity (gated, weeks 7–8)
-- **T40.1 (gated)** Remote SSH editing (`russh` + `russh-sftp`) — currently a backlog
-  item; large and needs a live host. Only if approved.
-- **T40.2** Language coverage: decide whether to widen syntax/LSP beyond rust/python
-  (Croft does py/rust/c/c++); add grammars + servers per the matrix.
-- **Accept:** (if approved) edit a file over `scp://`; (always) the language matrix is
-  explicit and documented.
+## W40 — DAP debugger (core, weeks 1–3, parallel)
+Restores the debugger as a **core feature crate** (`onda-dap`), the same architectural
+tier as LSP (DESIGN §1.3 lists LSP in core; DAP is structurally identical — external
+adapter process + Content-Length framed protocol + deep editor integration). A WASM
+plugin can't own the adapter subprocess under the sandbox, so the engine belongs in the
+host; see the decision rationale recorded below.
 
-## Decisions needed before starting (do not enact silently)
+- **T40.1** Restore `onda-dap` (protocol/transport/session/client + `onda-mock-dap`) and
+  wire it: `<F9>` breakpoints + gutter markers, `:DapRun`/`:DapStop`, F5/F10/F11/F12
+  step control, stop-line marker, `:DapStack`/`:DapVars`/`:DapEval`, `dap.toml` config.
+- **T40.2** Adapters documented: `lldb-dap` (rust/c/cpp), `debugpy` (python). Conformance
+  via `onda-mock-dap` in CI; real adapters are manual targets.
+- **T40.3 (hybrid extension)** Expose debug **state/events read-only** to plugins via the
+  W37 host API later, so custom debug UIs are possible without putting the protocol in
+  the sandbox. (Engine = core, surface = extensible.)
+- **Accept:** mock-adapter E2E green; breakpoints/stepping/stack/vars/eval work; the
+  `dap_on_keypress_p99_ms < 10` gate holds while a session is attached.
 
-These touch earlier product decisions; they need the user's explicit go-ahead:
+## Decisions (recorded 2026-06-15)
 
-1. **DAP debugger** — deliberately removed this session (reclassified to post-v0.1
-   backlog), but it is one of Croft's headline features. Options: (a) keep deferred,
-   (b) bring back as a **plugin** over a host debug API (preferred — fits ADR-002),
-   (c) re-add to the core. Not scheduled above until decided.
-2. **Remote SSH (W40.1)** — was Phase 3 backlog; large. Confirm before scheduling.
-3. **Language expansion (W40.2)** — Phase 1 narrowed to rust/python on purpose.
-4. **Scope vs v0.1** — this phase is post-v0.1 (Phase 5 ships v0.1); confirm sequencing.
+1. **DAP debugger → CORE.** Implemented as a feature crate alongside LSP (W40). Rationale:
+   the adapter subprocess + transport must live host-side regardless (the WASM sandbox
+   denies process spawning), so a plugin would only add a churny WIT surface on top of a
+   host engine — strictly more work for little isolation benefit, and DAP is structurally
+   the LSP twin (which is already core). Plugins may later consume debug state read-only
+   (T40.3).
+2. **Remote SSH → deferred to Phase 7.** Large, needs a live host.
+3. **Language expansion (beyond rust/python) → deferred to Phase 7.**
+4. **Sequencing:** this phase is **v0.2**, after Phase 5 ships v0.1.
+
+> **Phase 7 (later):** remote SSH editing (`russh`/`russh-sftp`), language coverage
+> expansion (c/c++/typescript/… grammars + servers).
 
 ## Phase 6 risks
 
