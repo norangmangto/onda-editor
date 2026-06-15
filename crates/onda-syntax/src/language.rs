@@ -153,3 +153,81 @@ fn parse_shebang(line: &str) -> Option<&str> {
     // Take the basename of the path.
     exe.rsplit('/').next()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_has_four_builtin_languages() {
+        let r = LanguageRegistry::new();
+        for (name, ext) in [
+            ("rust", "rs"),
+            ("python", "py"),
+            ("json", "json"),
+            ("toml", "toml"),
+        ] {
+            assert_eq!(r.by_extension(ext).map(|c| c.name.as_str()), Some(name));
+        }
+    }
+
+    #[test]
+    fn detect_by_extension() {
+        let r = LanguageRegistry::new();
+        assert_eq!(
+            r.detect("src/main.rs", None).map(|c| c.name.as_str()),
+            Some("rust")
+        );
+        assert_eq!(
+            r.detect("a/b/config.toml", None).map(|c| c.name.as_str()),
+            Some("toml")
+        );
+        assert_eq!(
+            r.detect("data.jsonc", None).map(|c| c.name.as_str()),
+            Some("json")
+        );
+    }
+
+    #[test]
+    fn detect_unknown_extension_is_none() {
+        let r = LanguageRegistry::new();
+        assert!(r.detect("notes.xyz", None).is_none());
+        assert!(r.detect("Makefile", None).is_none());
+    }
+
+    #[test]
+    fn detect_by_shebang_when_no_extension() {
+        let r = LanguageRegistry::new();
+        let got = r.detect("script", Some("#!/usr/bin/env python3"));
+        assert_eq!(got.map(|c| c.name.as_str()), Some("python"));
+        let got = r.detect("script", Some("#!/usr/bin/python"));
+        assert_eq!(got.map(|c| c.name.as_str()), Some("python"));
+    }
+
+    #[test]
+    fn extension_takes_priority_over_shebang() {
+        let r = LanguageRegistry::new();
+        // .rs extension wins even though the shebang says python.
+        let got = r.detect("weird.rs", Some("#!/usr/bin/env python3"));
+        assert_eq!(got.map(|c| c.name.as_str()), Some("rust"));
+    }
+
+    #[test]
+    fn parse_shebang_variants() {
+        assert_eq!(parse_shebang("#!/usr/bin/env python3"), Some("python3"));
+        assert_eq!(parse_shebang("#!/usr/bin/python"), Some("python"));
+        assert_eq!(parse_shebang("#!/bin/bash"), Some("bash"));
+        assert_eq!(parse_shebang("not a shebang"), None);
+        assert_eq!(parse_shebang("#!"), None);
+    }
+
+    #[test]
+    fn language_config_carries_comment_and_indent() {
+        let r = LanguageRegistry::new();
+        let rust = r.by_name("rust").unwrap();
+        assert_eq!(rust.comment_token, "//");
+        assert_eq!(rust.indent_width, 4);
+        let json = r.by_name("json").unwrap();
+        assert_eq!(json.indent_width, 2);
+    }
+}

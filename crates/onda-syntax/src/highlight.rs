@@ -268,3 +268,74 @@ pub fn parse_highlights(rope: &Rope, language_name: &str, version: u64) -> Optio
 
     Some(Highlights { spans, version })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hl() -> Highlights {
+        Highlights {
+            spans: vec![
+                Span {
+                    start: 0,
+                    end: 2,
+                    scope: Scope::Keyword,
+                },
+                Span {
+                    start: 3,
+                    end: 7,
+                    scope: Scope::Function,
+                },
+            ],
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn scope_at_finds_containing_span() {
+        let h = hl();
+        assert_eq!(h.scope_at(0), Some(Scope::Keyword));
+        assert_eq!(h.scope_at(1), Some(Scope::Keyword));
+        assert_eq!(h.scope_at(2), None); // end is exclusive
+        assert_eq!(h.scope_at(3), Some(Scope::Function));
+        assert_eq!(h.scope_at(100), None);
+    }
+
+    #[test]
+    fn spans_in_range_overlap() {
+        let h = hl();
+        let got: Vec<_> = h.spans_in_range(1, 4).map(|s| s.scope).collect();
+        assert_eq!(got, vec![Scope::Keyword, Scope::Function]);
+        let only_fn: Vec<_> = h.spans_in_range(5, 9).map(|s| s.scope).collect();
+        assert_eq!(only_fn, vec![Scope::Function]);
+        let none: Vec<_> = h.spans_in_range(2, 3).map(|s| s.scope).collect();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn ts_language_available_for_bundled_only() {
+        assert!(ts_language("rust").is_some());
+        assert!(ts_language("python").is_some());
+        assert!(ts_language("json").is_some());
+        assert!(ts_language("toml").is_none()); // no bundled grammar
+        assert!(ts_language("go").is_none());
+        assert!(ts_language("nonsense").is_none());
+    }
+
+    #[test]
+    fn rust_scope_mapping() {
+        assert_eq!(rust_scope("fn"), Some(Scope::Keyword));
+        assert_eq!(rust_scope("string_literal"), Some(Scope::String));
+        assert_eq!(rust_scope("integer_literal"), Some(Scope::Number));
+        assert_eq!(rust_scope("line_comment"), Some(Scope::Comment));
+        assert_eq!(rust_scope("type_identifier"), Some(Scope::Type));
+        assert_eq!(rust_scope("ERROR"), Some(Scope::Error));
+        assert_eq!(rust_scope("some_unmapped_kind"), None);
+    }
+
+    #[test]
+    fn python_scope_mapping() {
+        assert_eq!(python_scope("def"), Some(Scope::Keyword));
+        assert_eq!(python_scope("return"), Some(Scope::Keyword));
+    }
+}

@@ -205,4 +205,98 @@ mod tests {
         assert!(g.fs_roots().is_empty());
         assert!(!g.network());
     }
+
+    #[test]
+    fn read_buffer_grant_is_not_write() {
+        let p = perms(
+            r#"
+            [plugin]
+            name="p"
+            version="0.1.0"
+            entry="p.wasm"
+            [permissions]
+            buffer="read"
+            "#,
+        );
+        let g = GrantedCaps::resolve(&p, Path::new("/proj"), |_| true);
+        assert!(g.can_read_buffer());
+        assert!(!g.can_write_buffer());
+    }
+
+    #[test]
+    fn unapproved_buffer_is_not_granted() {
+        let p = perms(
+            r#"
+            [plugin]
+            name="p"
+            version="0.1.0"
+            entry="p.wasm"
+            [permissions]
+            buffer="write"
+            "#,
+        );
+        // User denies everything.
+        let g = GrantedCaps::resolve(&p, Path::new("/proj"), |_| false);
+        assert!(!g.can_read_buffer());
+        assert!(!g.can_write_buffer());
+    }
+
+    #[test]
+    fn individual_fs_path_can_be_denied() {
+        let p = perms(
+            r#"
+            [plugin]
+            name="p"
+            version="0.1.0"
+            entry="p.wasm"
+            [permissions]
+            filesystem = ["./.git", "src"]
+            "#,
+        );
+        // Approve only the `src` preopen, deny `.git`.
+        let g = GrantedCaps::resolve(&p, Path::new("/proj"), |cap| match cap {
+            Capability::Fs(path) => path.ends_with("src"),
+            _ => true,
+        });
+        assert!(g.fs_allows(Path::new("/proj/src/main.rs")));
+        assert!(!g.fs_allows(Path::new("/proj/.git/HEAD")));
+    }
+
+    #[test]
+    fn absolute_path_outside_root_is_dropped() {
+        // Absolute path not under root → resolve_within returns None → never granted.
+        assert_eq!(resolve_within(Path::new("/proj"), "/etc/passwd"), None);
+        // Absolute path already under root is accepted.
+        assert_eq!(
+            resolve_within(Path::new("/proj"), "/proj/src"),
+            Some(PathBuf::from("/proj/src"))
+        );
+    }
+
+    #[test]
+    fn network_granted_only_when_requested_and_approved() {
+        let with_net = perms(
+            r#"
+            [plugin]
+            name="p"
+            version="0.1.0"
+            entry="p.wasm"
+            [permissions]
+            network=true
+            "#,
+        );
+        assert!(GrantedCaps::resolve(&with_net, Path::new("/p"), |_| true).network());
+        assert!(!GrantedCaps::resolve(&with_net, Path::new("/p"), |_| false).network());
+
+        let no_net = perms(
+            r#"
+            [plugin]
+            name="p"
+            version="0.1.0"
+            entry="p.wasm"
+            "#,
+        );
+        // Not requested → never granted even if approve says yes.
+        assert!(!GrantedCaps::resolve(&no_net, Path::new("/p"), |_| true).network());
+    }
 }

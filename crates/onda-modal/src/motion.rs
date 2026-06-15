@@ -510,4 +510,57 @@ mod tests {
         let result = Motion::WordForward.apply(&r, pt(0), 3, None, 10);
         assert_eq!(result.0.head, 6); // "d"
     }
+
+    #[test]
+    fn is_inclusive_classification() {
+        // Inclusive: the target char is part of an operator span.
+        for m in [
+            Motion::WordEnd,
+            Motion::BigWordEnd,
+            Motion::LineEnd,
+            Motion::FindChar('x'),
+            Motion::TillChar('x'),
+        ] {
+            assert!(m.is_inclusive(), "{m:?} should be inclusive");
+        }
+        // Exclusive: target char is not deleted by an operator.
+        for m in [
+            Motion::Left,
+            Motion::Right,
+            Motion::WordForward,
+            Motion::WordBackward,
+            Motion::BigWordForward,
+            Motion::LineStart,
+            Motion::LineFirstNonBlank,
+            Motion::FindCharBack('x'),
+            Motion::TillCharBack('x'),
+            Motion::ParagraphForward,
+        ] {
+            assert!(!m.is_inclusive(), "{m:?} should be exclusive");
+        }
+    }
+
+    #[test]
+    fn word_end_lands_on_last_char() {
+        let r = rope("foo bar");
+        // `e` from start of "foo" → last char 'o' (index 2), inclusive.
+        let result = Motion::WordEnd.apply(&r, pt(0), 1, None, 10);
+        assert_eq!(result.0.head, 2);
+    }
+
+    #[test]
+    fn line_start_and_end() {
+        let r = rope("  hello\n");
+        assert_eq!(Motion::LineStart.apply(&r, pt(5), 1, None, 10).0.head, 0);
+        // `$` → last non-newline char.
+        assert_eq!(Motion::LineEnd.apply(&r, pt(0), 1, None, 10).0.head, 6);
+        // `^` → first non-blank.
+        assert_eq!(
+            Motion::LineFirstNonBlank
+                .apply(&r, pt(6), 1, None, 10)
+                .0
+                .head,
+            2
+        );
+    }
 }
