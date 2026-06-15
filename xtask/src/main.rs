@@ -43,7 +43,7 @@ TASKS:
     bench           Run benchmarks and print results
     bench --check   Check benchmarks against bench/baseline.json (exit 1 on >5%
                     regression OR on any measured gate exceeding its budget:
-                    theme_switch_ms<5)
+                    dap_on_keypress_p99_ms<10, theme_switch_ms<5)
     install         Build release + copy binary to ~/.local/bin and runtime/
                     (themes, queries) to ~/.local/share/onda (idempotent)
     bundle          Build release + assemble dist/ (binary + runtime/) for packaging
@@ -165,6 +165,8 @@ fn extra_gates() -> Vec<BenchResult> {
         budget_ms: Some(budget_ms),
     };
     vec![
+        // DAP attached: keypress → render p99 must stay under the 10ms input budget.
+        gate("dap_on_keypress_p99_ms", 10.0),
         // Full-screen re-render on `:theme` switch.
         gate("theme_switch_ms", 5.0),
         // Phase 4 (ACP agent): coalesced agent-panel stream re-render per frame

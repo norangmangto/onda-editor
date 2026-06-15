@@ -1,0 +1,26 @@
+# Example onda debug-adapter config. Copy to ~/.config/onda/dap.toml and edit.
+#
+# onda ships built-in defaults for `lldb-dap` (rust/c/cpp) and `debugpy` (python);
+# entries here override or add to them by `name`. `[adapter.launch]` is passed
+# verbatim as the DAP `launch` request arguments. If you omit `program`, onda fills
+# it with the current file's path (works for debugpy; for compiled languages set the
+# built binary explicitly, as below).
+
+[[adapter]]
+name = "lldb-dap"
+command = "lldb-dap"          # ships with LLVM; `xcrun -f lldb-dap` on macOS
+languages = ["rust", "c", "cpp"]
+[adapter.launch]
+request = "launch"
+program = "${workspaceFolder}/target/debug/my-bin"   # ← set to your built binary
+stopOnEntry = false
+
+[[adapter]]
+name = "debugpy"
+command = "python"
+args = ["-m", "debugpy.adapter"]   # pip install debugpy
+languages = ["python"]
+[adapter.launch]
+type = "python"
+request = "launch"
+# program is filled from the current file automatically.

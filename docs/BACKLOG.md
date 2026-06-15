@@ -8,9 +8,10 @@ The codebase was realigned to the approved plans (PHASE0–5 + DESIGN v0.3 + AGE
 Where older sections below still describe removed features as "done", **this section
 wins**:
 
-- **DAP debugger (`onda-dap`) — removed.** Reclassified to the post-v0.1 / Phase 6+
-  backlog. Crate, editor wiring, `dap.toml`, `docs/DAP.md`, and the dap bench gate are
-  gone.
+- **DAP debugger (`onda-dap`) — removed for v0.1, restored for v0.2.** It was cut from
+  the v0.1 scope, then reinstated as a **core feature crate** in Phase 6 (W40) after the
+  Croft benchmarking — the LSP twin (external adapter + framed protocol + editor
+  integration). Crate, wiring, `dap.toml`, `docs/DAP.md`, and the dap bench gate are back.
 - **Built-in git (`onda-git`) — removed from core.** Returns in Phase 3 as the
   `git-blame-inline` WASM reference plugin (ADR-002). diff/blame logic salvaged to
   `docs/SALVAGE/onda-git/`. `git2` remains only for `onda plugin install` (repo clone).

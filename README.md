@@ -25,6 +25,7 @@ even with IDE features turned on.
   activation and per-call time budgets keep them off the hot path.
 - **AI agent panel (ACP)** — chat, streaming responses, `@`-mentions, a permission
   gate, and hunk-level review of agent-proposed edits.
+- **Debugger (DAP)** — breakpoints, stepping, call stack & variables (lldb-dap, debugpy).
 - **Data-file superpowers** — CSV/TSV virtual **table** view and a JSONL **field**
   schema overlay.
 - **Performance budgets enforced in CI** — see [`BENCH_REPORT.md`](BENCH_REPORT.md)
@@ -124,6 +125,19 @@ In the input box, attach context with `@file:…`, `@selection`, `@buffer:…`,
 | `:table` | toggle the CSV/TSV aligned virtual-table view |
 | `:fields` | show the JSONL field schema (keys, counts, types) |
 
+### Debugger (DAP)
+Needs a debug adapter on `PATH` (`lldb-dap` for Rust/C/C++, `debugpy` for Python).
+
+| Command / key | Action |
+|---|---|
+| `<F9>` / `:DapBreakpoint` | toggle a breakpoint (gutter `●`/`◌`, `→` at a stop) |
+| `:DapRun` / `:DapStop` | start / end a session |
+| `<F5>` `<F10>` `<F11>` `<F12>` | continue · step over · step in · step out |
+| `:DapStack` `:DapVars` `:DapEval <expr>` | call stack · variables · evaluate |
+
+Configure adapters in `~/.config/onda/dap.toml` (template: [`runtime/dap.toml`](runtime/dap.toml));
+full guide in [`docs/DAP.md`](docs/DAP.md).
+
 ### Other
 | Command | Action |
 |---|---|
@@ -145,8 +159,8 @@ mouse = true
 persistent_undo = false   # opt-in: restore undo history across sessions
 ```
 
-Other config files under `~/.config/onda/`: `themes/<name>.toml`, `agents.toml`, and
-the plugin lockfile `plugins.lock`. Plugins are WASM components managed by
+Other config files under `~/.config/onda/`: `themes/<name>.toml`, `agents.toml`,
+`dap.toml`, and the plugin lockfile `plugins.lock`. Plugins are WASM components managed by
 `onda plugin …` (API: [`wit/onda/`](wit/onda), guide:
 [`docs/plugin-book/`](docs/plugin-book)).
 
@@ -161,7 +175,7 @@ cargo run -p xtask -- bench    # performance gates (see BENCH_REPORT.md)
 
 The workspace is split into focused crates (`onda-core`, `onda-modal`, `onda-render`,
 `onda-syntax`, `onda-lsp`, `onda-terminal`, `onda-session`, `onda-plugin`,
-`onda-agent`, `onda-data`, and the `onda` binary). Architecture and the
+`onda-agent`, `onda-data`, `onda-dap`, and the `onda` binary). Architecture and the
 performance rules live in [`docs/DESIGN.md`](docs/DESIGN.md) and `AGENTS.md` — please
 read `AGENTS.md` before contributing (the gates apply to human and agent PRs alike).
 
@@ -169,14 +183,19 @@ read `AGENTS.md` before contributing (the gates apply to human and agent PRs ali
 
 Working: modal editing, syntax highlighting + text objects (Rust, Python), LSP,
 terminal, sessions, persistent undo, themes, command-line completion, the WASM plugin
-system, the agent panel + diff review, CSV/JSONL views, and `onda doctor`.
+system, the agent panel + diff review, CSV/JSONL views, the DAP debugger, and
+`onda doctor`.
+
+In progress (Phase 6 / v0.2, see [`docs/plan/PHASE6_PLAN.md`](docs/plan/PHASE6_PLAN.md)):
+the IDE shell — file-explorer sidebar, command palette, multi-pane layout, full LSP UX,
+source-control surface, and rich previews.
 
 Not yet done (tracked in [`docs/BACKLOG.md`](docs/BACKLOG.md)): the Phase 3 reference
 plugins are being finalized (including `git-blame-inline` — git integration now ships
-as a plugin, not built in), remote editing over SSH (`scp://`), the libvterm terminal
-backend, and release packaging (Homebrew, prebuilt binaries, docs site). The agent
-protocol path is covered by a mock agent in CI; driving real `claude-code` needs it
-installed. A debugger (DAP) is deferred to the post-v0.1 backlog.
+as a plugin, not built in), remote editing over SSH (`scp://`, Phase 7), the libvterm
+terminal backend, and release packaging (Homebrew, prebuilt binaries, docs site). The
+agent and debugger protocol paths are covered by mock adapters in CI; driving real
+`claude-code`/`lldb-dap`/`debugpy` needs those tools installed.
 
 ## License
 
