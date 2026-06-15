@@ -57,10 +57,6 @@ enum BgMessage {
     PtyExited {
         pane_id: usize,
     },
-    /// Event from the background git worker.
-    Git(onda_git::GitEvent),
-    /// The repo `.git` directory changed on disk (external `git` command, etc.).
-    GitRepoChanged,
     /// Event from the ACP agent.
     Agent(onda_agent::AgentEvent),
     /// The agent finished connecting; carries the client handle.
@@ -137,15 +133,6 @@ impl WindowState {
 enum PickerKind {
     File,
     Buffer,
-    /// `:GitStatus` listing — `<Enter>` opens, `s` stages, `u` unstages, `dd` discards.
-    Git,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum GitPickerAction {
-    Stage,
-    Unstage,
-    Discard,
 }
 
 /// Pre-formatted agent-panel render data: (styled lines, input, busy, title).
@@ -383,23 +370,8 @@ struct App<B: Backend> {
     /// Plugin decorations to paint: doc index → namespace → batch.
     plugin_decorations: HashMap<usize, HashMap<String, onda_plugin::DecorationBatch>>,
 
-    // ── Git ──────────────────────────────────────────────────────────────────
-    /// Background git worker (lazily spawned on first git use).
-    git_worker: Option<onda_git::GitWorker>,
-    /// Gutter signs per document index.
-    git_signs: HashMap<usize, Vec<(usize, onda_git::LineSign)>>,
-    /// Working directory of the last status listing (to resolve relative paths).
-    git_status_root: Option<PathBuf>,
-    /// Last status listing, used to (re)build the git picker.
-    git_status_entries: Vec<onda_git::FileStatus>,
-    /// `:GitStatus` requested; open the picker when the next Status event arrives.
-    git_open_picker_pending: bool,
-    /// First `d` of a `dd` (discard) chord in the git picker.
-    git_picker_pending_d: bool,
-    /// Last buffer char-length we requested git signs for, per doc (change detector).
-    git_last_len: HashMap<usize, usize>,
-    /// Filesystem watcher on the repo `.git` dir (kept alive; `None` until first use).
-    git_watcher: Option<notify::RecommendedWatcher>,
+    /// Last buffer char-length we reparsed syntax for, per doc (change detector).
+    doc_last_len: HashMap<usize, usize>,
 
     // ── Soft wrap ─────────────────────────────────────────────────────────────
     #[allow(dead_code)]
@@ -587,7 +559,6 @@ impl<B: Backend> App<B> {
             self.syntax_workers[doc_idx] = Some(SyntaxWorker::spawn());
         }
         self.request_syntax_parse_for_doc(doc_idx);
-        self.request_git_signs(doc_idx);
     }
 
     /// Resolve the window's syntax highlights into theme-styled char spans for the
@@ -1428,155 +1399,22 @@ impl<B: Backend> App<B> {
         out
     }
 
-    // ── Git helpers ───────────────────────────────────────────────────────────
+    // ── Decoration refresh ──────────────────────────────────────────────────────
 
-    /// Lazily spawn the background git worker and the std-thread bridge that
-    /// forwards its events onto the main background-message queue.
-    fn ensure_git_worker(&mut self) {
-        if self.git_worker.is_some() {
-            return;
-        }
-        let (gtx, grx) = std::sync::mpsc::channel::<onda_git::GitEvent>();
-        let bg_tx = self.bg_tx.clone();
-        std::thread::Builder::new()
-            .name("onda-git-bridge".into())
-            .spawn(move || {
-                while let Ok(ev) = grx.recv() {
-                    if bg_tx.send(BgMessage::Git(ev)).is_err() {
-                        break;
-                    }
-                }
-            })
-            .ok();
-        self.git_worker = Some(onda_git::GitWorker::spawn(gtx));
-    }
-
-    /// Request a gutter-sign recompute for `doc_idx` (no-op for unsaved buffers).
-    fn request_git_signs(&mut self, doc_idx: usize) {
-        let path = match self.docs.get(doc_idx).and_then(|d| d.path()) {
-            Some(p) => p.to_path_buf(),
-            None => return,
-        };
-        let buffer = self.docs[doc_idx].rope().to_string().into_bytes();
-        self.git_last_len
-            .insert(doc_idx, self.docs[doc_idx].len_chars());
-        self.ensure_git_worker();
-        self.ensure_git_watcher(&path);
-        if let Some(worker) = self.git_worker.as_ref() {
-            worker.compute_signs(doc_idx as u64, path, buffer);
-        }
-    }
-
-    /// Lazily start a filesystem watcher on the repo `.git` directory so external
-    /// `git` changes (commits, checkouts, index writes) refresh signs within ~1s.
-    fn ensure_git_watcher(&mut self, anchor: &std::path::Path) {
-        use notify::Watcher;
-        if self.git_watcher.is_some() {
-            return;
-        }
-        let dot_git = match onda_git::discover(anchor) {
-            Ok(repo) => repo.path().to_path_buf(),
-            Err(_) => return,
-        };
-        let bg_tx = self.bg_tx.clone();
-        // Leading-edge debounce: forward at most one signal per 200ms burst.
-        let last = std::sync::Arc::new(std::sync::Mutex::new(
-            std::time::Instant::now() - Duration::from_secs(1),
-        ));
-        let mut watcher =
-            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                if res.is_ok() {
-                    if let Ok(mut l) = last.lock() {
-                        if l.elapsed() >= Duration::from_millis(200) {
-                            *l = std::time::Instant::now();
-                            let _ = bg_tx.try_send(BgMessage::GitRepoChanged);
-                        }
-                    }
-                }
-            }) {
-                Ok(w) => w,
-                Err(_) => return,
-            };
-        if watcher
-            .watch(&dot_git, notify::RecursiveMode::NonRecursive)
-            .is_ok()
-        {
-            self.git_watcher = Some(watcher);
-        }
-    }
-
-    /// Refresh syntax highlights and git signs for the focused doc when its length
-    /// changed since the last request (cheap per-key change detector). The syntax
-    /// worker debounces and rope clones are O(1)-ish, so this stays off the hot path.
+    /// Reparse syntax for the focused doc when its length changed since the last
+    /// request (cheap per-key change detector). The syntax worker debounces and rope
+    /// clones are O(1)-ish, so this stays off the hot path.
     fn maybe_refresh_decorations(&mut self) {
         let doc_idx = self.focused_win().doc_idx;
         let len = match self.docs.get(doc_idx) {
             Some(d) => d.len_chars(),
             None => return,
         };
-        if self.git_last_len.get(&doc_idx) == Some(&len) {
+        if self.doc_last_len.get(&doc_idx) == Some(&len) {
             return;
         }
-        self.git_last_len.insert(doc_idx, len);
+        self.doc_last_len.insert(doc_idx, len);
         self.request_syntax_parse_for_doc(doc_idx);
-        if self.docs[doc_idx].path().is_some() {
-            self.request_git_signs(doc_idx);
-        }
-    }
-
-    /// Absolute path to use as the repo anchor for git status/stage commands.
-    fn git_anchor_path(&self) -> PathBuf {
-        self.doc()
-            .path()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-    }
-
-    /// Resolve a workdir-relative path from the status listing to an absolute path.
-    fn git_resolve_rel(&self, rel: &str) -> Option<PathBuf> {
-        self.git_status_root.as_ref().map(|root| root.join(rel))
-    }
-
-    /// Apply a stage/unstage/discard action to the currently selected git picker item.
-    fn git_picker_action(&mut self, action: GitPickerAction) {
-        let rel = self
-            .picker
-            .as_ref()
-            .and_then(|p| p.selected_item())
-            .map(|i| i.value.clone());
-        let Some(rel) = rel else { return };
-        let Some(abs) = self.git_resolve_rel(&rel) else {
-            return;
-        };
-        self.ensure_git_worker();
-        if let Some(worker) = self.git_worker.as_ref() {
-            match action {
-                GitPickerAction::Stage => worker.stage(abs),
-                GitPickerAction::Unstage => worker.unstage(abs),
-                GitPickerAction::Discard => worker.discard(abs),
-            }
-        }
-        // The worker re-emits a Status event, which refreshes the open picker.
-    }
-
-    /// (Re)build the git picker from the current status listing.
-    fn rebuild_git_picker(&mut self) {
-        let items: Vec<onda_modal::picker::PickerItem> = self
-            .git_status_entries
-            .iter()
-            .map(|f| {
-                let staged = if f.is_staged() { "*" } else { " " };
-                onda_modal::picker::PickerItem::new(
-                    format!("{}{} {}", f.badge(), staged, f.path),
-                    f.path.clone(),
-                )
-            })
-            .collect();
-        let mut picker =
-            onda_modal::picker::Picker::new("Git Status (s stage · u unstage · dd discard)");
-        picker.open(items);
-        self.picker = Some(picker);
-        self.picker_kind = PickerKind::Git;
     }
 
     // ── Theme helpers (T18.1) ─────────────────────────────────────────────────
@@ -1834,11 +1672,6 @@ impl<B: Backend> App<B> {
                     );
                 }
 
-                // Git gutter signs (overlay in the leftmost gutter column).
-                if let Some(signs) = self.git_signs.get(&doc_idx) {
-                    draw_git_signs(grid, rect, viewport, signs);
-                }
-
                 // Plugin decorations: highlights (cell overlay), gutter signs,
                 // and end-of-line virtual text, per namespace.
                 if let Some(ns_map) = self.plugin_decorations.get(&doc_idx) {
@@ -2008,7 +1841,7 @@ impl<B: Backend> App<B> {
 
                 self.handle_key(key)?;
 
-                // Refresh git gutter signs if the buffer changed this keypress.
+                // Reparse syntax if the buffer changed this keypress.
                 self.maybe_refresh_decorations();
 
                 // Clear info messages on any keypress in normal mode
@@ -2162,10 +1995,6 @@ impl<B: Backend> App<B> {
     }
 
     fn handle_picker_key(&mut self, key: Key) -> Result<()> {
-        // Any key other than a second `d` cancels a pending discard chord.
-        if !matches!(key, Key::Char('d', _)) {
-            self.git_picker_pending_d = false;
-        }
         match &key {
             Key::Esc => {
                 if let Some(ref mut picker) = self.picker {
@@ -2208,42 +2037,7 @@ impl<B: Backend> App<B> {
                                 *self.selection_mut() = Selection::point(0);
                             }
                         }
-                        PickerKind::Git => {
-                            // `value` is the workdir-relative path; resolve and open it.
-                            if let Some(abs) = self.git_resolve_rel(&value) {
-                                match Document::open(&abs) {
-                                    Ok(doc) => {
-                                        let doc_idx = self.docs.len();
-                                        self.docs.push(doc);
-                                        self.focused_win_mut().doc_idx = doc_idx;
-                                        *self.selection_mut() = Selection::point(0);
-                                        self.message = Message::Info(format!("Opened: {value}"));
-                                        self.try_spawn_syntax_worker_for_doc(doc_idx);
-                                    }
-                                    Err(e) => {
-                                        self.message = Message::Error(format!("E: {e}"));
-                                    }
-                                }
-                            }
-                        }
                     }
-                }
-            }
-            // Git picker actions: stage / unstage / discard (dd) the selected file.
-            Key::Char('s', _) if self.picker_kind == PickerKind::Git => {
-                self.git_picker_pending_d = false;
-                self.git_picker_action(GitPickerAction::Stage);
-            }
-            Key::Char('u', _) if self.picker_kind == PickerKind::Git => {
-                self.git_picker_pending_d = false;
-                self.git_picker_action(GitPickerAction::Unstage);
-            }
-            Key::Char('d', _) if self.picker_kind == PickerKind::Git => {
-                if self.git_picker_pending_d {
-                    self.git_picker_pending_d = false;
-                    self.git_picker_action(GitPickerAction::Discard);
-                } else {
-                    self.git_picker_pending_d = true;
                 }
             }
             Key::Down => {
@@ -2576,103 +2370,6 @@ impl<B: Backend> App<B> {
                     .collect();
                 self.message = Message::Info(list.join(" | "));
             }
-            ExCommand::GitStatus => {
-                let anchor = self.git_anchor_path();
-                self.ensure_git_worker();
-                self.git_open_picker_pending = true;
-                if let Some(worker) = self.git_worker.as_ref() {
-                    worker.status(anchor);
-                }
-                self.message = Message::Info("Git: loading status…".into());
-            }
-            ExCommand::GitStage => {
-                if let Some(path) = self.doc().path().map(|p| p.to_path_buf()) {
-                    self.ensure_git_worker();
-                    if let Some(worker) = self.git_worker.as_ref() {
-                        worker.stage(path);
-                    }
-                    self.message = Message::Info("Git: staged current file".into());
-                } else {
-                    self.message = Message::Error("Git: current buffer has no file".into());
-                }
-            }
-            ExCommand::GitUnstage => {
-                if let Some(path) = self.doc().path().map(|p| p.to_path_buf()) {
-                    self.ensure_git_worker();
-                    if let Some(worker) = self.git_worker.as_ref() {
-                        worker.unstage(path);
-                    }
-                    self.message = Message::Info("Git: unstaged current file".into());
-                } else {
-                    self.message = Message::Error("Git: current buffer has no file".into());
-                }
-            }
-            ExCommand::GitDiscard => {
-                if let Some(path) = self.doc().path().map(|p| p.to_path_buf()) {
-                    self.ensure_git_worker();
-                    if let Some(worker) = self.git_worker.as_ref() {
-                        worker.discard(path.clone());
-                    }
-                    // Reload the buffer from disk after discarding (deferred to user reopen);
-                    // signs will refresh on next status. Recompute signs now too.
-                    let doc_idx = self.focused_win().doc_idx;
-                    self.request_git_signs(doc_idx);
-                    self.message = Message::Info("Git: discarded current file changes".into());
-                } else {
-                    self.message = Message::Error("Git: current buffer has no file".into());
-                }
-            }
-            ExCommand::GitDiff => {
-                if let Some(path) = self.doc().path().map(|p| p.to_path_buf()) {
-                    let buffer = self.doc().rope().to_string().into_bytes();
-                    self.ensure_git_worker();
-                    if let Some(worker) = self.git_worker.as_ref() {
-                        worker.diff(path, buffer);
-                    }
-                    self.message = Message::Info("Git: computing diff…".into());
-                } else {
-                    self.message = Message::Error("Git: current buffer has no file".into());
-                }
-            }
-            ExCommand::GitBlame => {
-                if let Some(path) = self.doc().path().map(|p| p.to_path_buf()) {
-                    self.ensure_git_worker();
-                    if let Some(worker) = self.git_worker.as_ref() {
-                        worker.blame(path);
-                    }
-                    self.message = Message::Info("Git: blaming…".into());
-                } else {
-                    self.message = Message::Error("Git: current buffer has no file".into());
-                }
-            }
-            ExCommand::GitStageHunk => {
-                if let Some(path) = self.doc().path().map(|p| p.to_path_buf()) {
-                    let line = self.doc().char_to_line(self.selection().primary().head);
-                    self.ensure_git_worker();
-                    if let Some(worker) = self.git_worker.as_ref() {
-                        worker.stage_hunk(path, line);
-                    }
-                    let doc_idx = self.focused_win().doc_idx;
-                    self.request_git_signs(doc_idx);
-                    self.message = Message::Info(format!("Git: staged hunk at line {}", line + 1));
-                } else {
-                    self.message = Message::Error("Git: current buffer has no file".into());
-                }
-            }
-            ExCommand::GitResetHunk => {
-                if let Some(path) = self.doc().path().map(|p| p.to_path_buf()) {
-                    let line = self.doc().char_to_line(self.selection().primary().head);
-                    self.ensure_git_worker();
-                    if let Some(worker) = self.git_worker.as_ref() {
-                        worker.reset_hunk(path, line);
-                    }
-                    let doc_idx = self.focused_win().doc_idx;
-                    self.request_git_signs(doc_idx);
-                    self.message = Message::Info(format!("Git: reset hunk at line {}", line + 1));
-                } else {
-                    self.message = Message::Error("Git: current buffer has no file".into());
-                }
-            }
             ExCommand::Theme(name) => match name {
                 Some(n) => {
                     self.apply_theme(&n);
@@ -2735,9 +2432,7 @@ impl<B: Backend> App<B> {
                     Ok(()) => {
                         self.doc_mut().mark_saved();
                         self.message = Message::Info(format!("\"{}\" written", self.doc().name()));
-                        // Refresh git gutter signs against the newly-saved content.
                         let doc_idx = self.focused_win().doc_idx;
-                        self.request_git_signs(doc_idx);
                         self.persist_undo_on_save(doc_idx);
                     }
                     Err(e) => {
@@ -4071,17 +3766,6 @@ impl<B: Backend> App<B> {
                         self.mode = Mode::Normal;
                     }
                 }
-                BgMessage::Git(ev) => self.handle_git_event(ev),
-                BgMessage::GitRepoChanged => {
-                    let doc_idx = self.focused_win().doc_idx;
-                    self.request_git_signs(doc_idx);
-                    if self.picker_kind == PickerKind::Git && self.picker.is_some() {
-                        let anchor = self.git_anchor_path();
-                        if let Some(worker) = self.git_worker.as_ref() {
-                            worker.status(anchor);
-                        }
-                    }
-                }
                 BgMessage::ThemeReload => {
                     self.reload_theme_file();
                 }
@@ -4089,81 +3773,6 @@ impl<B: Backend> App<B> {
                 BgMessage::AgentClientReady(client) => {
                     self.agent_client = Some(client);
                 }
-            }
-        }
-    }
-
-    fn handle_git_event(&mut self, ev: onda_git::GitEvent) {
-        match ev {
-            onda_git::GitEvent::Signs { doc_id, signs } => {
-                self.git_signs.insert(doc_id as usize, signs);
-            }
-            onda_git::GitEvent::Status { root, entries } => {
-                self.git_status_root = Some(root);
-                self.git_status_entries = entries;
-                if self.git_open_picker_pending {
-                    self.git_open_picker_pending = false;
-                    self.rebuild_git_picker();
-                } else if self.picker_kind == PickerKind::Git && self.picker.is_some() {
-                    // Refresh an already-open git picker after a stage/unstage/discard.
-                    self.rebuild_git_picker();
-                }
-            }
-            onda_git::GitEvent::Diff { path, hunks } => {
-                if hunks.is_empty() {
-                    self.message = Message::Info("Git: no changes vs HEAD".into());
-                    return;
-                }
-                // Open the unified diff in a scratch buffer.
-                let mut text = format!(
-                    "# git diff (working vs HEAD) — {}\n",
-                    path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
-                );
-                for h in &hunks {
-                    text.push_str(&format!(
-                        "@@ -{},{} +{},{} @@\n",
-                        h.old_start, h.old_lines, h.new_start, h.new_lines
-                    ));
-                    for l in &h.lines {
-                        text.push_str(l);
-                        text.push('\n');
-                    }
-                }
-                let mut doc = Document::new_empty();
-                let cs = onda_core::transaction::ChangeSetBuilder::new(0)
-                    .insert(&text)
-                    .build();
-                let _ = doc.apply(&Transaction::new(cs));
-                let doc_idx = self.docs.len();
-                self.docs.push(doc);
-                self.focused_win_mut().doc_idx = doc_idx;
-                *self.selection_mut() = Selection::point(0);
-                *self.viewport_mut() = Viewport::new();
-                self.message = Message::Info(format!("Git: diff ({} hunks)", hunks.len()));
-            }
-            onda_git::GitEvent::Blame { path, lines } => {
-                let doc_idx = self.focused_win().doc_idx;
-                // Only show if blame is for the focused doc.
-                if self.docs[doc_idx].path() != Some(path.as_path()) {
-                    return;
-                }
-                let cur = self.doc().char_to_line(self.selection().primary().head);
-                if let Some(b) = lines.iter().find(|b| b.line == cur) {
-                    let date = format_unix_date(b.time);
-                    self.hover_float = Some(HoverFloat {
-                        lines: vec![
-                            format!("{} {} {}", b.commit, b.author, date),
-                            b.summary.clone(),
-                        ],
-                        col: 4,
-                        row: 2,
-                    });
-                } else {
-                    self.message = Message::Info("Git: no blame for this line".into());
-                }
-            }
-            onda_git::GitEvent::Error(msg) => {
-                self.message = Message::Error(format!("git: {msg}"));
             }
         }
     }
@@ -4615,14 +4224,7 @@ fn make_app<B: Backend>(
         plugin_host: None,
         plugin_idle_fired: false,
         plugin_decorations: HashMap::new(),
-        git_worker: None,
-        git_signs: HashMap::new(),
-        git_status_root: None,
-        git_status_entries: Vec::new(),
-        git_open_picker_pending: false,
-        git_picker_pending_d: false,
-        git_last_len: HashMap::new(),
-        git_watcher: None,
+        doc_last_len: HashMap::new(),
         soft_wrap: false,
         #[cfg(feature = "bench")]
         tracer: LatencyTracer::default(),
@@ -4792,39 +4394,6 @@ fn draw_review_overlay(
             *style
         };
         grid.write_str(x + 2, row, &clipped, st);
-    }
-}
-
-fn draw_git_signs(
-    grid: &mut onda_render::Grid,
-    rect: &Rect,
-    viewport: &Viewport,
-    signs: &[(usize, onda_git::LineSign)],
-) {
-    use onda_render::{Cell, Color, Style};
-    use std::collections::HashMap;
-
-    if viewport.line_nr_width == 0 {
-        return;
-    }
-    // Index signs by doc line for O(1) lookup per visible row.
-    let by_line: HashMap<usize, onda_git::LineSign> = signs.iter().copied().collect();
-
-    for screen_row in 0..rect.height {
-        let doc_line = viewport.offset_line + screen_row as usize;
-        if let Some(sign) = by_line.get(&doc_line) {
-            let color = match sign {
-                onda_git::LineSign::Added => Color::Green,
-                onda_git::LineSign::Modified => Color::Yellow,
-                onda_git::LineSign::Deleted => Color::Red,
-            };
-            let style = Style::default().fg(color);
-            grid.set(
-                rect.x,
-                rect.y + screen_row,
-                Cell::new(sign.glyph().to_string(), style),
-            );
-        }
     }
 }
 
@@ -5129,24 +4698,6 @@ fn render_table(
         screen_row += 1;
         line += 1;
     }
-}
-
-/// Format a unix timestamp (seconds, UTC) as `YYYY-MM-DD` without a date crate
-/// (Howard Hinnant's days-from-civil, inverted). Used for git blame display.
-fn format_unix_date(secs: i64) -> String {
-    let days = secs.div_euclid(86_400);
-    // days → civil date (UTC), algorithm from chrono-compatible public domain code.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    let year = if m <= 2 { y + 1 } else { y };
-    format!("{year:04}-{m:02}-{d:02}")
 }
 
 /// Hard-wrap `text` into chunks of at most `width` chars (char-based, not word-aware

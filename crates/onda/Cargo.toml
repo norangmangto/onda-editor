@@ -21,7 +21,6 @@ onda-lsp.workspace = true
 onda-terminal.workspace = true
 onda-session.workspace = true
 onda-plugin.workspace = true
-onda-git.workspace = true
 crossterm.workspace = true
 tokio.workspace = true
 tracing.workspace = true

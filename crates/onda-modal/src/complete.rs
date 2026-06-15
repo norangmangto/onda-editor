@@ -37,14 +37,6 @@ pub const COMMAND_NAMES: &[&str] = &[
     "GrammarFetch",
     "ls",
     "buffers",
-    "GitStatus",
-    "GitStage",
-    "GitUnstage",
-    "GitDiscard",
-    "GitDiff",
-    "GitBlame",
-    "GitStageHunk",
-    "GitResetHunk",
     "session save",
     "session restore",
     "theme",
@@ -228,9 +220,9 @@ mod tests {
 
     #[test]
     fn command_completion_prefix() {
-        let got = complete_commands("Git", &[]);
-        assert!(got.iter().any(|c| c == "GitStatus"));
-        assert!(got.iter().any(|c| c == "GitDiff" || c == "GitDiscard"));
+        let got = complete_commands("se", &[]);
+        assert!(got.iter().any(|c| c == "session save"));
+        assert!(got.iter().any(|c| c == "set"));
         // Non-matching commands are excluded.
         assert!(!got.iter().any(|c| c == "quit"));
     }
@@ -244,10 +236,10 @@ mod tests {
 
     #[test]
     fn analyze_bare_command() {
-        let c = analyze("Gi", &[]);
+        let c = analyze("ag", &[]);
         match c {
             Completion::Commands { candidates, .. } => {
-                assert!(candidates.iter().any(|c| c == "GitStatus"));
+                assert!(candidates.iter().any(|c| c == "agent"));
             }
             other => panic!("expected Commands, got {other:?}"),
         }

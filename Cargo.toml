@@ -10,7 +10,6 @@ members = [
     "crates/onda-terminal",
     "crates/onda-session",
     "crates/onda-plugin",
-    "crates/onda-git",
     "crates/onda-agent",
     "crates/onda-data",
     "xtask",
@@ -85,6 +84,11 @@ notify = "6"
 # Gitignore-aware directory traversal
 ignore = "0.4"
 
+# libgit2 bindings — used only by onda-plugin to clone plugin source repos for
+# `onda plugin install github:<user>/<repo>` (Phase 3 T19.1). NOT editor git
+# integration (that returns as the git-blame-inline WASM plugin in Phase 3).
+git2 = { version = "0.19", default-features = false }
+
 # LSP types
 lsp-types = "0.97"
 
@@ -93,9 +97,6 @@ portable-pty = "0.9"
 
 # VT100 terminal emulation
 vt100 = "0.16"
-
-# Git integration (libgit2 bindings)
-git2 = { version = "0.19", default-features = false }
 
 # URL parsing (used by lsp-types)
 url = "2"
@@ -114,7 +115,6 @@ onda-lsp = { path = "crates/onda-lsp" }
 onda-terminal = { path = "crates/onda-terminal" }
 onda-session = { path = "crates/onda-session" }
 onda-plugin = { path = "crates/onda-plugin" }
-onda-git = { path = "crates/onda-git" }
 onda-agent = { path = "crates/onda-agent" }
 onda-data = { path = "crates/onda-data" }
 

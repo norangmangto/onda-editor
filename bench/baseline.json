@@ -19,15 +19,6 @@
       "budget_ms": null
     },
     {
-      "name": "git_blame_render_ms",
-      "median_ms": 0.0,
-      "mean_ms": 0.0,
-      "min_ms": 0.0,
-      "max_ms": 0.0,
-      "runs": 0,
-      "budget_ms": 2.0
-    },
-    {
       "name": "theme_switch_ms",
       "median_ms": 0.0,
       "mean_ms": 0.0,

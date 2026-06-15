@@ -58,22 +58,6 @@ pub enum ExCommand {
     GrammarFetch,
     /// `:ls` — list buffers.
     ListBuffers,
-    /// `:GitStatus` — open a picker of modified/untracked/staged files.
-    GitStatus,
-    /// `:GitStage` — stage the current file.
-    GitStage,
-    /// `:GitUnstage` — unstage the current file.
-    GitUnstage,
-    /// `:GitDiscard` — discard worktree changes to the current file.
-    GitDiscard,
-    /// `:GitDiff` — show the unified diff of the current file vs HEAD.
-    GitDiff,
-    /// `:GitBlame` — show blame for the current line.
-    GitBlame,
-    /// `:GitStageHunk` — stage the hunk under the cursor.
-    GitStageHunk,
-    /// `:GitResetHunk` — reset the hunk under the cursor.
-    GitResetHunk,
     /// `:theme [name]` — switch theme, or report the current one when name omitted.
     Theme(Option<String>),
     /// `:agent [name]` — connect to an agent (open panel), or toggle the panel.
@@ -165,14 +149,6 @@ impl ExCommand {
             "messages" | "mes" => Ok(ExCommand::Messages),
             "GrammarFetch" | "grammars" => Ok(ExCommand::GrammarFetch),
             "ls" | "buffers" => Ok(ExCommand::ListBuffers),
-            "GitStatus" | "gitstatus" | "Gs" => Ok(ExCommand::GitStatus),
-            "GitStage" | "gitstage" => Ok(ExCommand::GitStage),
-            "GitUnstage" | "gitunstage" => Ok(ExCommand::GitUnstage),
-            "GitDiscard" | "gitdiscard" => Ok(ExCommand::GitDiscard),
-            "GitDiff" | "gitdiff" => Ok(ExCommand::GitDiff),
-            "GitBlame" | "gitblame" => Ok(ExCommand::GitBlame),
-            "GitStageHunk" | "gitstagehunk" => Ok(ExCommand::GitStageHunk),
-            "GitResetHunk" | "gitresethunk" => Ok(ExCommand::GitResetHunk),
             "agent" => Ok(ExCommand::Agent(None)),
             "agent-export" => Ok(ExCommand::AgentExport),
             "agent-review" => Ok(ExCommand::AgentReview),
