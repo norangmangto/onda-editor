@@ -17,13 +17,12 @@ even with IDE features turned on.
   visual / visual-line / visual-block, regex search & substitute, splits, a fuzzy
   file/buffer picker, and command-line completion (`<Tab>`).
 - **Tree-sitter syntax** highlighting + structural **text objects** (`af`/`if`,
-  `ac`/`ic`, `aa`/`ia`) for Rust, Go, Python, TypeScript and C.
-- **LSP** — hover, completions, go-to-definition, diagnostics (rust-analyzer, gopls, …).
-- **Git** — gutter signs, `:GitStatus`, `:GitDiff`, `:GitBlame`, and hunk-level staging.
+  `ac`/`ic`, `aa`/`ia`) for Rust and Python.
+- **LSP** — hover, completions, go-to-definition, diagnostics (rust-analyzer, …).
 - **Integrated terminal**, **persistent sessions**, and **persistent undo** (opt-in).
 - **Themes** — TOML format with inheritance, live `:theme` switching, and hot-reload.
-- **Lua plugins** with a sandboxed API.
-- **Debugger (DAP)** — breakpoints, stepping, call stack & variables (lldb-dap, debugpy).
+- **WASM plugins** (Component Model) — sandboxed, permissioned, multi-language; lazy
+  activation and per-call time budgets keep them off the hot path.
 - **AI agent panel (ACP)** — chat, streaming responses, `@`-mentions, a permission
   gate, and hunk-level review of agent-proposed edits.
 - **Data-file superpowers** — CSV/TSV virtual **table** view and a JSONL **field**
@@ -90,28 +89,20 @@ motion/text-object, `u`/`<C-r>`, `/`pattern, `:%s/…/…/g`, …) work as you'd
 
 See [`docs/THEMES.md`](docs/THEMES.md) for the TOML format and `inherits`.
 
-### Git
-| Command | Action |
-|---|---|
-| `:GitStatus` | picker of changed files (`s` stage · `u` unstage · `dd` discard) |
-| `:GitDiff` | unified diff vs HEAD in a scratch buffer |
-| `:GitBlame` | blame for the current line |
-| `:GitStageHunk` / `:GitResetHunk` | stage / reset the hunk under the cursor |
+### Plugins (WASM)
+Plugins are WebAssembly components — sandboxed, permissioned, and written in any
+language that targets the Component Model. They activate lazily and run under
+per-call time budgets so they can't stall input.
 
-Modified/added/deleted lines show `+`/`~`/`-` gutter signs, updated as you edit.
+```sh
+onda plugin install github:<user>/<repo>   # fetch + verify + install
+onda plugin list / update / remove
+onda plugin dev --watch                     # rebuild + hot-reload during development
+```
 
-### Debugger (DAP)
-Needs a debug adapter on `PATH` (`lldb-dap` for Rust/C/C++, `debugpy` for Python).
-
-| Command / key | Action |
-|---|---|
-| `<F9>` / `:DapBreakpoint` | toggle a breakpoint (gutter `●`/`◌`, `→` at a stop) |
-| `:DapRun` / `:DapStop` | start / end a session |
-| `<F5>` `<F10>` `<F11>` `<F12>` | continue · step over · step in · step out |
-| `:DapStack` `:DapVars` `:DapEval <expr>` | call stack · variables · evaluate |
-
-Configure adapters in `~/.config/onda/dap.toml` (template: [`runtime/dap.toml`](runtime/dap.toml));
-full guide in [`docs/DAP.md`](docs/DAP.md).
+The host API is defined in [`wit/onda/`](wit/onda); a quickstart is in
+[`docs/plugin-book/quickstart.md`](docs/plugin-book/quickstart.md). Git integration
+ships as the `git-blame-inline` reference plugin (see `plugins/`).
 
 ### AI agent (ACP)
 Speaks the Agent Client Protocol to an external agent (e.g. `claude-code acp`),
@@ -154,8 +145,10 @@ mouse = true
 persistent_undo = false   # opt-in: restore undo history across sessions
 ```
 
-Other config files under `~/.config/onda/`: `themes/<name>.toml`, `dap.toml`,
-`agents.toml`, and Lua plugins in `plugins/*.lua` (API: [`docs/PLUGIN_API.md`](docs/PLUGIN_API.md)).
+Other config files under `~/.config/onda/`: `themes/<name>.toml`, `agents.toml`, and
+the plugin lockfile `plugins.lock`. Plugins are WASM components managed by
+`onda plugin …` (API: [`wit/onda/`](wit/onda), guide:
+[`docs/plugin-book/`](docs/plugin-book)).
 
 ## Building & contributing
 
@@ -167,22 +160,23 @@ cargo run -p xtask -- bench    # performance gates (see BENCH_REPORT.md)
 ```
 
 The workspace is split into focused crates (`onda-core`, `onda-modal`, `onda-render`,
-`onda-syntax`, `onda-lsp`, `onda-terminal`, `onda-session`, `onda-lua`, `onda-git`,
-`onda-agent`, `onda-dap`, `onda-data`, and the `onda` binary). Architecture and the
+`onda-syntax`, `onda-lsp`, `onda-terminal`, `onda-session`, `onda-plugin`,
+`onda-agent`, `onda-data`, and the `onda` binary). Architecture and the
 performance rules live in [`docs/DESIGN.md`](docs/DESIGN.md) and `AGENTS.md` — please
 read `AGENTS.md` before contributing (the gates apply to human and agent PRs alike).
 
 ## Status
 
-Working: modal editing, syntax highlighting + text objects, LSP, git, terminal,
-sessions, persistent undo, themes, Lua plugins, command-line completion, the DAP
-debugger, the agent panel + diff review, CSV/JSONL views, and `onda doctor`.
+Working: modal editing, syntax highlighting + text objects (Rust, Python), LSP,
+terminal, sessions, persistent undo, themes, command-line completion, the WASM plugin
+system, the agent panel + diff review, CSV/JSONL views, and `onda doctor`.
 
-Not yet done (tracked in [`docs/BACKLOG.md`](docs/BACKLOG.md)): remote editing over
-SSH (`scp://`), the libvterm terminal backend, and release packaging (Homebrew,
-prebuilt multi-platform binaries, docs site). Debugger/agent protocol paths are
-covered by mock adapters in CI; driving real `lldb-dap`/`debugpy`/`claude-code` needs
-those tools installed.
+Not yet done (tracked in [`docs/BACKLOG.md`](docs/BACKLOG.md)): the Phase 3 reference
+plugins are being finalized (including `git-blame-inline` — git integration now ships
+as a plugin, not built in), remote editing over SSH (`scp://`), the libvterm terminal
+backend, and release packaging (Homebrew, prebuilt binaries, docs site). The agent
+protocol path is covered by a mock agent in CI; driving real `claude-code` needs it
+installed. A debugger (DAP) is deferred to the post-v0.1 backlog.
 
 ## License
 

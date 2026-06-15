@@ -2,6 +2,30 @@
 
 Agent follow-up notes — items deferred from the current phase.
 
+## Plan reconciliation (2026-06-15) — current source of truth
+
+The codebase was realigned to the approved plans (PHASE0–5 + DESIGN v0.3 + AGENTS.md).
+Where older sections below still describe removed features as "done", **this section
+wins**:
+
+- **DAP debugger (`onda-dap`) — removed.** Reclassified to the post-v0.1 / Phase 6+
+  backlog. Crate, editor wiring, `dap.toml`, `docs/DAP.md`, and the dap bench gate are
+  gone.
+- **Built-in git (`onda-git`) — removed from core.** Returns in Phase 3 as the
+  `git-blame-inline` WASM reference plugin (ADR-002). diff/blame logic salvaged to
+  `docs/SALVAGE/onda-git/`. `git2` remains only for `onda plugin install` (repo clone).
+- **Lua plugins (`onda-lua`) — removed.** Replaced by the WASM Component Model system
+  (`onda-plugin`), per ADR-002. Host API surface salvaged to
+  `docs/SALVAGE/lua-api-surface.md`; old `docs/PLUGIN_API.md` deleted (see `wit/onda/`).
+- **Text objects — narrowed to Rust + Python.** The feature (PHASE1 T6.4) stays; the
+  Go/C/TypeScript grammars and their `textobjects.scm` were dropped to match the bundled
+  language set (rust/python/json/toml).
+- **Command-line completion — kept** (PHASE1 T8.3), unchanged.
+- **`onda-agent` / `onda-data` — kept** (Phase 4 / Phase 5), fully implemented.
+
+ADRs (`docs/DESIGN.md`) are user-owned: product ADR-001..009 + implementation ADR-101+;
+agents must not change them without explicit approval (AGENTS.md rule 3).
+
 ## Completed in Phase 1
 
 Items that were Phase 0 deferrals and landed during Phase 1:
