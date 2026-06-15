@@ -139,3 +139,66 @@ fn instantiating_twice_is_independent() {
     assert!(!a.drain_calls().is_empty());
     assert!(!b.drain_calls().is_empty());
 }
+
+/// Sum of highlight ranges across all decoration batches in `calls`.
+fn highlight_count(calls: &[PluginApiCall]) -> usize {
+    calls
+        .iter()
+        .filter_map(|c| match c {
+            PluginApiCall::SetDecorations { batch, .. } => Some(batch.highlights.len()),
+            _ => None,
+        })
+        .sum()
+}
+
+#[test]
+fn todo_highlighter_ignores_buffer_without_markers() {
+    let engine = PluginEngine::new().expect("engine");
+    let snap = BufferSnapshot::new("fn main() {}\nlet ok = 1;\n");
+    let mut inst = engine
+        .instantiate(
+            TODO_WASM,
+            GrantedCaps::default(),
+            ".".into(),
+            vec![(0, snap)],
+        )
+        .expect("instantiate");
+    inst.fire_buffer_open(0, "clean.rs").expect("buffer-open");
+    assert_eq!(highlight_count(&inst.drain_calls()), 0);
+}
+
+#[test]
+fn todo_highlighter_marks_multiple_lines() {
+    let engine = PluginEngine::new().expect("engine");
+    let snap = BufferSnapshot::new("// TODO: a\nok\n// FIXME: b\n// HACK: c\n");
+    let mut inst = engine
+        .instantiate(
+            TODO_WASM,
+            GrantedCaps::default(),
+            ".".into(),
+            vec![(0, snap)],
+        )
+        .expect("instantiate");
+    inst.fire_buffer_open(0, "many.rs").expect("buffer-open");
+    assert_eq!(highlight_count(&inst.drain_calls()), 3);
+}
+
+#[test]
+fn set_buffer_snapshot_updates_decorations() {
+    let engine = PluginEngine::new().expect("engine");
+    let mut inst = engine
+        .instantiate(
+            TODO_WASM,
+            GrantedCaps::default(),
+            ".".into(),
+            vec![(0, BufferSnapshot::new("no markers here\n"))],
+        )
+        .expect("instantiate");
+    inst.fire_buffer_open(0, "f.rs").expect("open");
+    assert_eq!(highlight_count(&inst.drain_calls()), 0);
+
+    // Update the snapshot to contain a TODO and re-fire.
+    inst.set_buffer_snapshot(0, BufferSnapshot::new("// TODO: now\n"));
+    inst.fire_buffer_change(0, "f.rs").expect("change");
+    assert_eq!(highlight_count(&inst.drain_calls()), 1);
+}

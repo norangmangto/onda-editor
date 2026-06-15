@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -145,12 +145,10 @@ impl Transport {
     }
 
     async fn write_message(&mut self, value: &Value) -> Result<(), TransportError> {
-        let body = serde_json::to_vec(value)?;
-        let header = format!("Content-Length: {}\r\n\r\n", body.len());
+        let framed = encode_message(value)?;
         debug!(method = %value.get("method").and_then(|v| v.as_str()).unwrap_or("response"),
-               len = body.len(), "→ LSP");
-        self.stdin.write_all(header.as_bytes()).await?;
-        self.stdin.write_all(&body).await?;
+               len = framed.len(), "→ LSP");
+        self.stdin.write_all(&framed).await?;
         self.stdin.flush().await?;
         Ok(())
     }
@@ -161,82 +159,163 @@ impl Transport {
     }
 }
 
+// ── Framing helpers ─────────────────────────────────────────────────────────────
+
+/// Frame a JSON value as a `Content-Length`-prefixed LSP message.
+fn encode_message(value: &Value) -> Result<Vec<u8>, TransportError> {
+    let body = serde_json::to_vec(value)?;
+    let mut out = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Read one `Content-Length`-framed message body from `reader`.
+///
+/// Returns `Ok(None)` on clean EOF. Non-`Content-Length` headers (e.g.
+/// `Content-Type`) are ignored; a header block without a `Content-Length` is
+/// skipped and the next block is tried.
+async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+    loop {
+        let mut content_length: Option<usize> = None;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).await? == 0 {
+                return Ok(None); // EOF
+            }
+            let line = line.trim_end();
+            if line.is_empty() {
+                break; // end of headers
+            }
+            if let Some(rest) = line.strip_prefix("Content-Length:") {
+                if let Ok(n) = rest.trim().parse::<usize>() {
+                    content_length = Some(n);
+                }
+            }
+        }
+        let Some(len) = content_length else {
+            continue; // header block with no Content-Length — try the next
+        };
+        let mut body = vec![0u8; len];
+        reader.read_exact(&mut body).await?;
+        return Ok(Some(body));
+    }
+}
+
+/// Parse a message body and classify it as a response or notification/request.
+/// Returns `None` for malformed JSON (the caller skips it).
+fn classify(body: &[u8]) -> Option<IncomingMessage> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    if value.get("id").is_some() && value.get("method").is_none() {
+        serde_json::from_value::<JsonRpcResponse>(value)
+            .ok()
+            .map(IncomingMessage::Response)
+    } else {
+        serde_json::from_value::<JsonRpcNotification>(value)
+            .ok()
+            .map(IncomingMessage::Notification)
+    }
+}
+
 // ── Stdout reader task ─────────────────────────────────────────────────────────
 
 async fn read_stdout_task(stdout: ChildStdout, tx: mpsc::Sender<IncomingMessage>) {
     let mut reader = BufReader::new(stdout);
     loop {
-        // Read headers until blank line
-        let mut content_length: Option<usize> = None;
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line).await {
-                Ok(0) => return, // EOF
-                Ok(_) => {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        break;
+        match read_frame(&mut reader).await {
+            Ok(Some(body)) => {
+                if let Some(msg) = classify(&body) {
+                    if tx.send(msg).await.is_err() {
+                        return;
                     }
-                    if let Some(rest) = line.strip_prefix("Content-Length: ") {
-                        if let Ok(n) = rest.parse::<usize>() {
-                            content_length = Some(n);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("LSP stdout read error: {e}");
-                    return;
+                } else {
+                    warn!("LSP: skipping unparseable message");
                 }
             }
-        }
-
-        let len = match content_length {
-            Some(n) => n,
-            None => {
-                warn!("LSP: missing Content-Length header");
-                continue;
-            }
-        };
-
-        let mut body = vec![0u8; len];
-        if let Err(e) = reader.read_exact(&mut body).await {
-            warn!("LSP body read error: {e}");
-            return;
-        }
-
-        let value: Value = match serde_json::from_slice(&body) {
-            Ok(v) => v,
+            Ok(None) => return, // EOF
             Err(e) => {
-                warn!("LSP JSON parse error: {e}");
-                continue;
+                warn!("LSP stdout read error: {e}");
+                return;
             }
-        };
-
-        debug!(method = %value.get("method").and_then(|v| v.as_str()).unwrap_or("response"),
-               "← LSP");
-
-        let msg = if value.get("id").is_some() && value.get("method").is_none() {
-            // Response
-            match serde_json::from_value::<JsonRpcResponse>(value) {
-                Ok(r) => IncomingMessage::Response(r),
-                Err(e) => {
-                    warn!("LSP response parse error: {e}");
-                    continue;
-                }
-            }
-        } else {
-            // Notification or request from server
-            match serde_json::from_value::<JsonRpcNotification>(value) {
-                Ok(n) => IncomingMessage::Notification(n),
-                Err(e) => {
-                    warn!("LSP notification parse error: {e}");
-                    continue;
-                }
-            }
-        };
-
-        if tx.send(msg).await.is_err() {
-            return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::BufReader;
+
+    fn framed(body: &str) -> Vec<u8> {
+        let mut v = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        v.extend_from_slice(body.as_bytes());
+        v
+    }
+
+    #[tokio::test]
+    async fn reads_a_response_frame() {
+        let data = framed(r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#);
+        let mut r = BufReader::new(&data[..]);
+        let body = read_frame(&mut r).await.unwrap().unwrap();
+        assert!(matches!(
+            classify(&body),
+            Some(IncomingMessage::Response(_))
+        ));
+        // Next read hits EOF.
+        assert!(read_frame(&mut r).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reads_a_notification_frame() {
+        let data = framed(r#"{"jsonrpc":"2.0","method":"window/logMessage","params":{}}"#);
+        let mut r = BufReader::new(&data[..]);
+        let body = read_frame(&mut r).await.unwrap().unwrap();
+        match classify(&body) {
+            Some(IncomingMessage::Notification(n)) => {
+                assert_eq!(n.method, "window/logMessage")
+            }
+            other => panic!("expected notification, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_two_back_to_back_frames() {
+        let mut data = framed(r#"{"jsonrpc":"2.0","id":1,"result":1}"#);
+        data.extend(framed(r#"{"jsonrpc":"2.0","method":"x","params":null}"#));
+        let mut r = BufReader::new(&data[..]);
+        let a = read_frame(&mut r).await.unwrap().unwrap();
+        let b = read_frame(&mut r).await.unwrap().unwrap();
+        assert!(matches!(classify(&a), Some(IncomingMessage::Response(_))));
+        assert!(matches!(
+            classify(&b),
+            Some(IncomingMessage::Notification(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ignores_extra_headers() {
+        let body = r#"{"jsonrpc":"2.0","id":2,"result":null}"#;
+        let mut data = format!(
+            "Content-Type: application/vscode-jsonrpc\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        data.extend_from_slice(body.as_bytes());
+        let mut r = BufReader::new(&data[..]);
+        let got = read_frame(&mut r).await.unwrap().unwrap();
+        assert_eq!(got, body.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn encode_then_read_round_trips() {
+        let value = serde_json::json!({"jsonrpc":"2.0","id":7,"result":"ok"});
+        let bytes = encode_message(&value).unwrap();
+        let mut r = BufReader::new(&bytes[..]);
+        let body = read_frame(&mut r).await.unwrap().unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), value);
+    }
+
+    #[test]
+    fn classify_rejects_malformed_json() {
+        assert!(classify(b"{ not json").is_none());
     }
 }
