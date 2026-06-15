@@ -98,8 +98,6 @@ pub enum ExCommand {
     Table,
     /// `:fields` — show the JSONL field schema overlay for the current buffer.
     Fields,
-    /// Custom command registered by a Lua plugin.
-    LuaCommand(String, Vec<String>),
 }
 
 impl ExCommand {

@@ -9,7 +9,7 @@ members = [
     "crates/onda-lsp",
     "crates/onda-terminal",
     "crates/onda-session",
-    "crates/onda-lua",
+    "crates/onda-plugin",
     "crates/onda-git",
     "crates/onda-agent",
     "crates/onda-data",
@@ -17,6 +17,9 @@ members = [
     "xtask",
     "bench",
 ]
+# Reference plugins target wasm32-wasip2 + wit-bindgen — built separately, never
+# part of the host workspace build (W20).
+exclude = ["plugins"]
 resolver = "2"
 
 [workspace.package]
@@ -95,14 +98,15 @@ portable-pty = "0.9"
 # VT100 terminal emulation
 vt100 = "0.16"
 
-# Lua 5.4 embedding
-mlua = { version = "0.10", features = ["lua54", "vendored"] }
-
 # Git integration (libgit2 bindings)
 git2 = { version = "0.19", default-features = false }
 
 # URL parsing (used by lsp-types)
 url = "2"
+
+# WASM Component Model plugin host (onda-plugin, W18, ADR-002)
+wasmtime = { version = "45", default-features = false, features = ["runtime", "cranelift", "component-model", "std"] }
+wasmtime-wasi = "45"
 
 # Crate cross-references
 onda-core = { path = "crates/onda-core" }
@@ -113,7 +117,7 @@ onda-syntax = { path = "crates/onda-syntax" }
 onda-lsp = { path = "crates/onda-lsp" }
 onda-terminal = { path = "crates/onda-terminal" }
 onda-session = { path = "crates/onda-session" }
-onda-lua = { path = "crates/onda-lua" }
+onda-plugin = { path = "crates/onda-plugin" }
 onda-git = { path = "crates/onda-git" }
 onda-agent = { path = "crates/onda-agent" }
 onda-data = { path = "crates/onda-data" }

@@ -61,6 +61,78 @@ Items identified during Phase 1 that were explicitly deferred:
 - **Hot-reload config on file change**: `:config-reload` works; automatic watch-and-reload
   via `notify` explicitly deferred. Revisit in Phase 3.
 
+## Phase 3 — WASM plugin migration (design-first, ADR-002)
+
+DESIGN.md v0.3 mandates **WASM Component Model** plugins (ADR-002 explicitly
+rejects Lua). The shipped `onda-lua` (mlua) system is a divergence being reversed.
+
+### Done — W17 (WIT API v0)
+- `wit/onda/{world,host,guest,types}.wit` — host API v0 (`@unstable`), mirroring
+  the old Lua surface (notify/buffer/selection/keymap/command/decoration/picker/
+  config) + capability-gated `fs`/`http`. Design-review doc: `wit/README.md`.
+- `onda-plugin` crate scaffold: `manifest` (`onda-plugin.toml` schema + API-version
+  gating), `permission` (capability model, request ∩ grant, `..`-escape rejection),
+  `api` (`PluginApiCall` host-call queue). 11 tests, fmt+clippy green. No `wasmtime`
+  dep yet (kept out of W17 so the heavy dep + bench gates land with W18).
+- AGENTS.md: pre-approved deps swapped mlua → wasmtime/wit-bindgen/wasmparser/
+  cap-std; "commonly wrong" entries added (no blocking host calls, no raw buffer).
+
+### Done — W18 (wasmtime host)
+- `onda-plugin::host` — `wasmtime::component::bindgen!` host bindings for the full
+  WIT surface; effectful calls routed to the `PluginApiCall` queue, reads from a
+  pre-frame buffer snapshot (rule 2). WASI satisfied via `wasmtime-wasi` (wasip2
+  std pulls it in).
+- `onda-plugin::engine` — `PluginEngine` (component model + epoch interruption +
+  watchdog), per-instance `Store` with memory limit, lazy instantiate + `init`
+  under the 5ms epoch budget, capability interfaces (`fs`/`http`) linked **only
+  when granted** (link-time enforcement, T17.3).
+- Integration tests against **real components** (built from `plugins/`, committed
+  under `tests/fixtures/`): todo-highlighter emits a decoration batch; a busy-loop
+  plugin is trapped by the epoch budget; git-blame reads `.git/HEAD` through a
+  granted fs cap; an ungranted capability fails to link. 20 tests, fmt+clippy green.
+
+### Done — W19 (plugin manager)
+- `onda-plugin::manager` — `PluginManager` install/list/remove over a store dir +
+  `plugins.lock`; sources: `github:user/repo[@rev]`, git URLs (incl. `file://`),
+  local dirs. Staging→promote so a bad manifest can't half-install; entry-component
+  presence verified; resolved commit sha recorded. Tested (local + local-git).
+
+### Done — W20 (reference plugins, real WASM components)
+- `plugins/{todo-highlighter,git-blame-inline,http-client}` build to wasm32-wasip2
+  components via wit-bindgen. Validate: decoration batch / event flow (todo);
+  fs capability + virt-text + cursor-hold (git-blame — real per-line blame awaits a
+  host `vcs` interface, deferred); network capability + command + picker (http —
+  host HTTP is v0-stubbed). `plugins/hostile-test` is the containment fixture.
+
+### Done — final swap (binary rewiring)
+- **`onda-lua` removed**: crate deleted, `mlua` workspace dep dropped,
+  `runtime/plugins/*.lua` deleted. `ExCommand::LuaCommand` removed (it was dead —
+  `parse` never constructed it).
+- **Binary on `onda-plugin`** (`crates/onda/src/plugin_host.rs`): `PluginHost`
+  discovers + instantiates installed plugins at startup (init registers commands),
+  fires editor events (buffer-open at load, cursor-hold/buffer-change on idle),
+  applies `PluginApiCall`s between frames (notify, buffer edits, cursor/selection,
+  float, highlight-group → theme reapply). `:name` dispatches to plugin commands.
+  `onda plugin install|list|remove` CLI wired. fmt+clippy+`cargo test --workspace`
+  green; CLI install→list→remove smoke-tested with a real component.
+
+### Outstanding — plugin follow-ups
+- **Decoration rendering**: plugin virt-text / signs / highlight-ranges
+  (`SetDecorations`) are received but not yet painted — wire into the compositor
+  (the LSP/git decoration path is the model). Until then todo-highlighter's
+  highlights/signs are no-ops (highlight-*group* overrides do apply via the theme).
+- **Permission approval UI**: `discover` auto-grants declared capabilities; add the
+  install-time + first-use prompt (T18.3 / T24.3 pattern). fs is still whitelist- +
+  `..`-scoped and ungranted imports still fail to link.
+- **Lazy-by-event activation**: plugins currently instantiate eagerly at startup
+  (so command tables are known). Switch command-activated plugins to instantiate on
+  first `:name` once a manifest pre-scan registers their command names.
+- **Plugin keymaps / picker contributions / statusline segments**: received, not
+  yet applied.
+- **W19 polish**: `update` (re-resolve lockfile), `onda plugin dev --watch`,
+  `cargo generate` template, full `docs/plugin-book/` (quickstart drafted).
+- **`http` host impl** (currently v0-stub) + a `vcs` host interface for real blame.
+
 ## Notes from Phase 0
 
 <!-- Agents: append here as you work. Format: `- [T0.x] Note about friction/decision.` -->

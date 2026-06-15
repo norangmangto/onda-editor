@@ -19,3 +19,6 @@ Cargo.lock
 
 # Editor state
 /.onda/
+
+# Reference-plugin build output
+/plugins/*/target/

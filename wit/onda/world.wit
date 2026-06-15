@@ -1,0 +1,36 @@
+// onda plugin host API v0.
+//
+// STABILITY: @unstable. Versioned with the package; breaking changes allowed
+// until the Phase 5 release freeze. The host advertises this version in
+// `initialize`; a plugin manifest declares `min-api-version` and fails to link
+// if incompatible (T17.3).
+//
+// NON-GOALS for v0 (binding — see PHASE3_PLAN T17.1):
+//   - No arbitrary UI windows beyond float/picker/statusline.
+//   - No raw filesystem/network in the core API — only the capability-gated
+//     `fs`/`http` interfaces, wired in solely when the manifest declares them
+//     and the user approved.
+//   - No raw buffer/rope access — all mutation is transactional.
+//   - No synchronous host call that can block the frame.
+
+package onda:plugin@0.1.0;
+
+/// The world a plugin component targets: it imports the host surface and exports
+/// the guest lifecycle/handlers.
+world plugin {
+    import types;
+    import log;
+    import buffer;
+    import selection;
+    import editor;
+    import commands;
+    import keymap;
+    import decorations;
+    import ui;
+    import config;
+    // Capability-gated — present only when the manifest declares + user approves.
+    import fs;
+    import http;
+
+    export guest;
+}

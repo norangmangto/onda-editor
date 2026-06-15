@@ -4,6 +4,7 @@ use std::{collections::HashMap, path::PathBuf, sync::mpsc, time::Duration};
 use std::time::Instant;
 
 mod doctor;
+mod plugin_host;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -16,12 +17,12 @@ use onda_lsp::{
     types::{LspDiagnostic, LspEvent},
     LspManager,
 };
-use onda_lua::{LuaApiCall, LuaRuntime, PluginLoader};
 use onda_modal::{
     build_buffer_picker, build_file_picker, find_all, find_next, find_prev, Action, CommandLine,
     ExCommand, JumpList, Key, KeyMod, Keymap, KeymapState, MacroRecorder, MarkStore, Mode, Motion,
     Operator, PendingResult, Picker, Register, RegisterBank, SearchState,
 };
+use onda_plugin::PluginApiCall;
 use onda_render::{
     draw_borders, render_completion_menu, render_float, render_picker, Backend, Compositor,
     DiagnosticSpan, DocumentView, Layout, Message, MessageLine, ModeIndicator, NullBackend, Rect,
@@ -30,6 +31,7 @@ use onda_render::{
 use onda_session::{Session, SessionManager};
 use onda_syntax::{LanguageRegistry, SyntaxWorker};
 use onda_terminal::{PtyEvent, PtyProcess, TerminalScreen};
+use plugin_host::{PluginEvent, PluginHost};
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::debug;
 
@@ -314,9 +316,9 @@ struct App<B: Backend> {
     theme_watcher: Option<notify::RecommendedWatcher>,
     /// Path of the on-disk theme file currently watched, if any.
     theme_path: Option<PathBuf>,
-    /// Highlight overrides registered by Lua plugins (`onda.highlight.set`),
+    /// Highlight overrides registered by plugins (`decorations.set-group`),
     /// re-applied on top of the theme after every switch/reload (the ThemeChanged effect).
-    lua_highlights: Vec<(String, onda_lua::api::HighlightOpts)>,
+    plugin_highlights: Vec<(String, onda_plugin::Style)>,
 
     // ── Data views (CSV table) ─────────────────────────────────────────────────
     /// Docs currently shown as a CSV/TSV table, with their sniffed dialect.
@@ -404,11 +406,11 @@ struct App<B: Backend> {
     // ── Session ───────────────────────────────────────────────────────────────
     session_manager: SessionManager,
 
-    // ── Lua plugins ────────────────────────────────────────────────────────────
-    /// Lua runtime (None when in bench / non-tokio mode).
-    lua_runtime: Option<LuaRuntime>,
-    /// Custom Lua commands registered via `onda.cmd.create`.
-    lua_commands: HashMap<String, u64>,
+    // ── WASM plugins ───────────────────────────────────────────────────────────
+    /// WASM plugin host (None in bench / when the engine fails to start).
+    plugin_host: Option<PluginHost>,
+    /// True after an idle tick has fired plugin events; reset on input.
+    plugin_idle_fired: bool,
 
     // ── Git ──────────────────────────────────────────────────────────────────
     /// Background git worker (lazily spawned on first git use).
@@ -1888,7 +1890,7 @@ impl<B: Backend> App<B> {
             .as_ref()
             .and_then(|p| spawn_theme_watcher(p, self.bg_tx.clone()));
         self.theme_path = path;
-        self.reapply_lua_highlights();
+        self.reapply_plugin_highlights();
         // Full re-render: theme changes touch every cell (rule 3 allows redraw on
         // theme change). The compositor still diffs, so only changed cells flush.
         self.compositor.buf.invalidate();
@@ -1904,7 +1906,7 @@ impl<B: Backend> App<B> {
             Ok(text) => match onda_render::Theme::from_toml(&name, &text) {
                 Ok(theme) => {
                     self.theme = theme;
-                    self.reapply_lua_highlights();
+                    self.reapply_plugin_highlights();
                     self.compositor.buf.invalidate();
                 }
                 Err(e) => {
@@ -1917,16 +1919,16 @@ impl<B: Backend> App<B> {
         }
     }
 
-    /// Re-apply all Lua-registered highlight overrides on top of the current theme.
-    fn reapply_lua_highlights(&mut self) {
-        for (group, opts) in &self.lua_highlights {
+    /// Re-apply all plugin-registered highlight overrides on top of the current theme.
+    fn reapply_plugin_highlights(&mut self) {
+        for (group, style) in &self.plugin_highlights {
             let _ = self.theme.set_parsed(
                 group,
-                opts.fg.as_deref(),
-                opts.bg.as_deref(),
-                opts.bold,
-                opts.italic,
-                opts.underline,
+                style.fg.as_deref(),
+                style.bg.as_deref(),
+                style.bold,
+                style.italic,
+                style.underline,
             );
         }
     }
@@ -2735,6 +2737,12 @@ impl<B: Backend> App<B> {
                 } else {
                     match self.command_line.submit() {
                         Ok(cmd) => self.execute_ex_command(cmd)?,
+                        // An unknown `:name …` may be a plugin-registered command.
+                        Err(onda_modal::CommandError::Unknown(line))
+                            if self.try_plugin_command(&line) =>
+                        {
+                            self.mode = Mode::Normal;
+                        }
                         Err(e) => {
                             self.message = Message::Error(format!("E: {e}"));
                             self.mode = Mode::Normal;
@@ -2765,7 +2773,11 @@ impl<B: Backend> App<B> {
     /// candidates on first use, then writing the selected candidate into the line.
     fn cmd_complete_advance(&mut self, dir: i32) {
         if self.cmd_completion.is_none() {
-            let extra: Vec<String> = self.lua_commands.keys().cloned().collect();
+            let extra: Vec<String> = self
+                .plugin_host
+                .as_ref()
+                .map(|h| h.command_names())
+                .unwrap_or_default();
             let line = self.command_line.as_str().to_string();
             let (base, candidates) = match onda_modal::analyze(&line, &extra) {
                 onda_modal::Completion::Commands {
@@ -3028,12 +3040,6 @@ impl<B: Backend> App<B> {
                 let session = self.build_session();
                 let _ = self.session_manager.auto_save(&session);
                 self.running = false;
-            }
-            ExCommand::LuaCommand(name, args) => {
-                if let Some(runtime) = &self.lua_runtime {
-                    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                    runtime.fire_command(&name, &args_refs);
-                }
             }
             ExCommand::Write(path) => {
                 let result = if let Some(p) = path {
@@ -4202,99 +4208,158 @@ impl<B: Backend> App<B> {
         Ok(())
     }
 
-    // ── Lua API call drain ────────────────────────────────────────────────────
+    // ── WASM plugin integration ───────────────────────────────────────────────
 
-    fn drain_lua_calls(&mut self) {
-        let calls = if let Some(rt) = &self.lua_runtime {
-            rt.drain_calls()
-        } else {
+    /// A read-only snapshot of the focused buffer for plugin reads: `(buf id,
+    /// path, snapshot)`. The buffer id is the doc index.
+    fn focused_plugin_snapshot(&self) -> (u64, String, onda_plugin::BufferSnapshot) {
+        let idx = self.focused_win().doc_idx;
+        let doc = &self.docs[idx];
+        (
+            idx as u64,
+            doc.name().to_string(),
+            onda_plugin::BufferSnapshot::new(doc.rope().to_string()),
+        )
+    }
+
+    /// Fire `buffer-open` to plugins (startup, file load, `:e`).
+    fn fire_plugin_open(&mut self, doc_idx: usize) {
+        if self.plugin_host.is_none() || doc_idx >= self.docs.len() {
             return;
-        };
+        }
+        let doc = &self.docs[doc_idx];
+        let snap = onda_plugin::BufferSnapshot::new(doc.rope().to_string());
+        let path = doc.name().to_string();
+        let calls = self.plugin_host.as_mut().unwrap().fire(
+            PluginEvent::BufferOpen {
+                buf: doc_idx as u64,
+                path,
+            },
+            snap,
+        );
+        self.apply_plugin_calls(calls);
+    }
 
+    /// Idle tick: fire `cursor-hold` + `buffer-change` to plugins, apply results.
+    fn tick_plugins(&mut self) {
+        if self.plugin_host.is_none() {
+            return;
+        }
+        let (buf, path, snap) = self.focused_plugin_snapshot();
+        let pos = self.selection().primary().head as u32;
+        let mut calls = Vec::new();
+        {
+            let host = self.plugin_host.as_mut().unwrap();
+            calls.extend(host.fire(PluginEvent::CursorHold { buf, pos }, snap.clone()));
+            calls.extend(host.fire(PluginEvent::BufferChange { buf, path }, snap));
+        }
+        self.apply_plugin_calls(calls);
+    }
+
+    /// Dispatch an unknown `:name …` to a plugin command. Returns true if handled.
+    fn try_plugin_command(&mut self, line: &str) -> bool {
+        if self.plugin_host.is_none() {
+            return false;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(name) = parts.next().map(|s| s.to_string()) else {
+            return false;
+        };
+        let args: Vec<String> = parts.map(|s| s.to_string()).collect();
+        let (buf, _path, snap) = self.focused_plugin_snapshot();
+        let calls = self
+            .plugin_host
+            .as_mut()
+            .unwrap()
+            .run_command(&name, args, buf, snap);
+        match calls {
+            Some(calls) => {
+                self.apply_plugin_calls(calls);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Apply the effectful calls a plugin made (rule 2: between frames).
+    fn apply_plugin_calls(&mut self, calls: Vec<PluginApiCall>) {
         for call in calls {
             match call {
-                LuaApiCall::Notify { msg, level } => {
+                PluginApiCall::Notify { msg, level } => {
                     self.message_history.push(msg.clone());
                     self.message = match level {
-                        onda_lua::api::NotifyLevel::Error => Message::Error(msg),
+                        onda_plugin::NotifyLevel::Error => Message::Error(msg),
                         _ => Message::Info(msg),
                     };
                 }
-                LuaApiCall::BufSetLines {
-                    buf_id,
-                    start,
-                    end,
-                    lines,
-                } => {
-                    if buf_id < self.docs.len() {
-                        let doc = &self.docs[buf_id];
-                        let line_start = if start < doc.len_lines() {
-                            doc.line_to_char(start)
-                        } else {
-                            doc.len_chars()
-                        };
-                        let line_end = if end < doc.len_lines() {
-                            doc.line_to_char(end)
-                        } else {
-                            doc.len_chars()
-                        };
-                        let new_text = lines.join("\n");
-                        let len = doc.len_chars();
-                        let cs = onda_core::transaction::ChangeSetBuilder::new(len)
-                            .retain(line_start)
-                            .delete(line_end - line_start)
-                            .insert(&new_text)
-                            .build();
-                        let tx = Transaction::new(cs);
-                        let _ = self.docs[buf_id].apply(&tx);
+                PluginApiCall::BufferApply { buf_id, mut edits } => {
+                    let idx = buf_id as usize;
+                    if idx < self.docs.len() {
+                        let len = self.docs[idx].len_chars();
+                        edits.sort_by_key(|e| e.start);
+                        let mut b = onda_core::transaction::ChangeSetBuilder::new(len);
+                        let mut pos = 0usize;
+                        for e in edits {
+                            // Skip overlapping / out-of-bounds edits (snapshot was stale).
+                            if e.start < pos || e.end > len || e.start > e.end {
+                                continue;
+                            }
+                            b = b
+                                .retain(e.start - pos)
+                                .delete(e.end - e.start)
+                                .insert(&e.text);
+                            pos = e.end;
+                        }
+                        let tx = Transaction::new(b.build());
+                        let _ = self.docs[idx].apply(&tx);
                     }
                 }
-                LuaApiCall::WinSetCursor { win_id, row, col } => {
-                    if win_id < self.windows.len() {
-                        let doc_idx = self.windows[win_id].doc_idx;
+                PluginApiCall::SetCursor { win_id, pos } => {
+                    let win = win_id as usize;
+                    if win < self.windows.len() {
+                        let doc_idx = self.windows[win].doc_idx;
                         if doc_idx < self.docs.len() {
-                            let doc = &self.docs[doc_idx];
-                            let line = row.min(doc.len_lines().saturating_sub(1));
-                            let line_start = doc.line_to_char(line);
-                            let line_len = doc.line_len_no_eol(line);
-                            let char_pos = line_start + col.min(line_len);
-                            self.windows[win_id].selection = Selection::point(char_pos);
+                            let clamped = pos.min(self.docs[doc_idx].len_chars());
+                            self.windows[win].selection = Selection::point(clamped);
                         }
                     }
                 }
-                LuaApiCall::CmdCreate {
-                    name, callback_id, ..
-                } => {
-                    self.lua_commands.insert(name, callback_id);
+                PluginApiCall::SetSelection { ranges, .. } => {
+                    if let Some((_anchor, head)) = ranges.first().copied() {
+                        let clamped = head.min(self.doc().len_chars());
+                        *self.selection_mut() = Selection::point(clamped);
+                    }
                 }
-                LuaApiCall::UiFloat {
-                    title: _title,
-                    lines,
-                    width: _width,
-                    height: _height,
-                } => {
-                    let lines_str: Vec<String> = lines;
+                PluginApiCall::UiFloat { lines, .. } => {
                     self.hover_float = Some(HoverFloat {
-                        lines: lines_str,
+                        lines,
                         col: 4,
                         row: 4,
                     });
                 }
-                LuaApiCall::HighlightSet { group, opts } => {
-                    // Apply immediately and remember it so it survives theme switches.
+                PluginApiCall::HighlightGroup { group, style } => {
+                    // Apply now and remember it so it survives theme switches.
                     let _ = self.theme.set_parsed(
                         &group,
-                        opts.fg.as_deref(),
-                        opts.bg.as_deref(),
-                        opts.bold,
-                        opts.italic,
-                        opts.underline,
+                        style.fg.as_deref(),
+                        style.bg.as_deref(),
+                        style.bold,
+                        style.italic,
+                        style.underline,
                     );
-                    self.lua_highlights.retain(|(g, _)| g != &group);
-                    self.lua_highlights.push((group, opts));
+                    self.plugin_highlights.retain(|(g, _)| g != &group);
+                    self.plugin_highlights.push((group, style));
                     self.compositor.buf.invalidate();
                 }
-                _ => {}
+                // Decoration rendering (virt-text/signs/highlight ranges), picker
+                // contributions, statusline segments, and plugin keymaps are
+                // follow-ups — see docs/BACKLOG.md. CmdCreate is owned by PluginHost.
+                PluginApiCall::SetDecorations { .. }
+                | PluginApiCall::ClearDecorations { .. }
+                | PluginApiCall::UiPick { .. }
+                | PluginApiCall::StatuslineSegment { .. }
+                | PluginApiCall::CmdCreate { .. }
+                | PluginApiCall::KeymapSet { .. } => {}
             }
         }
     }
@@ -4635,13 +4700,20 @@ impl<B: Backend> App<B> {
         self.render_frame().context("initial render")?;
 
         while self.running {
-            if event::poll(Duration::from_millis(8))? {
+            let had_event = event::poll(Duration::from_millis(8))?;
+            if had_event {
                 let ev = event::read()?;
                 self.handle_event(ev)?;
+                self.plugin_idle_fired = false;
             }
 
             self.drain_bg_channel();
-            self.drain_lua_calls();
+            // On idle (no input this tick), fire plugin cursor-hold/buffer-change
+            // once, so plugins react without being polled every frame.
+            if !had_event && !self.plugin_idle_fired {
+                self.tick_plugins();
+                self.plugin_idle_fired = true;
+            }
             self.render_frame().context("render frame")?;
         }
 
@@ -4921,7 +4993,7 @@ fn make_app<B: Backend>(
         theme,
         theme_watcher,
         theme_path,
-        lua_highlights: Vec::new(),
+        plugin_highlights: Vec::new(),
         config,
         table_docs: HashMap::new(),
         table_layout: HashMap::new(),
@@ -4958,8 +5030,8 @@ fn make_app<B: Backend>(
         next_pane_id: 0,
         window_to_pane: HashMap::new(),
         session_manager: SessionManager::new(),
-        lua_runtime: None,
-        lua_commands: HashMap::new(),
+        plugin_host: None,
+        plugin_idle_fired: false,
         git_worker: None,
         git_signs: HashMap::new(),
         git_status_root: None,
@@ -5070,22 +5142,13 @@ fn run_editor(paths: Vec<PathBuf>) -> Result<()> {
         app.message = Message::Error(warn);
     }
 
-    // Initialize Lua runtime and load plugins (T13.1)
+    // Discover + instantiate installed WASM plugins (ADR-002). `init` runs here
+    // (registering commands); buffer-open is fired for the initial doc below.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    match LuaRuntime::new() {
-        Ok(runtime) => {
-            let errors = PluginLoader::load_all(&runtime, &cwd);
-            for (name, err) in errors {
-                app.message_history
-                    .push(format!("Plugin '{name}' error: {err}"));
-            }
-            app.lua_runtime = Some(runtime);
-        }
-        Err(e) => {
-            app.message_history
-                .push(format!("Lua runtime init error: {e}"));
-        }
-    }
+    let (host, startup_calls) = PluginHost::discover(&cwd);
+    app.plugin_host = host;
+    app.apply_plugin_calls(startup_calls);
+    app.fire_plugin_open(0);
 
     let result = app.run();
 
@@ -5513,6 +5576,10 @@ fn main() -> Result<()> {
 
     if args.first().map(|s| s.as_str()) == Some("doctor") {
         std::process::exit(doctor::run());
+    }
+
+    if args.first().map(|s| s.as_str()) == Some("plugin") {
+        std::process::exit(plugin_host::cli(&args[1..]));
     }
 
     if args.iter().any(|a| a == "--bench-startup") {

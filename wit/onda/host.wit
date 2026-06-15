@@ -1,0 +1,180 @@
+// onda plugin host API — interfaces the editor *exports* (plugins import).
+//
+// DESIGN PRINCIPLE (ADR-002 + rule 2): no host function may block the caller.
+// Reads are answered from a snapshot prepared before the plugin's frame budget
+// begins; writes are queued as transactions and applied by the main loop between
+// frames. Nothing here is an await point that can stall the render path.
+
+interface log {
+    use types.{notify-level};
+
+    /// Show a message in the editor message line.
+    notify: func(msg: string, level: notify-level);
+
+    /// Write to the editor log file (ONDA_LOG), never the screen.
+    debug: func(msg: string);
+}
+
+/// Buffer read + mutation. All mutation is transactional (ADR-005): a plugin
+/// describes an edit over the snapshot it read; the host applies it as one
+/// `ChangeSet`, mapping selections and notifying LSP/undo uniformly.
+interface buffer {
+    use types.{buffer-id, char-idx, range, host-error};
+
+    /// The currently focused buffer.
+    current: func() -> buffer-id;
+
+    /// Number of characters in the buffer.
+    len: func(buf: buffer-id) -> result<char-idx, host-error>;
+
+    /// Number of lines in the buffer.
+    line-count: func(buf: buffer-id) -> result<u32, host-error>;
+
+    /// Read a slice of buffer text by char range (snapshot-consistent).
+    text: func(buf: buffer-id, %range: range) -> result<string, host-error>;
+
+    /// Read whole lines [start, end) (0-based, end exclusive), without newlines.
+    lines: func(buf: buffer-id, start: u32, end: u32) -> result<list<string>, host-error>;
+
+    /// A single transactional edit: replace the chars in `range` with `text`.
+    /// (`range.anchor == range.head` is a pure insert; empty `text` is a delete.)
+    record edit {
+        %range: range,
+        text: string,
+    }
+
+    /// Apply a batch of edits as ONE transaction (one undo step). Edits are in
+    /// terms of the pre-edit coordinate space; the host orders/maps them.
+    /// Fails (rejected) if the buffer changed under the plugin since its snapshot.
+    apply: func(buf: buffer-id, edits: list<edit>) -> result<_, host-error>;
+}
+
+/// Selection get/set. Plugins receive and return full multi-range selections.
+interface selection {
+    use types.{buffer-id, selection, host-error};
+
+    get: func(buf: buffer-id) -> result<selection, host-error>;
+    set: func(buf: buffer-id, sel: selection) -> result<_, host-error>;
+}
+
+/// Editor-level state: windows, cursor, mode (read), focus.
+interface editor {
+    use types.{window-id, buffer-id, char-idx, mode, host-error};
+
+    current-window: func() -> window-id;
+    current-mode: func() -> mode;
+
+    /// Cursor as a char index in the window's buffer.
+    cursor: func(win: window-id) -> result<char-idx, host-error>;
+    set-cursor: func(win: window-id, pos: char-idx) -> result<_, host-error>;
+}
+
+/// Command + keymap registration. The guest exports the matching handlers
+/// (see guest.wit `run-command` / `run-keymap`); registration just declares them.
+interface commands {
+    /// Register a `:name` command. `id` is the plugin-chosen handler id passed
+    /// back to the guest's `run-command` export.
+    create: func(name: string, id: u64, desc: option<string>, nargs: u8);
+}
+
+interface keymap {
+    /// Register a keybinding. `mode` is e.g. "n"/"i"/"v"; `lhs` is the key
+    /// sequence; `id` is dispatched to the guest's `run-keymap` export.
+    set: func(mode: string, lhs: string, id: u64, desc: option<string>);
+}
+
+/// Decorations — THE perf-critical surface (T17.2). Batch only: a plugin submits
+/// the full decoration set for a buffer in one call per frame's worth of work,
+/// never one host call per item. The compositor diffs them onto the cell grid.
+interface decorations {
+    use types.{buffer-id, char-idx, range, style, host-error};
+
+    /// Virtual (non-editable) text anchored after a char position.
+    record virt-text {
+        at: char-idx,
+        text: string,
+        style: style,
+    }
+
+    /// A gutter sign on a line.
+    record sign {
+        line: u32,
+        text: string,
+        style: style,
+    }
+
+    /// An inline highlight over a range.
+    record highlight {
+        %range: range,
+        style: style,
+    }
+
+    /// A namespaced decoration batch. Replacing a namespace clears the plugin's
+    /// previous decorations in it — no per-item add/remove churn.
+    record batch {
+        namespace: string,
+        virt-texts: list<virt-text>,
+        signs: list<sign>,
+        highlights: list<highlight>,
+    }
+
+    /// Replace all decorations for `namespace` on `buf` with `batch`.
+    set: func(buf: buffer-id, batch: batch) -> result<_, host-error>;
+    clear: func(buf: buffer-id, namespace: string);
+
+    /// Define/override a theme highlight group (mirrors the old onda.highlight.set).
+    set-group: func(group: string, style: style);
+}
+
+/// Floating UI + picker contribution (T17.2). The picker reuses the Phase 1
+/// component; plugins supply items and get the chosen index back via an event.
+interface ui {
+    use types.{style};
+
+    /// Open a read-only floating window.
+    float: func(title: string, lines: list<string>, width: u16, height: u16);
+
+    record picker-item {
+        label: string,
+        detail: option<string>,
+    }
+
+    /// Open a fuzzy picker. The chosen item's index is delivered to the guest's
+    /// `run-keymap`/event channel via `id` (selection event carries the index).
+    pick: func(title: string, items: list<picker-item>, id: u64);
+
+    /// Register/replace a statusline segment owned by this plugin.
+    statusline-segment: func(id: string, text: string, style: style);
+}
+
+/// Typed config reads from merged config.toml (global + project overlay, §5.7).
+interface config {
+    get-string: func(key: string) -> option<string>;
+    get-bool: func(key: string) -> option<bool>;
+    get-int: func(key: string) -> option<s64>;
+}
+
+/// Capability-gated filesystem (T17.3). Only wired into the instance if the
+/// manifest declares paths AND the user approved. Paths are resolved against the
+/// project root through cap-std preopens; `..` escapes are rejected by the host.
+interface fs {
+    use types.{host-error};
+
+    read: func(path: string) -> result<list<u8>, host-error>;
+    write: func(path: string, data: list<u8>) -> result<_, host-error>;
+    read-dir: func(dir: string) -> result<list<string>, host-error>;
+}
+
+/// Capability-gated HTTP (T17.3). Only present if `network = true` in the manifest
+/// and the domain is on the manifest allowlist; host-mediated, no raw sockets.
+interface http {
+    use types.{host-error};
+
+    record response {
+        status: u16,
+        body: list<u8>,
+    }
+
+    get: func(url: string) -> result<response, host-error>;
+    post: func(url: string, body: list<u8>, content-type: string) -> result<response, host-error>;
+}

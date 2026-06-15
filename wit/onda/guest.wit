@@ -1,0 +1,54 @@
+// onda plugin host API — what a plugin (guest component) *exports*.
+//
+// The host calls these. Handlers run on the main thread inside an epoch deadline
+// (default 5ms, T18.2); exceeding it suspends + demotes the plugin. Handlers
+// reach editor state only through the imported host interfaces (host.wit).
+
+interface guest {
+    use types.{buffer-id, char-idx, mode};
+
+    /// Events a plugin can subscribe to (declared in the manifest `activation`).
+    variant event {
+        /// A buffer was opened (handle + path).
+        buffer-open(buffer-event),
+        /// A buffer was saved.
+        buffer-save(buffer-event),
+        /// A buffer's text changed (post-transaction).
+        buffer-change(buffer-event),
+        /// The cursor stopped moving for the hold interval.
+        cursor-hold(cursor-event),
+        /// The editor mode changed.
+        mode-change(mode),
+        /// A picker opened by this plugin resolved to an item index (or none).
+        picker-result(picker-result),
+    }
+
+    record buffer-event {
+        buf: buffer-id,
+        path: string,
+    }
+
+    record cursor-event {
+        buf: buffer-id,
+        pos: char-idx,
+    }
+
+    record picker-result {
+        /// The `id` passed to `ui.pick`.
+        id: u64,
+        /// Chosen item index, or none if cancelled.
+        index: option<u32>,
+    }
+
+    /// Called once when the plugin is first activated (lazy, on a matching event).
+    init: func();
+
+    /// Dispatch a subscribed event.
+    handle-event: func(ev: event);
+
+    /// Run a command registered via `commands.create` (`id` + raw args).
+    run-command: func(id: u64, args: list<string>);
+
+    /// Run a keybinding registered via `keymap.set`.
+    run-keymap: func(id: u64);
+}

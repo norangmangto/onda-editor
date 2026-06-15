@@ -1,0 +1,11 @@
+[plugin]
+name = "http-client"
+version = "0.1.0"
+entry = "http_client.wasm"
+min-api-version = "0.1"
+
+[permissions]
+network = true
+
+[activation]
+events = ["command:http"]

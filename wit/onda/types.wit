@@ -1,0 +1,72 @@
+// onda plugin host API — shared types
+//
+// STABILITY: v0 / @unstable. Every name here is a future compatibility cost.
+// Breaking changes are allowed until the Phase 5 release freeze (DESIGN §8 risk row).
+//
+// Position model (DESIGN §5.5, ADR-005/006): positions are **char indices** into a
+// buffer (0-based). No line/col footguns in v0. All mutation flows through
+// transactions; the host owns the rope, plugins never get raw access.
+
+interface types {
+    /// A character index into a buffer (0-based, UTF-8 scalar boundary).
+    type char-idx = u32;
+
+    /// A buffer handle. Stable for the lifetime of an open buffer.
+    type buffer-id = u64;
+
+    /// A window handle.
+    type window-id = u64;
+
+    /// A half-open selection range. `anchor` is the fixed end, `head` the moving
+    /// end (they may be equal for a caret, and anchor may be > head).
+    record range {
+        anchor: char-idx,
+        head: char-idx,
+    }
+
+    /// A multi-range selection (ADR-006: selection is always 1..N ranges).
+    record selection {
+        ranges: list<range>,
+        /// Index into `ranges` of the primary cursor.
+        primary: u32,
+    }
+
+    /// Severity for `log.notify`.
+    enum notify-level {
+        info,
+        warn,
+        error,
+    }
+
+    /// An editor mode, as observed by plugins (read-only).
+    enum mode {
+        normal,
+        insert,
+        visual,
+        visual-line,
+        visual-block,
+        command,
+    }
+
+    /// A style for a decoration or highlight group.
+    /// Colors are `#rrggbb` or a theme scope/ANSI name; empty = inherit.
+    record style {
+        fg: option<string>,
+        bg: option<string>,
+        bold: bool,
+        italic: bool,
+        underline: bool,
+    }
+
+    /// Errors a host call can return. Plugins must handle these without panicking.
+    variant host-error {
+        /// The buffer/window handle is no longer valid.
+        invalid-handle,
+        /// A char index was out of bounds for the buffer.
+        out-of-bounds,
+        /// The plugin lacks the capability for this call (permission model).
+        permission-denied(string),
+        /// The transaction did not apply cleanly (e.g. stale base).
+        rejected(string),
+    }
+}

@@ -1,0 +1,11 @@
+[plugin]
+name = "todo-highlighter"
+version = "0.1.0"
+entry = "todo_highlighter.wasm"
+min-api-version = "0.1"
+
+[permissions]
+buffer = "read"
+
+[activation]
+events = ["buffer-open", "buffer-change"]

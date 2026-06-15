@@ -1,0 +1,12 @@
+[plugin]
+name = "git-blame-inline"
+version = "0.1.0"
+entry = "git_blame_inline.wasm"
+min-api-version = "0.1"
+
+[permissions]
+buffer = "read"
+filesystem = [".git"]
+
+[activation]
+events = ["cursor-hold"]

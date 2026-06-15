@@ -1,0 +1,27 @@
+[package]
+name = "onda-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# WASM Component Model plugin host (ADR-002, DESIGN §5.5) — replaces `onda-lua`.
+# W17: WIT surface + manifest + permission model. W18: wasmtime engine + instance
+# lifecycle + epoch budgets + capability wiring. W19: plugin manager + lockfile.
+
+[dependencies]
+onda-core = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# WASM Component Model host (W18, ADR-002). wasmtime-wasi satisfies the WASI
+# imports that the wasip2 std pulls in; capability interfaces (fs/http) are wired
+# separately and only when granted.
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
+# Plugin manager (W19): git = package source; lockfile via serde+toml.
+git2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

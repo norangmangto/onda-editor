@@ -1,0 +1,21 @@
+[package]
+name = "todo-highlighter"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+# A reference onda plugin (W20). Builds to a WASM component:
+#   cargo build --release --target wasm32-wasip2
+# The resulting target/wasm32-wasip2/release/todo_highlighter.wasm is a
+# component loadable by the onda-plugin host.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+
+[profile.release]
+opt-level = "s"
+strip = true

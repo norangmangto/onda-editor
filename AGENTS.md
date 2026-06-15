@@ -52,12 +52,19 @@ them without updating the doc first).
  time, and maintenance are costs). Pre-approved: ropey, crossterm, tokio, tracing,
  thiserror, anyhow, criterion, unicode-segmentation, unicode-width, tree-sitter,
  libloading, regex, nucleo-matcher, toml, notify, arboard, ignore,
- lsp-types, portable-pty, vt100, mlua (lua54 feature), serde_json, url, tempfile,
+ lsp-types, portable-pty, vt100, serde_json, url, tempfile,
  git2 (libgit2 bindings — git status/diff/blame, Phase 3 W16),
  russh + russh-sftp (SSH transport for remote editing, Phase 3 W17),
  libvterm-sys (vendored libvterm FFI — terminal emulation, Phase 3 W17;
  `unsafe` FFI requires `// SAFETY:` comments per rule 4),
  dap-types (hand-rolled DAP JSON types acceptable, Phase 3 W15).
+ **Phase 3 plugin system (`onda-plugin`, WASM — ADR-002):** wasmtime
+ (component model feature on; pin the major version, record upgrade policy here),
+ wit-bindgen, wasmparser, cap-std (preopen-scoped fs for the permission model).
+ The plugin runtime is **WASM Component Model**, not Lua — ADR-002 explicitly
+ rejects Lua embedding (single-language, weak sandbox). `mlua` is **removed**;
+ the `onda-lua` crate is being replaced by `onda-plugin` during the W17→W20
+ migration and must not be extended.
  Phase 4 (ACP agent integration): the `agent-client-protocol` crate is the upstream
  option but the spec is moving — onda **vendors** the ACP JSON-RPC types in `onda-agent`
  (no new external dep; built on the pre-approved serde/serde_json/tokio), with a thin
@@ -72,7 +79,8 @@ them without updating the doc first).
 
 ## Workflow for agents
 
-1. Work on **one task ID** (from `PHASE0_PLAN.md`, `PHASE1_PLAN.md`, or `PHASE2_PLAN.md`) per session. Don't drift into
+1. Work on **one task ID** (from the phase plans under `docs/plan/` —
+   `PHASE0_PLAN.md` … `PHASE5_PLAN.md`) per session. Don't drift into
    adjacent tasks; note follow-ups in `docs/BACKLOG.md` instead.
 2. Before coding: restate the task's acceptance criteria; list files you expect to touch.
 3. Definition of done = acceptance criteria + tests + fmt/clippy + bench (if applicable).
@@ -88,4 +96,10 @@ them without updating the doc first).
 - "Optimizing later": perf is verified per-commit, not per-phase.
 - Full-screen redraws "to keep it simple" — the compositor exists; use it.
 - Reaching for a heavyweight TUI framework — onda owns its compositor (ADR-004).
+- Exposing a plugin host function that can **block** the caller — every WASM host
+  call must be non-blocking (snapshot read or queued transaction), never an await
+  point that stalls the frame (rule 2 + ADR-002).
+- Passing **raw buffer/rope access** across the plugin boundary — all plugin
+  mutation flows through transactions over the WIT API; positions are char-indices.
+- Reaching for Lua/`mlua` for plugins — ADR-002 mandates WASM Component Model.
 
