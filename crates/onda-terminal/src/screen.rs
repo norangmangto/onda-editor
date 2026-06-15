@@ -216,4 +216,59 @@ mod tests {
         assert_eq!(r, g);
         assert_eq!(g, b);
     }
+
+    fn line(s: &TerminalScreen, row: u16) -> String {
+        s.row(row).iter().map(|c| c.ch).collect::<String>()
+    }
+
+    #[test]
+    fn plain_text_writes_and_advances_cursor() {
+        let mut s = TerminalScreen::new(4, 20);
+        s.process(b"hello");
+        assert_eq!(line(&s, 0).trim_end(), "hello");
+        assert_eq!(s.cursor_pos(), (0, 5));
+    }
+
+    #[test]
+    fn crlf_moves_to_next_row() {
+        let mut s = TerminalScreen::new(4, 20);
+        s.process(b"ab\r\ncd");
+        assert_eq!(line(&s, 0).trim_end(), "ab");
+        assert_eq!(line(&s, 1).trim_end(), "cd");
+        assert_eq!(s.cursor_pos(), (1, 2));
+    }
+
+    #[test]
+    fn cursor_position_escape() {
+        let mut s = TerminalScreen::new(10, 20);
+        s.process(b"\x1b[3;5H"); // row 3, col 5 (1-based) → (2,4) 0-based
+        assert_eq!(s.cursor_pos(), (2, 4));
+        s.process(b"X");
+        assert_eq!(s.row(2)[4].ch, 'X');
+    }
+
+    #[test]
+    fn clear_screen_blanks_cells() {
+        let mut s = TerminalScreen::new(4, 20);
+        s.process(b"junk text");
+        s.process(b"\x1b[2J"); // erase entire screen
+        assert_eq!(line(&s, 0).trim_end(), "");
+    }
+
+    #[test]
+    fn sgr_bold_attribute_applies() {
+        let mut s = TerminalScreen::new(4, 20);
+        s.process(b"\x1b[1mB\x1b[0mN"); // bold 'B', reset, normal 'N'
+        assert!(s.row(0)[0].attrs.bold);
+        assert!(!s.row(0)[1].attrs.bold);
+    }
+
+    #[test]
+    fn resize_changes_dimensions() {
+        let mut s = TerminalScreen::new(4, 20);
+        s.resize(10, 40);
+        assert_eq!(s.rows(), 10);
+        assert_eq!(s.cols(), 40);
+        assert_eq!(s.row(0).len(), 40);
+    }
 }

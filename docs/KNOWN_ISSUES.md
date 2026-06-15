@@ -53,6 +53,8 @@ plan) or remove it.
 
 ## Fixed (kept briefly for reference)
 
+- 🟠 LSP percent-decode corrupted multibyte (non-ASCII) paths; `initialize`
+  root URI wasn't percent-encoded — both fixed.
 - 🔴 Single-line `:s` wiped the whole buffer — fixed (splice result into range).
 - 🟠 Cursor misplaced after wide/CJK chars — fixed (`char_to_display_col`).
 - 🟠 Wide-char ghosting on redraw — fixed (width-0 continuation cells).

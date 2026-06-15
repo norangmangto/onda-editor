@@ -117,3 +117,89 @@ fn dirs_path() -> PathBuf {
 fn dirs_home() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{BufferEntry, CursorPos, SplitEntry, WindowEntry};
+
+    fn mgr_in(dir: &Path) -> SessionManager {
+        SessionManager {
+            sessions_dir: dir.join("sessions"),
+        }
+    }
+
+    fn sample(cwd: &str) -> Session {
+        Session {
+            version: Session::CURRENT_VERSION,
+            cwd: PathBuf::from(cwd),
+            buffers: vec![BufferEntry {
+                id: 0,
+                path: Some(PathBuf::from(format!("{cwd}/a.rs"))),
+                name: "a.rs".into(),
+                unsaved_content: None,
+            }],
+            windows: vec![WindowEntry {
+                id: 0,
+                buffer_id: 0,
+                cursor: CursorPos {
+                    char_offset: 7,
+                    viewport_line: 0,
+                },
+            }],
+            layout: SplitEntry::Window { window_id: 0 },
+            focused_window: 0,
+        }
+    }
+
+    #[test]
+    fn named_save_load_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = mgr_in(tmp.path());
+        m.save("work", &sample("/p")).unwrap();
+        let loaded = m.load("work").unwrap();
+        assert_eq!(loaded.cwd, PathBuf::from("/p"));
+        assert_eq!(loaded.buffers[0].name, "a.rs");
+    }
+
+    #[test]
+    fn load_missing_session_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = mgr_in(tmp.path());
+        assert!(m.load("nope").is_err());
+    }
+
+    #[test]
+    fn auto_load_returns_none_without_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = mgr_in(tmp.path());
+        assert!(m.auto_load().is_none());
+        m.auto_save(&sample("/x")).unwrap();
+        assert!(m.auto_load().is_some());
+    }
+
+    #[test]
+    fn list_sessions_returns_saved_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = mgr_in(tmp.path());
+        m.save("alpha", &sample("/a")).unwrap();
+        m.save("beta", &sample("/b")).unwrap();
+        let mut names = m.list_sessions();
+        names.sort();
+        assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn project_local_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        SessionManager::save_project_local(tmp.path(), &sample("/proj")).unwrap();
+        let loaded = SessionManager::load_project_local(tmp.path()).expect("loads");
+        assert_eq!(loaded.cwd, PathBuf::from("/proj"));
+    }
+
+    #[test]
+    fn project_local_absent_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(SessionManager::load_project_local(tmp.path()).is_none());
+    }
+}

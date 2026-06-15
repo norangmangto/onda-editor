@@ -89,12 +89,8 @@ impl LspClient {
     }
 
     async fn initialize(&mut self) -> Result<(), LspError> {
-        let root_str = self.root.to_string_lossy();
-        let root_uri = if root_str.starts_with('/') {
-            format!("file://{}/", root_str)
-        } else {
-            format!("file:///{}/", root_str)
-        };
+        // Percent-encode like file URIs elsewhere (spaces / non-ASCII roots).
+        let root_uri = format!("{}/", path_to_uri(&self.root));
 
         let params = json!({
             "processId": std::process::id(),
@@ -642,21 +638,65 @@ fn uri_to_path(uri: &lsp_types::Uri) -> PathBuf {
 }
 
 fn percent_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
+    // Decode into raw bytes first, then interpret as UTF-8. Pushing each decoded
+    // byte as a `char` would corrupt multibyte sequences (e.g. a percent-encoded
+    // Hangul path), so collect bytes and decode once.
     let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
             if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
                 if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                    result.push(byte as char);
+                    out.push(byte);
                     i += 3;
                     continue;
                 }
             }
         }
-        result.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    result
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod uri_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn percent_roundtrip_spaces() {
+        let s = "/home/user/my project/file.rs";
+        let enc = percent_encode_path(s);
+        assert!(!enc.contains(' '));
+        assert!(enc.contains("%20"));
+        assert_eq!(percent_decode(&enc), s);
+    }
+
+    #[test]
+    fn percent_roundtrip_multibyte() {
+        // Regression: percent-decoding must reassemble multibyte UTF-8, not push
+        // each byte as a char (which corrupted non-ASCII paths).
+        let s = "/home/사용자/파일.rs";
+        let enc = percent_encode_path(s);
+        assert!(enc.is_ascii(), "encoded form should be ASCII: {enc}");
+        assert_eq!(percent_decode(&enc), s);
+    }
+
+    #[test]
+    fn path_to_uri_unix_absolute_encodes_space() {
+        let uri = path_to_uri(Path::new("/tmp/a b.rs"));
+        assert_eq!(uri, "file:///tmp/a%20b.rs");
+    }
+
+    #[test]
+    fn uri_to_path_roundtrips_through_path_to_uri() {
+        for p in ["/home/user/space dir/x.rs", "/tmp/한글/파일.rs"] {
+            let pb = PathBuf::from(p);
+            let uri = path_to_uri(&pb);
+            let parsed = lsp_types::Uri::from_str(&uri).expect("valid uri");
+            assert_eq!(uri_to_path(&parsed), pb, "roundtrip failed for {p}");
+        }
+    }
 }
