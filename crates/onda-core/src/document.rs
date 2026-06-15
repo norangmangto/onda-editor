@@ -219,6 +219,25 @@ impl Document {
         (line, col)
     }
 
+    /// Convert a char index to a (line, display_col) pair, where `display_col` sums
+    /// the terminal cell widths of preceding characters on the line (wide/CJK glyphs
+    /// count as 2). Use this for cursor placement; [`char_to_visual_pos`] returns a
+    /// grapheme count, which under-counts columns when wide characters precede the
+    /// cursor.
+    pub fn char_to_display_col(&self, char_idx: usize) -> (usize, usize) {
+        use unicode_width::UnicodeWidthChar;
+        let char_idx = char_idx.min(self.rope.len_chars());
+        let line = self.rope.char_to_line(char_idx);
+        let line_start = self.rope.line_to_char(line);
+        let col: usize = self
+            .rope
+            .slice(line_start..char_idx)
+            .chars()
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum();
+        (line, col)
+    }
+
     /// Convert a (line, grapheme_col) pair to a char index.
     pub fn visual_pos_to_char(&self, line: usize, col: usize) -> usize {
         let line = line.min(self.rope.len_lines().saturating_sub(1));
@@ -334,6 +353,41 @@ mod tests {
         assert_eq!(col, 1);
         let back = doc.visual_pos_to_char(1, 1);
         assert_eq!(back, 7);
+    }
+
+    #[test]
+    fn multibyte_char_and_line_conversions() {
+        // Each Hangul syllable is one char (3 UTF-8 bytes, 2 display cells).
+        let doc = doc_from_str("가나다\n라마\n");
+        assert_eq!(doc.len_lines(), 3); // two lines + empty final
+        assert_eq!(doc.len_chars(), 7); // 3 + \n + 2 + \n
+        assert_eq!(doc.line_len_no_eol(0), 3);
+        assert_eq!(doc.line_len_no_eol(1), 2);
+        assert_eq!(doc.char_to_line(0), 0);
+        assert_eq!(doc.char_to_line(3), 0); // the newline char of line 0
+        assert_eq!(doc.char_to_line(4), 1); // first char of "라마"
+        assert_eq!(doc.line_to_char(1), 4);
+    }
+
+    #[test]
+    fn display_col_accounts_for_wide_chars() {
+        let doc = doc_from_str("가나X\n");
+        // grapheme columns under-count; display columns count wide glyphs as 2.
+        assert_eq!(doc.char_to_visual_pos(2), (0, 2)); // grapheme count before 'X'
+        assert_eq!(doc.char_to_display_col(2), (0, 4)); // 가(2) + 나(2)
+                                                        // ASCII line is unaffected.
+        let ascii = doc_from_str("abc\n");
+        assert_eq!(ascii.char_to_display_col(2), (0, 2));
+    }
+
+    #[test]
+    fn display_col_mixed_width_line() {
+        let doc = doc_from_str("a가b나\n"); // widths: 1,2,1,2
+        assert_eq!(doc.char_to_display_col(0), (0, 0));
+        assert_eq!(doc.char_to_display_col(1), (0, 1)); // after 'a'
+        assert_eq!(doc.char_to_display_col(2), (0, 3)); // after 'a가'
+        assert_eq!(doc.char_to_display_col(3), (0, 4)); // after 'a가b'
+        assert_eq!(doc.char_to_display_col(4), (0, 6)); // after 'a가b나'
     }
 
     #[test]

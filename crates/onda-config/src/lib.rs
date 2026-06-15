@@ -351,4 +351,39 @@ line_numbers = "relative"
             Some("move_down")
         );
     }
+
+    #[test]
+    fn overlay_editor_and_theme_override_base() {
+        let mut base = Config::default();
+        base.editor.tab_width = 8;
+        base.theme = "base-theme".into();
+
+        let mut overlay = Config::default();
+        overlay.editor.tab_width = 2;
+        overlay.editor.expand_tab = false;
+        overlay.theme = "project-theme".into();
+
+        let merged = merge(base, overlay);
+        assert_eq!(merged.editor.tab_width, 2);
+        assert!(!merged.editor.expand_tab);
+        assert_eq!(merged.theme, "project-theme");
+    }
+
+    #[test]
+    fn parse_editor_section_overrides_defaults() {
+        let toml = r#"
+            theme = "onda-light"
+            [editor]
+            tab_width = 2
+            expand_tab = false
+            scrolloff = 5
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.editor.tab_width, 2);
+        assert!(!cfg.editor.expand_tab);
+        assert_eq!(cfg.editor.scrolloff, 5);
+        assert_eq!(cfg.theme, "onda-light");
+        // Unspecified editor fields keep their defaults.
+        assert_eq!(cfg.editor.auto_indent, default_auto_indent());
+    }
 }

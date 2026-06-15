@@ -1809,7 +1809,9 @@ impl<B: Backend> App<B> {
         let doc = self.doc();
         let win = self.focused_win();
         let head = win.selection.primary().head;
-        let (line, col) = doc.char_to_visual_pos(head);
+        // Use display columns (wide/CJK glyphs = 2 cells) so the cursor lands on the
+        // right cell when wide characters precede it on the line.
+        let (line, col) = doc.char_to_display_col(head);
 
         let screen_row = rect.y + line.saturating_sub(win.viewport.offset_line) as u16;
         let screen_col = rect.x
@@ -2585,10 +2587,16 @@ impl<B: Backend> App<B> {
                         line_end,
                     );
                     if let Some((new_text, _count)) = result {
+                        // `substitute` returns only the substituted [line_start,
+                        // line_end) slice — splice it back in, preserving the rest of
+                        // the buffer (a full `delete(len)` would drop everything
+                        // outside the range, e.g. for a single-line `:s`).
                         let len = self.doc().len_chars();
                         let cs = onda_core::transaction::ChangeSetBuilder::new(len)
-                            .delete(len)
+                            .retain(line_start)
+                            .delete(line_end - line_start)
                             .insert(&new_text)
+                            .retain(len - line_end)
                             .build();
                         let tx = Transaction::new(cs);
                         let sel_before = self.selection().clone();
@@ -5377,5 +5385,126 @@ mod edit_integration_tests {
         keys(&mut app, "$"); // end of line (on 'f')
         keys(&mut app, "p"); // paste "abc" after cursor
         assert_eq!(body(&app), "abcdefabc\n");
+    }
+}
+
+#[cfg(test)]
+mod search_substitute_tests {
+    use super::*;
+
+    fn app_with(text: &str) -> App<NullBackend> {
+        let (bg_tx, bg_rx) = mpsc::sync_channel(64);
+        let backend = NullBackend::new(120, 40);
+        let (w, h) = backend.size();
+        let compositor = Compositor::new(w, h);
+        let mut doc = Document::new_empty();
+        let cs = onda_core::transaction::ChangeSetBuilder::new(0)
+            .insert(text)
+            .build();
+        doc.apply(&Transaction::new(cs)).unwrap();
+        make_app(
+            doc,
+            backend,
+            compositor,
+            bg_tx,
+            bg_rx,
+            Config::default(),
+            false,
+        )
+    }
+
+    fn body(app: &App<NullBackend>) -> String {
+        app.doc().rope().to_string()
+    }
+    fn head(app: &App<NullBackend>) -> usize {
+        app.selection().primary().head
+    }
+    fn keys(app: &mut App<NullBackend>, s: &str) {
+        for c in s.chars() {
+            app.handle_key(Key::char(c)).unwrap();
+        }
+    }
+
+    // ── Search ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn search_forward_jumps_to_match() {
+        let mut app = app_with("foo bar foo\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "/bar"); // `/` enters search, then the pattern
+        app.handle_key(Key::Enter).unwrap();
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(head(&app), 4); // start of "bar"
+    }
+
+    #[test]
+    fn search_n_and_capital_n_cycle() {
+        let mut app = app_with("foo bar foo bar\n"); // "bar" at 4 and 12
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "/bar");
+        app.handle_key(Key::Enter).unwrap();
+        assert_eq!(head(&app), 4);
+        keys(&mut app, "n");
+        assert_eq!(head(&app), 12);
+        keys(&mut app, "N");
+        assert_eq!(head(&app), 4);
+    }
+
+    #[test]
+    fn search_not_found_keeps_cursor() {
+        let mut app = app_with("hello world\n");
+        *app.selection_mut() = Selection::point(3);
+        keys(&mut app, "/zzz");
+        app.handle_key(Key::Enter).unwrap();
+        assert_eq!(head(&app), 3); // unchanged
+    }
+
+    #[test]
+    fn star_searches_word_under_cursor() {
+        let mut app = app_with("foo bar foo\n");
+        *app.selection_mut() = Selection::point(0); // on first "foo"
+        keys(&mut app, "*");
+        assert_eq!(head(&app), 8); // second "foo"
+    }
+
+    // ── Substitute ──────────────────────────────────────────────────────────
+
+    fn run_cmd(app: &mut App<NullBackend>, cmd: &str) {
+        app.handle_key(Key::char(':')).unwrap();
+        for c in cmd.chars() {
+            app.handle_key(Key::char(c)).unwrap();
+        }
+        app.handle_key(Key::Enter).unwrap();
+    }
+
+    #[test]
+    fn substitute_all_lines_global() {
+        let mut app = app_with("aaa\nbbb\naaa\n");
+        run_cmd(&mut app, "%s/a/X/g");
+        assert_eq!(body(&app), "XXX\nbbb\nXXX\n");
+    }
+
+    #[test]
+    fn substitute_current_line_only() {
+        let mut app = app_with("aa\naa\n");
+        *app.selection_mut() = Selection::point(0); // line 0
+        run_cmd(&mut app, "s/a/X/g");
+        assert_eq!(body(&app), "XX\naa\n");
+    }
+
+    #[test]
+    fn substitute_first_match_without_global() {
+        let mut app = app_with("aa\n");
+        run_cmd(&mut app, "s/a/X/");
+        assert_eq!(body(&app), "Xa\n");
+    }
+
+    #[test]
+    fn substitute_is_undoable() {
+        let mut app = app_with("aaa\n");
+        run_cmd(&mut app, "%s/a/X/g");
+        assert_eq!(body(&app), "XXX\n");
+        keys(&mut app, "u");
+        assert_eq!(body(&app), "aaa\n");
     }
 }
