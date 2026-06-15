@@ -7,8 +7,9 @@ Instructions for AI coding agents (Claude Code, etc.) working on this repository
 
 onda is a Rust modal editor/IDE (vim-like keybindings, own ecosystem). Performance is the
 core philosophy: **onda must be as fast as or faster than Neovim, always.** Design doc:
-`docs/DESIGN.md` (architecture decisions are recorded as ADR-001..009 — do not violate
-them without updating the doc first).
+`docs/DESIGN.md` (product decisions are recorded as ADR-001..009 and implementation
+decisions as ADR-101+ — do not violate them, and do not change them without the user's
+explicit approval; see rule 3).
 
 ## Non-negotiable rules
 
@@ -41,6 +42,11 @@ them without updating the doc first).
   must not depend on each other unless documented in `docs/DESIGN.md` §6.
 - Rendering uses damage tracking: mutate the cell grid, let the compositor diff. Never
   force a full redraw outside resize/theme-change.
+- **ADRs are owned by the user.** Never add, remove, renumber, or change the meaning of
+  any ADR in `docs/DESIGN.md` (product ADR-001..009 or implementation ADR-101+) without
+  the user's **explicit** approval in the request. If your work seems to require an ADR
+  change, **stop and ask** — do not silently reinterpret an architecture decision. Fixing
+  typos/links in surrounding prose is fine; touching a decision is not.
 
 ### 4. Code standards
 - `cargo fmt` and `cargo clippy --workspace --all-targets -- -D warnings` must pass.
