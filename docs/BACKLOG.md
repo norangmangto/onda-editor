@@ -116,11 +116,15 @@ rejects Lua). The shipped `onda-lua` (mlua) system is a divergence being reverse
   `onda plugin install|list|remove` CLI wired. fmt+clippy+`cargo test --workspace`
   green; CLI install→list→remove smoke-tested with a real component.
 
+### Done — decoration rendering
+- Plugin `SetDecorations`/`ClearDecorations` stored per (doc, namespace) and
+  painted in `render_frame` after git signs: highlight ranges (cell-style overlay
+  preserving the grapheme), gutter signs, and end-of-line virtual text (inlay
+  style). Colors parse `#rrggbb`/basic names. `draw_plugin_{signs,highlights,
+  virt_text}` unit-tested for coordinate mapping. todo-highlighter now visibly
+  marks TODO/FIXME lines; git-blame shows the branch at end of the cursor line.
+
 ### Outstanding — plugin follow-ups
-- **Decoration rendering**: plugin virt-text / signs / highlight-ranges
-  (`SetDecorations`) are received but not yet painted — wire into the compositor
-  (the LSP/git decoration path is the model). Until then todo-highlighter's
-  highlights/signs are no-ops (highlight-*group* overrides do apply via the theme).
 - **Permission approval UI**: `discover` auto-grants declared capabilities; add the
   install-time + first-use prompt (T18.3 / T24.3 pattern). fs is still whitelist- +
   `..`-scoped and ungranted imports still fail to link.

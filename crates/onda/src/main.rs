@@ -411,6 +411,8 @@ struct App<B: Backend> {
     plugin_host: Option<PluginHost>,
     /// True after an idle tick has fired plugin events; reset on input.
     plugin_idle_fired: bool,
+    /// Plugin decorations to paint: doc index → namespace → batch.
+    plugin_decorations: HashMap<usize, HashMap<String, onda_plugin::DecorationBatch>>,
 
     // ── Git ──────────────────────────────────────────────────────────────────
     /// Background git worker (lazily spawned on first git use).
@@ -2137,6 +2139,16 @@ impl<B: Backend> App<B> {
                 // Git gutter signs (overlay in the leftmost gutter column).
                 if let Some(signs) = self.git_signs.get(&doc_idx) {
                     draw_git_signs(grid, rect, viewport, signs);
+                }
+
+                // Plugin decorations: highlights (cell overlay), gutter signs,
+                // and end-of-line virtual text, per namespace.
+                if let Some(ns_map) = self.plugin_decorations.get(&doc_idx) {
+                    for batch in ns_map.values() {
+                        draw_plugin_highlights(grid, rect, viewport, doc, &batch.highlights);
+                        draw_plugin_signs(grid, rect, viewport, &batch.signs);
+                        draw_plugin_virt_text(grid, rect, viewport, doc, &batch.virt_texts);
+                    }
                 }
 
                 // Debugger gutter markers (breakpoints ●/◌, stop →) take precedence.
@@ -4351,12 +4363,23 @@ impl<B: Backend> App<B> {
                     self.plugin_highlights.push((group, style));
                     self.compositor.buf.invalidate();
                 }
-                // Decoration rendering (virt-text/signs/highlight ranges), picker
-                // contributions, statusline segments, and plugin keymaps are
-                // follow-ups — see docs/BACKLOG.md. CmdCreate is owned by PluginHost.
-                PluginApiCall::SetDecorations { .. }
-                | PluginApiCall::ClearDecorations { .. }
-                | PluginApiCall::UiPick { .. }
+                PluginApiCall::SetDecorations { buf_id, batch } => {
+                    self.plugin_decorations
+                        .entry(buf_id as usize)
+                        .or_default()
+                        .insert(batch.namespace.clone(), batch);
+                    self.compositor.buf.invalidate();
+                }
+                PluginApiCall::ClearDecorations { buf_id, namespace } => {
+                    if let Some(ns) = self.plugin_decorations.get_mut(&(buf_id as usize)) {
+                        ns.remove(&namespace);
+                    }
+                    self.compositor.buf.invalidate();
+                }
+                // Picker contributions, statusline segments, and plugin keymaps
+                // are follow-ups — see docs/BACKLOG.md. CmdCreate is owned by
+                // PluginHost (the command registry).
+                PluginApiCall::UiPick { .. }
                 | PluginApiCall::StatuslineSegment { .. }
                 | PluginApiCall::CmdCreate { .. }
                 | PluginApiCall::KeymapSet { .. } => {}
@@ -5032,6 +5055,7 @@ fn make_app<B: Backend>(
         session_manager: SessionManager::new(),
         plugin_host: None,
         plugin_idle_fired: false,
+        plugin_decorations: HashMap::new(),
         git_worker: None,
         git_signs: HashMap::new(),
         git_status_root: None,
@@ -5272,6 +5296,155 @@ fn draw_git_signs(
                 rect.y + screen_row,
                 Cell::new(sign.glyph().to_string(), style),
             );
+        }
+    }
+}
+
+/// Parse a plugin color string (`#rrggbb` or a basic name) to a render `Color`.
+fn plugin_color(s: &str) -> Option<onda_render::Color> {
+    use onda_render::Color;
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix('#') {
+        if hex.len() == 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            return Some(Color::Rgb(r, g, b));
+        }
+        return None;
+    }
+    Some(match s.to_ascii_lowercase().as_str() {
+        "black" => Color::Black,
+        "red" => Color::Red,
+        "green" => Color::Green,
+        "yellow" => Color::Yellow,
+        "blue" => Color::Blue,
+        "magenta" => Color::Magenta,
+        "cyan" => Color::Cyan,
+        "white" => Color::White,
+        "gray" | "grey" => Color::DarkGray,
+        _ => return None,
+    })
+}
+
+/// Convert a plugin decoration style to a render `Style`.
+fn plugin_style(s: &onda_plugin::Style) -> onda_render::Style {
+    let mut st = onda_render::Style::default();
+    if let Some(fg) = s.fg.as_deref().and_then(plugin_color) {
+        st = st.fg(fg);
+    }
+    if let Some(bg) = s.bg.as_deref().and_then(plugin_color) {
+        st = st.bg(bg);
+    }
+    if s.bold {
+        st = st.bold();
+    }
+    if s.italic {
+        st = st.italic();
+    }
+    st
+}
+
+/// Paint plugin gutter signs (one glyph per line in the gutter column).
+fn draw_plugin_signs(
+    grid: &mut onda_render::Grid,
+    rect: &Rect,
+    viewport: &Viewport,
+    signs: &[(usize, String, onda_plugin::Style)],
+) {
+    if viewport.line_nr_width == 0 {
+        return;
+    }
+    for (line, glyph, style) in signs {
+        if *line < viewport.offset_line {
+            continue;
+        }
+        let screen_row = (*line - viewport.offset_line) as u16;
+        if screen_row >= rect.height {
+            continue;
+        }
+        grid.set(
+            rect.x,
+            rect.y + screen_row,
+            onda_render::Cell::new(glyph.clone(), plugin_style(style)),
+        );
+    }
+}
+
+/// Overlay plugin highlight styles onto cells in each char range (grapheme kept).
+fn draw_plugin_highlights(
+    grid: &mut onda_render::Grid,
+    rect: &Rect,
+    viewport: &Viewport,
+    doc: &Document,
+    highlights: &[(usize, usize, onda_plugin::Style)],
+) {
+    let gutter = viewport.line_nr_width;
+    let total = doc.len_chars();
+    for (start, end, style) in highlights {
+        let st = plugin_style(style);
+        let start = (*start).min(total);
+        let end = (*end).min(total);
+        for ch in start..end {
+            let line = doc.char_to_line(ch);
+            if line < viewport.offset_line {
+                continue;
+            }
+            let screen_row = (line - viewport.offset_line) as u16;
+            if screen_row >= rect.height {
+                continue;
+            }
+            let col = ch - doc.line_to_char(line);
+            if col < viewport.offset_col {
+                continue;
+            }
+            let sx = rect.x + gutter + (col - viewport.offset_col) as u16;
+            if sx >= rect.x + rect.width {
+                continue;
+            }
+            let row = rect.y + screen_row;
+            let grapheme = grid
+                .get(sx, row)
+                .map(|c| c.grapheme.clone())
+                .unwrap_or_else(|| " ".to_string());
+            grid.set(sx, row, onda_render::Cell::new(grapheme, st));
+        }
+    }
+}
+
+/// Paint plugin virtual text at the end of its anchor line (inlay-style).
+fn draw_plugin_virt_text(
+    grid: &mut onda_render::Grid,
+    rect: &Rect,
+    viewport: &Viewport,
+    doc: &Document,
+    virt: &[(usize, String, onda_plugin::Style)],
+) {
+    let gutter = viewport.line_nr_width;
+    let total = doc.len_chars();
+    for (at, text, style) in virt {
+        let at = (*at).min(total);
+        let line = doc.char_to_line(at);
+        if line < viewport.offset_line {
+            continue;
+        }
+        let screen_row = (line - viewport.offset_line) as u16;
+        if screen_row >= rect.height {
+            continue;
+        }
+        let eol_col = doc
+            .line_len_no_eol(line)
+            .saturating_sub(viewport.offset_col);
+        // One space gap after the line content.
+        let base = rect.x + gutter + eol_col as u16 + 1;
+        let row = rect.y + screen_row;
+        let st = plugin_style(style);
+        for (i, g) in text.chars().enumerate() {
+            let sx = base + i as u16;
+            if sx >= rect.x + rect.width {
+                break;
+            }
+            grid.set(sx, row, onda_render::Cell::new(g.to_string(), st));
         }
     }
 }
@@ -5594,4 +5767,91 @@ fn main() -> Result<()> {
         .collect();
 
     run_editor(paths)
+}
+
+#[cfg(test)]
+mod plugin_render_tests {
+    use super::*;
+    use onda_plugin::Style;
+
+    fn doc_with(text: &str) -> Document {
+        let mut d = Document::new_empty();
+        let cs = onda_core::transaction::ChangeSetBuilder::new(0)
+            .insert(text)
+            .build();
+        let _ = d.apply(&Transaction::new(cs));
+        d
+    }
+
+    fn viewport(line_nr_width: u16) -> Viewport {
+        let mut vp = Viewport::new();
+        vp.line_nr_width = line_nr_width;
+        vp.offset_line = 0;
+        vp.offset_col = 0;
+        vp
+    }
+
+    #[test]
+    fn signs_paint_in_gutter_column() {
+        let mut grid = onda_render::Grid::new(40, 10);
+        let vp = viewport(4);
+        let rect = Rect::new(0, 0, 40, 10);
+        let signs = vec![(
+            1usize,
+            "▶".to_string(),
+            Style {
+                fg: Some("#ff0000".into()),
+                ..Default::default()
+            },
+        )];
+        draw_plugin_signs(&mut grid, &rect, &vp, &signs);
+        assert_eq!(grid.get(0, 1).unwrap().grapheme, "▶");
+        assert_eq!(
+            grid.get(0, 1).unwrap().style.fg,
+            onda_render::Color::Rgb(255, 0, 0)
+        );
+    }
+
+    #[test]
+    fn highlights_overlay_style_on_range() {
+        let doc = doc_with("hello TODO world\n");
+        let mut grid = onda_render::Grid::new(40, 10);
+        let vp = viewport(0);
+        let rect = Rect::new(0, 0, 40, 10);
+        // "TODO" is chars 6..10.
+        let hl = vec![(
+            6usize,
+            10usize,
+            Style {
+                fg: Some("#00ff00".into()),
+                bold: true,
+                ..Default::default()
+            },
+        )];
+        draw_plugin_highlights(&mut grid, &rect, &vp, &doc, &hl);
+        for col in 6..10u16 {
+            assert_eq!(
+                grid.get(col, 0).unwrap().style.fg,
+                onda_render::Color::Rgb(0, 255, 0),
+                "col {col} should be highlighted"
+            );
+        }
+        // Outside the range is untouched.
+        assert_ne!(
+            grid.get(5, 0).unwrap().style.fg,
+            onda_render::Color::Rgb(0, 255, 0)
+        );
+    }
+
+    #[test]
+    fn virt_text_renders_after_line_end() {
+        let doc = doc_with("abc\n");
+        let mut grid = onda_render::Grid::new(40, 10);
+        let vp = viewport(0);
+        let rect = Rect::new(0, 0, 40, 10);
+        let v = vec![(0usize, "Z".to_string(), Style::default())];
+        draw_plugin_virt_text(&mut grid, &rect, &vp, &doc, &v);
+        // "abc" has len 3; one-space gap → virtual text starts at column 4.
+        assert_eq!(grid.get(4, 0).unwrap().grapheme, "Z");
+    }
 }
