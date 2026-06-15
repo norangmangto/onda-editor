@@ -235,12 +235,15 @@ pub fn open_line(doc: &Document, sel: &Selection, above: bool) -> (Transaction, 
     let len = doc.len_chars();
     let line = doc.char_to_line(sel.primary().head);
 
-    let insert_pos = if above {
-        doc.line_to_char(line)
-    } else if line + 1 < doc.len_lines() {
-        doc.line_to_char(line + 1)
+    // `above`: insert a newline at the line start (pushes the current line down).
+    // `below`: insert a newline after the current line's content (before its own
+    // newline, or at EOF). In both cases the cursor lands on the new empty line.
+    let (insert_pos, cursor_pos) = if above {
+        let start = doc.line_to_char(line);
+        (start, start)
     } else {
-        len
+        let end = doc.line_to_char(line) + doc.line_len_no_eol(line);
+        (end, end + 1)
     };
 
     let changes = ChangeSetBuilder::new(len)
@@ -249,8 +252,9 @@ pub fn open_line(doc: &Document, sel: &Selection, above: bool) -> (Transaction, 
         .retain(len - insert_pos)
         .build();
 
-    let cursor_pos = if above { insert_pos } else { insert_pos + 1 };
-    let new_sel = Selection::point(cursor_pos.min(len));
+    // After the insert the document has `len + 1` chars, so the new line's start
+    // (`end + 1` in the below case) is a valid cursor position.
+    let new_sel = Selection::point(cursor_pos.min(len + 1));
     (Transaction::new(changes), new_sel)
 }
 

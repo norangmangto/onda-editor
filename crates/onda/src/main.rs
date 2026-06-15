@@ -2103,11 +2103,10 @@ impl<B: Backend> App<B> {
                 self.macros.end_change();
             }
             Key::Enter => {
+                // `apply_insert` maps the cursor through the change (Assoc::After), so it
+                // already lands at the start of the new line. Adding another +1 here was a
+                // double-advance that drifted the cursor into following text on every Enter.
                 self.apply_insert(|doc, sel| onda_modal::operator::insert_char(doc, sel, '\n'))?;
-                // Move cursor to new line
-                let new_pos = self.selection().primary().head + 1;
-                let len = self.doc().len_chars();
-                *self.selection_mut() = Selection::point(new_pos.min(len));
             }
             Key::Backspace => {
                 let tx = onda_modal::operator::delete_before_cursor(self.doc(), self.selection());
@@ -4932,5 +4931,84 @@ mod plugin_render_tests {
         draw_plugin_virt_text(&mut grid, &rect, &vp, &doc, &v);
         // "abc" has len 3; one-space gap → virtual text starts at column 4.
         assert_eq!(grid.get(4, 0).unwrap().grapheme, "Z");
+    }
+}
+
+#[cfg(test)]
+mod insert_newline_tests {
+    use super::*;
+
+    fn app_with(text: &str) -> App<NullBackend> {
+        let (bg_tx, bg_rx) = mpsc::sync_channel(16);
+        let backend = NullBackend::new(120, 40);
+        let (w, h) = backend.size();
+        let compositor = Compositor::new(w, h);
+        let mut doc = Document::new_empty();
+        let cs = onda_core::transaction::ChangeSetBuilder::new(0)
+            .insert(text)
+            .build();
+        doc.apply(&Transaction::new(cs)).unwrap();
+        make_app(
+            doc,
+            backend,
+            compositor,
+            bg_tx,
+            bg_rx,
+            Config::default(),
+            false,
+        )
+    }
+
+    fn body(app: &App<NullBackend>) -> String {
+        app.doc().rope().to_string()
+    }
+
+    /// Regression: <Enter> in insert mode must land the cursor at the *start* of the
+    /// new line. A previous double-advance pushed it one char too far (skipping text).
+    #[test]
+    fn enter_lands_at_start_of_new_line() {
+        let mut app = app_with("abcd");
+        app.mode = Mode::Insert;
+        *app.selection_mut() = Selection::point(2); // between 'b' and 'c'
+        app.handle_key(Key::Enter).unwrap();
+        assert_eq!(body(&app), "ab\ncd");
+        assert_eq!(app.selection().primary().head, 3); // the 'c', not 'd' (would be 4)
+    }
+
+    /// Regression: hitting <Enter> repeatedly must not drift the cursor and garble text.
+    #[test]
+    fn repeated_enter_does_not_garble() {
+        let mut app = app_with("abcd");
+        app.mode = Mode::Insert;
+        *app.selection_mut() = Selection::point(2);
+        app.handle_key(Key::Enter).unwrap();
+        app.handle_key(Key::Enter).unwrap();
+        assert_eq!(body(&app), "ab\n\ncd");
+        assert_eq!(app.selection().primary().head, 4);
+    }
+
+    /// Regression: `o` (open line below) → type → <Enter> → type must not skip the
+    /// freshly opened line.
+    #[test]
+    fn open_below_then_type_then_enter_keeps_lines() {
+        let mut app = app_with("first\nsecond\n");
+        *app.selection_mut() = Selection::point(0); // on line 0
+        app.handle_key(Key::char('o')).unwrap();
+        assert_eq!(app.mode, Mode::Insert);
+        app.handle_key(Key::char('x')).unwrap();
+        app.handle_key(Key::Enter).unwrap();
+        app.handle_key(Key::char('y')).unwrap();
+        assert_eq!(body(&app), "first\nx\ny\nsecond\n");
+    }
+
+    /// `O` (open line above) lands on the new empty line, above the current one.
+    #[test]
+    fn open_above_then_type_keeps_lines() {
+        let mut app = app_with("first\nsecond\n");
+        *app.selection_mut() = Selection::point(6); // start of "second" (line 1)
+        app.handle_key(Key::char('O')).unwrap();
+        assert_eq!(app.mode, Mode::Insert);
+        app.handle_key(Key::char('z')).unwrap();
+        assert_eq!(body(&app), "first\nz\nsecond\n");
     }
 }
