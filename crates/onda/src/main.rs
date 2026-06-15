@@ -243,6 +243,10 @@ struct App<B: Backend> {
     // ── Macro / dot-repeat ─────────────────────────────────────────────────────
     macros: MacroRecorder,
     last_macro_reg: Option<char>,
+    /// True while replaying a dot-repeat sequence (suppresses re-recording).
+    dot_replaying: bool,
+    /// Set by `DotRepeat` so the `.` keypress itself isn't recorded as a change.
+    dot_just_replayed: bool,
 
     // ── Search ─────────────────────────────────────────────────────────────────
     search: SearchState,
@@ -1983,7 +1987,20 @@ impl<B: Backend> App<B> {
             return Ok(());
         }
 
-        match self.mode {
+        // Dot-repeat: track editing keys (Normal/Insert/Visual) so `.` can replay
+        // the last buffer-changing command. Suppressed during replay itself.
+        let track_dot = !self.dot_replaying
+            && matches!(
+                self.mode,
+                Mode::Insert | Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+            );
+        let mode_before = self.mode;
+        let rev_before = self.doc().rev();
+        if track_dot {
+            self.macros.dot_feed(&key);
+        }
+
+        let result = match self.mode {
             Mode::Insert => self.handle_insert_key(key),
             Mode::Command => self.handle_command_key(key),
             Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
@@ -1993,6 +2010,40 @@ impl<B: Backend> App<B> {
                 // Already handled before handle_key is called
                 Ok(())
             }
+        };
+
+        if track_dot {
+            self.finalize_dot(mode_before, rev_before);
+        }
+        result
+    }
+
+    /// Decide what to do with the in-progress dot sequence after a key was handled.
+    fn finalize_dot(&mut self, mode_before: Mode, rev_before: u64) {
+        // The `.` keypress itself must not become the recorded change.
+        if self.dot_just_replayed {
+            self.dot_just_replayed = false;
+            self.macros.dot_clear();
+            return;
+        }
+        // Still composing inside insert mode → keep accumulating.
+        if self.mode == Mode::Insert {
+            return;
+        }
+        // Just left insert (e.g. `i…<Esc>`, `cw…<Esc>`): the whole session is a change.
+        if mode_before == Mode::Insert {
+            self.macros.dot_commit();
+            return;
+        }
+        // A multi-key normal command still in progress (operator/count/find pending).
+        if self.keymap_state.has_pending() || self.keymap_state.count.is_some() {
+            return;
+        }
+        // Command complete: commit if it changed the buffer, else discard.
+        if self.doc().rev() != rev_before {
+            self.macros.dot_commit();
+        } else {
+            self.macros.dot_clear();
         }
     }
 
@@ -2102,7 +2153,6 @@ impl<B: Backend> App<B> {
                 self.undo().end_group();
                 self.mode = Mode::Normal;
                 self.keymap_state.reset();
-                self.macros.end_change();
             }
             Key::Enter => {
                 // `apply_insert` maps the cursor through the change (Assoc::After), so it
@@ -2641,7 +2691,6 @@ impl<B: Backend> App<B> {
             Action::EnterInsert => {
                 self.mode = Mode::Insert;
                 self.undo().begin_group();
-                self.macros.begin_change();
             }
             Action::EnterInsertLineStart => {
                 let doc = self.doc();
@@ -2650,7 +2699,6 @@ impl<B: Backend> App<B> {
                 *self.selection_mut() = Selection::point(line_start);
                 self.mode = Mode::Insert;
                 self.undo().begin_group();
-                self.macros.begin_change();
             }
             Action::EnterInsertAfter => {
                 let pos = self.selection().primary().head;
@@ -2664,7 +2712,6 @@ impl<B: Backend> App<B> {
                 *self.selection_mut() = Selection::point((pos + 1).min(line_end).min(len));
                 self.mode = Mode::Insert;
                 self.undo().begin_group();
-                self.macros.begin_change();
             }
             Action::EnterInsertLineEnd => {
                 let doc = self.doc();
@@ -2673,7 +2720,6 @@ impl<B: Backend> App<B> {
                 *self.selection_mut() = Selection::point(line_end.min(doc.len_chars()));
                 self.mode = Mode::Insert;
                 self.undo().begin_group();
-                self.macros.begin_change();
             }
             Action::EnterInsertNewLineBelow => {
                 let (tx, new_sel) =
@@ -2684,7 +2730,6 @@ impl<B: Backend> App<B> {
                 self.undo().push(tx, inv, sel_before, new_sel);
                 self.mode = Mode::Insert;
                 self.undo().begin_group();
-                self.macros.begin_change();
             }
             Action::EnterInsertNewLineAbove => {
                 let (tx, new_sel) =
@@ -2695,12 +2740,10 @@ impl<B: Backend> App<B> {
                 self.undo().push(tx, inv, sel_before, new_sel);
                 self.mode = Mode::Insert;
                 self.undo().begin_group();
-                self.macros.begin_change();
             }
             Action::EnterNormal => {
                 if self.mode == Mode::Insert {
                     self.undo().end_group();
-                    self.macros.end_change();
                 }
                 self.mode = Mode::Normal;
                 let collapsed = self.selection().collapse_to_head();
@@ -3179,9 +3222,14 @@ impl<B: Backend> App<B> {
             }
             Action::DotRepeat => {
                 if let Some(keys) = self.macros.dot_repeat().map(|s| s.to_vec()) {
+                    self.dot_replaying = true;
                     for key in keys {
                         self.handle_key(key)?;
                     }
+                    self.dot_replaying = false;
+                    // Tell finalize_dot to drop the `.` key from the change buffer
+                    // (without overwriting the change it just replayed).
+                    self.dot_just_replayed = true;
                 }
             }
 
@@ -4222,6 +4270,8 @@ fn make_app<B: Backend>(
         pending_register: None,
         macros: MacroRecorder::new(),
         last_macro_reg: None,
+        dot_replaying: false,
+        dot_just_replayed: false,
         search: SearchState::new(),
         search_matches: Vec::new(),
         search_input_dir: None,
@@ -5410,6 +5460,59 @@ mod edit_integration_tests {
         assert_eq!(app.mode, Mode::Insert);
         // Deletes the run of whitespace up to "bar" (not into the word).
         assert_eq!(body(&app), "foobar\n");
+    }
+
+    // ── Dot-repeat ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn dot_repeats_x() {
+        let mut app = app_with("abcdef\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "x"); // "bcdef"
+        keys(&mut app, "."); // "cdef"
+        keys(&mut app, "."); // "def"
+        assert_eq!(body(&app), "def\n");
+    }
+
+    #[test]
+    fn dot_repeats_dw() {
+        let mut app = app_with("aa bb cc dd\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "dw"); // "bb cc dd"
+        keys(&mut app, "."); // "cc dd"
+        assert_eq!(body(&app), "cc dd\n");
+    }
+
+    #[test]
+    fn dot_repeats_dd() {
+        let mut app = app_with("l1\nl2\nl3\nl4\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "dd"); // remove l1
+        keys(&mut app, "."); // remove l2
+        assert_eq!(body(&app), "l3\nl4\n");
+    }
+
+    #[test]
+    fn dot_repeats_insert_change() {
+        let mut app = app_with("");
+        app.handle_key(Key::char('i')).unwrap();
+        keys(&mut app, "ab");
+        app.handle_key(Key::Esc).unwrap(); // inserted "ab"
+        assert_eq!(body(&app), "ab");
+        // Cursor is on the last 'b'; `.` re-inserts "ab" before it.
+        app.handle_key(Key::char('.')).unwrap();
+        assert_eq!(body(&app), "aabb");
+    }
+
+    #[test]
+    fn motion_does_not_set_dot() {
+        let mut app = app_with("abcdef\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "x"); // change: delete char → "bcdef"
+        keys(&mut app, "ll"); // motions, must not overwrite the dot command
+        keys(&mut app, "."); // repeats the `x`, deleting under cursor
+                             // After x:"bcdef", ll→cursor on 'd'(idx2), . deletes 'd' → "bcef"
+        assert_eq!(body(&app), "bcef\n");
     }
 
     // ── Visual mode ─────────────────────────────────────────────────────────

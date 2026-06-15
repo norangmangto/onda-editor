@@ -67,22 +67,23 @@ impl MacroRecorder {
         self.macros.get(&reg).map(Vec::as_slice)
     }
 
-    /// Mark the start of a change operation (for dot-repeat tracking).
-    pub fn begin_change(&mut self) {
-        self.change_keys.clear();
-    }
-
-    /// Append a key to the ongoing change sequence.
-    pub fn record_change_key(&mut self, key: &Key) {
+    /// Append a key to the in-progress command sequence (dot-repeat tracking).
+    /// The editor feeds every editing key here, then either commits the sequence
+    /// (when the command changed the buffer) or clears it (when it didn't).
+    pub fn dot_feed(&mut self, key: &Key) {
         self.change_keys.push(key.clone());
     }
 
-    /// Finalise the change: save `change_keys` as the sequence to replay on `.`.
-    pub fn end_change(&mut self) {
+    /// Commit the accumulated sequence as the last change (replayed on `.`).
+    pub fn dot_commit(&mut self) {
         if !self.change_keys.is_empty() {
-            self.last_change = Some(self.change_keys.clone());
-            self.change_keys.clear();
+            self.last_change = Some(std::mem::take(&mut self.change_keys));
         }
+    }
+
+    /// Discard the in-progress sequence without recording it (e.g. a pure motion).
+    pub fn dot_clear(&mut self) {
+        self.change_keys.clear();
     }
 
     /// Return the key sequence for dot-repeat, or `None` if no change has been recorded.
@@ -126,11 +127,21 @@ mod tests {
     #[test]
     fn dot_repeat_tracks_change() {
         let mut rec = MacroRecorder::new();
-        rec.begin_change();
-        rec.record_change_key(&k('c'));
-        rec.record_change_key(&k('w'));
-        rec.end_change();
+        rec.dot_feed(&k('c'));
+        rec.dot_feed(&k('w'));
+        rec.dot_commit();
         assert_eq!(rec.dot_repeat(), Some([k('c'), k('w')].as_slice()));
+    }
+
+    #[test]
+    fn dot_clear_discards_in_progress_sequence() {
+        let mut rec = MacroRecorder::new();
+        rec.dot_feed(&k('d'));
+        rec.dot_feed(&k('w'));
+        rec.dot_commit(); // last_change = dw
+        rec.dot_feed(&k('w')); // a motion
+        rec.dot_clear(); // discarded — last_change unchanged
+        assert_eq!(rec.dot_repeat(), Some([k('d'), k('w')].as_slice()));
     }
 
     #[test]

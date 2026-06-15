@@ -74,6 +74,9 @@ pub struct Document {
     modified: bool,
     /// If the file was loaded with lossy UTF-8 conversion, this is set.
     pub lossy: bool,
+    /// Monotonic counter bumped on every applied [`Transaction`]. Lets callers
+    /// cheaply detect whether a command mutated the buffer (e.g. dot-repeat).
+    rev: u64,
 }
 
 impl Document {
@@ -86,6 +89,7 @@ impl Document {
             line_ending: LineEnding::Lf,
             modified: false,
             lossy: false,
+            rev: 0,
         }
     }
 
@@ -113,6 +117,7 @@ impl Document {
             line_ending,
             modified: false,
             lossy,
+            rev: 0,
         })
     }
 
@@ -153,7 +158,13 @@ impl Document {
         let inverse = tx.invert(&self.rope);
         tx.changes.apply(&mut self.rope)?;
         self.modified = true;
+        self.rev = self.rev.wrapping_add(1);
         Ok(inverse)
+    }
+
+    /// Monotonic revision counter (bumped on every applied transaction).
+    pub fn rev(&self) -> u64 {
+        self.rev
     }
 
     // ── Accessors ──────────────────────────────────────────────────────────
