@@ -73,6 +73,8 @@ motion/text-object, `u`/`<C-r>`, `/`pattern, `:%s/…/…/g`, …) work as you'd
 
 ## Feature reference
 
+> Full keybinding + `:`-command list: [`docs/KEYBINDINGS.md`](docs/KEYBINDINGS.md).
+
 ### Files, windows, search
 | Command / key | Action |
 |---|---|
