@@ -172,7 +172,12 @@ Prefix `i` = inner, `a` = around/outer.
 | `j` / `<Down>`, `k` / `<Up>` | move selection |
 | `l` / `<CR>` | expand a directory, or open a file (focus → editor) |
 | `h` | collapse the directory, or jump to its parent |
+| `a` / `A` | create a new file / directory (prompts for a name) |
+| `r` | rename the selected entry |
+| `d` | delete the selected entry (`y` to confirm) |
 | `R` | refresh the tree |
+
+In a create/rename prompt: type the name, `<CR>` confirms, `<Esc>` cancels.
 
 ---
 

@@ -145,6 +145,65 @@ impl FileTree {
     }
 }
 
+/// Reject names that are empty, contain a path separator, or are `.`/`..` — file
+/// operations only create/rename within a single directory.
+fn valid_name(name: &str) -> std::io::Result<&str> {
+    let n = name.trim();
+    if n.is_empty() || n.contains('/') || n.contains('\\') || n == "." || n == ".." {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid name",
+        ));
+    }
+    Ok(n)
+}
+
+/// Create an empty file `name` inside `dir`. Errors if it already exists.
+pub fn create_file(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
+    let name = valid_name(name)?;
+    let path = dir.join(name);
+    if path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "already exists",
+        ));
+    }
+    std::fs::File::create(&path)?;
+    Ok(path)
+}
+
+/// Create a directory `name` inside `dir`.
+pub fn create_dir(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
+    let name = valid_name(name)?;
+    let path = dir.join(name);
+    std::fs::create_dir(&path)?;
+    Ok(path)
+}
+
+/// Rename `path` to `new_name` within its parent directory.
+pub fn rename_entry(path: &Path, new_name: &str) -> std::io::Result<PathBuf> {
+    let new_name = valid_name(new_name)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let dest = parent.join(new_name);
+    if dest.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "already exists",
+        ));
+    }
+    std::fs::rename(path, &dest)?;
+    Ok(dest)
+}
+
+/// Delete `path` (recursively for directories).
+pub fn delete_entry(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
 /// Read the immediate children of `dir` (gitignore-aware), sorted directories-first
 /// then alphabetically. `.git` is always hidden.
 fn read_children(dir: &Path, depth: usize) -> Vec<TreeEntry> {
@@ -236,6 +295,39 @@ mod tests {
         assert_eq!(t.selected_entry().unwrap().depth, 1);
         t.collapse_or_parent(); // → jump to parent "src"
         assert_eq!(t.selected_entry().unwrap().name, "src");
+    }
+
+    #[test]
+    fn create_rename_delete_roundtrip() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        // create file
+        let f = create_file(root, "new.txt").unwrap();
+        assert!(f.exists() && f.is_file());
+        // duplicate create fails
+        assert!(create_file(root, "new.txt").is_err());
+        // create dir
+        let sub = create_dir(root, "subdir").unwrap();
+        assert!(sub.is_dir());
+        // rename file
+        let renamed = rename_entry(&f, "renamed.txt").unwrap();
+        assert!(!f.exists() && renamed.exists());
+        // delete file + dir
+        delete_entry(&renamed).unwrap();
+        assert!(!renamed.exists());
+        delete_entry(&sub).unwrap();
+        assert!(!sub.exists());
+    }
+
+    #[test]
+    fn invalid_names_are_rejected() {
+        let d = tempfile::tempdir().unwrap();
+        for bad in ["", "  ", "a/b", "..", "."] {
+            assert!(
+                create_file(d.path(), bad).is_err(),
+                "{bad:?} should be invalid"
+            );
+        }
     }
 
     #[test]

@@ -187,6 +187,44 @@ impl SidebarView {
     }
 }
 
+/// An in-progress file-explorer operation awaiting input (Phase 6 W34).
+#[derive(Debug, Clone)]
+struct SidebarPrompt {
+    kind: PromptKind,
+    /// Text being typed (file/dir name, or rename target).
+    input: String,
+    /// Directory new entries are created in.
+    dir: PathBuf,
+    /// Existing entry being renamed/deleted, if any.
+    target: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptKind {
+    NewFile,
+    NewDir,
+    Rename,
+    Delete,
+}
+
+impl SidebarPrompt {
+    /// One-line prompt shown in the sidebar header.
+    fn display(&self) -> String {
+        let name = self
+            .target
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        match self.kind {
+            PromptKind::NewFile => format!("new file: {}", self.input),
+            PromptKind::NewDir => format!("new dir: {}", self.input),
+            PromptKind::Rename => format!("rename: {}", self.input),
+            PromptKind::Delete => format!("delete {name}? (y/n)"),
+        }
+    }
+}
+
 /// DAP execution-control actions (F5/F10/F11/F12).
 #[derive(Debug, Clone, Copy)]
 enum DapControl {
@@ -470,6 +508,8 @@ struct App<B: Backend> {
     file_tree: Option<file_tree::FileTree>,
     /// Visible rows in the sidebar body (updated each render; for tree scrolling).
     sidebar_body_rows: usize,
+    /// In-progress file operation (create/rename/delete) awaiting input.
+    sidebar_prompt: Option<SidebarPrompt>,
 
     // ── Soft wrap ─────────────────────────────────────────────────────────────
     #[allow(dead_code)]
@@ -1493,6 +1533,12 @@ impl<B: Backend> App<B> {
     /// true when consumed. View-switching keys are handled here; content keys
     /// (file-tree navigation) are delegated per active view.
     fn handle_sidebar_key(&mut self, key: &Key) -> bool {
+        // An active file-operation prompt captures all input first.
+        if self.sidebar_prompt.is_some() {
+            self.handle_prompt_key(key);
+            self.compositor.buf.invalidate();
+            return true;
+        }
         match key {
             Key::Esc => self.sidebar_focused = false, // back to the editor, keep open
             Key::Char('q', _) => {
@@ -1530,7 +1576,9 @@ impl<B: Backend> App<B> {
     fn handle_explorer_key(&mut self, key: &Key) {
         self.ensure_file_tree();
         let rows = self.sidebar_body_rows.max(1);
+        let base_dir = self.explorer_base_dir();
         let mut open_path: Option<PathBuf> = None;
+        let mut start_prompt: Option<SidebarPrompt> = None;
         if let Some(t) = self.file_tree.as_mut() {
             match key {
                 Key::Char('j', _) | Key::Down => t.move_selection(1, rows),
@@ -1538,14 +1586,125 @@ impl<B: Backend> App<B> {
                 Key::Char('l', _) | Key::Enter => open_path = t.activate(),
                 Key::Char('h', _) => t.collapse_or_parent(),
                 Key::Char('R', _) => t.refresh(),
+                Key::Char('a', _) => {
+                    start_prompt = Some(SidebarPrompt {
+                        kind: PromptKind::NewFile,
+                        input: String::new(),
+                        dir: base_dir.clone(),
+                        target: None,
+                    });
+                }
+                Key::Char('A', _) => {
+                    start_prompt = Some(SidebarPrompt {
+                        kind: PromptKind::NewDir,
+                        input: String::new(),
+                        dir: base_dir.clone(),
+                        target: None,
+                    });
+                }
+                Key::Char('r', _) => {
+                    if let Some(e) = t.selected_entry() {
+                        start_prompt = Some(SidebarPrompt {
+                            kind: PromptKind::Rename,
+                            input: e.name.clone(),
+                            dir: base_dir.clone(),
+                            target: Some(e.path.clone()),
+                        });
+                    }
+                }
+                Key::Char('d', _) => {
+                    if let Some(e) = t.selected_entry() {
+                        start_prompt = Some(SidebarPrompt {
+                            kind: PromptKind::Delete,
+                            input: String::new(),
+                            dir: base_dir.clone(),
+                            target: Some(e.path.clone()),
+                        });
+                    }
+                }
                 _ => {}
             }
+        }
+        if let Some(p) = start_prompt {
+            self.sidebar_prompt = Some(p);
         }
         if let Some(p) = open_path {
             self.open_path_in_buffer(&p);
             self.sidebar_focused = false; // hand focus to the editor after opening
         }
         self.compositor.buf.invalidate();
+    }
+
+    /// Directory that new file-explorer entries are created in: the selected
+    /// directory, or the parent of the selected file (root if nothing selected).
+    fn explorer_base_dir(&self) -> PathBuf {
+        let t = match &self.file_tree {
+            Some(t) => t,
+            None => return std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+        match t.selected_entry() {
+            Some(e) if e.is_dir => e.path.clone(),
+            Some(e) => e
+                .path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| t.root.clone()),
+            None => t.root.clone(),
+        }
+    }
+
+    /// Handle a key while a file-operation prompt is active.
+    fn handle_prompt_key(&mut self, key: &Key) {
+        let Some(mut prompt) = self.sidebar_prompt.take() else {
+            return;
+        };
+        // Delete is a y/n confirmation; the others edit a name then commit on Enter.
+        if prompt.kind == PromptKind::Delete {
+            match key {
+                Key::Char('y', _) | Key::Char('Y', _) => self.commit_prompt(&prompt),
+                _ => {} // any other key cancels
+            }
+            return;
+        }
+        match key {
+            Key::Esc => {} // cancelled (prompt already taken)
+            Key::Enter => self.commit_prompt(&prompt),
+            Key::Backspace => {
+                prompt.input.pop();
+                self.sidebar_prompt = Some(prompt);
+            }
+            Key::Char(c, _) => {
+                prompt.input.push(*c);
+                self.sidebar_prompt = Some(prompt);
+            }
+            _ => self.sidebar_prompt = Some(prompt),
+        }
+    }
+
+    /// Perform the file operation described by `prompt` and refresh the tree.
+    fn commit_prompt(&mut self, prompt: &SidebarPrompt) {
+        let result: std::io::Result<String> = match prompt.kind {
+            PromptKind::NewFile => file_tree::create_file(&prompt.dir, &prompt.input)
+                .map(|p| format!("created {}", p.display())),
+            PromptKind::NewDir => file_tree::create_dir(&prompt.dir, &prompt.input)
+                .map(|p| format!("created {}/", p.display())),
+            PromptKind::Rename => match &prompt.target {
+                Some(t) => file_tree::rename_entry(t, &prompt.input)
+                    .map(|p| format!("renamed to {}", p.display())),
+                None => Ok(String::new()),
+            },
+            PromptKind::Delete => match &prompt.target {
+                Some(t) => file_tree::delete_entry(t).map(|_| format!("deleted {}", t.display())),
+                None => Ok(String::new()),
+            },
+        };
+        match result {
+            Ok(msg) => self.message = Message::Info(msg),
+            Err(e) => self.message = Message::Error(format!("file op: {e}")),
+        }
+        if let Some(t) = self.file_tree.as_mut() {
+            t.refresh();
+        }
     }
 
     /// Move the active sidebar view by `delta` (wrapping).
@@ -2131,6 +2290,11 @@ impl<B: Backend> App<B> {
         } else {
             Vec::new()
         };
+        // Header shows an active file-operation prompt, else the view title.
+        let sidebar_title: String = match &self.sidebar_prompt {
+            Some(p) => p.display(),
+            None => self.sidebar_view.title().to_string(),
+        };
 
         // ── Phase 3: render into grid ─────────────────────────────────────────
         {
@@ -2147,7 +2311,7 @@ impl<B: Backend> App<B> {
                     content_height,
                     &views,
                     self.sidebar_view.index(),
-                    self.sidebar_view.title(),
+                    &sidebar_title,
                     &sidebar_body,
                     self.sidebar_focused,
                     theme,
@@ -5054,6 +5218,7 @@ fn make_app<B: Backend>(
         sidebar_focused: false,
         file_tree: None,
         sidebar_body_rows: 0,
+        sidebar_prompt: None,
         soft_wrap: false,
         #[cfg(feature = "bench")]
         tracer: LatencyTracer::default(),
@@ -6358,6 +6523,60 @@ mod edit_integration_tests {
             !app.sidebar_focused,
             "focus moves to the editor after opening"
         );
+    }
+
+    #[test]
+    fn explorer_create_rename_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with("");
+        keys(&mut app, " e"); // open + focus Explorer
+        app.file_tree = Some(file_tree::FileTree::new(dir.path().to_path_buf()));
+
+        // `a` → new-file prompt; type a name; Enter creates it.
+        app.handle_key(Key::char('a')).unwrap();
+        for c in "foo.txt".chars() {
+            app.handle_key(Key::char(c)).unwrap();
+        }
+        app.handle_key(Key::Enter).unwrap();
+        assert!(dir.path().join("foo.txt").exists());
+        assert!(app
+            .file_tree
+            .as_ref()
+            .unwrap()
+            .entries()
+            .iter()
+            .any(|e| e.name == "foo.txt"));
+
+        // `r` → rename (prefilled); clear and retype; Enter renames.
+        app.handle_key(Key::char('r')).unwrap();
+        for _ in 0.."foo.txt".len() {
+            app.handle_key(Key::Backspace).unwrap();
+        }
+        for c in "bar.txt".chars() {
+            app.handle_key(Key::char(c)).unwrap();
+        }
+        app.handle_key(Key::Enter).unwrap();
+        assert!(dir.path().join("bar.txt").exists());
+        assert!(!dir.path().join("foo.txt").exists());
+
+        // `d` then `y` → delete.
+        app.handle_key(Key::char('d')).unwrap();
+        app.handle_key(Key::char('y')).unwrap();
+        assert!(!dir.path().join("bar.txt").exists());
+        assert!(app.sidebar_prompt.is_none());
+    }
+
+    #[test]
+    fn explorer_delete_cancel_with_n() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "x").unwrap();
+        let mut app = app_with("");
+        keys(&mut app, " e");
+        app.file_tree = Some(file_tree::FileTree::new(dir.path().to_path_buf()));
+        app.handle_key(Key::char('d')).unwrap(); // delete prompt
+        app.handle_key(Key::char('n')).unwrap(); // cancel
+        assert!(dir.path().join("keep.txt").exists());
+        assert!(app.sidebar_prompt.is_none());
     }
 
     #[test]
