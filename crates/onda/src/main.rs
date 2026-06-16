@@ -6,8 +6,9 @@ use std::time::Instant;
 mod doctor;
 mod file_tree;
 mod lsp_edit;
-mod scm;
 mod plugin_host;
+mod preview;
+mod scm;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -314,6 +315,21 @@ struct HoverFloat {
     row: u16,
 }
 
+// ── PreviewState ─────────────────────────────────────────────────────────────
+
+/// A non-text buffer rendered as an image/PDF preview (Phase 6 W39). View-only:
+/// the underlying `Document` rope stays empty; the metadata card and (on capable
+/// terminals) the inline image are drawn from this state.
+struct PreviewState {
+    kind: preview::PreviewKind,
+    /// File bytes, kept for inline-graphics transmission. `None` if the file was
+    /// too large to hold in memory (we then show the card only).
+    bytes: Option<Vec<u8>>,
+    info: Option<preview::ImageInfo>,
+    pages: Option<usize>,
+    byte_len: usize,
+}
+
 // ── CompletionState ────────────────────────────────────────────────────────────
 
 /// Active completion menu state.
@@ -412,6 +428,15 @@ struct App<B: Backend> {
     table_docs: HashMap<usize, onda_data::Dialect>,
     /// Cached per-column layout for table docs (computed on `:table` enable).
     table_layout: HashMap<usize, onda_data::ColumnLayout>,
+
+    // ── Rich previews (Phase 6 W39) ────────────────────────────────────────────
+    /// Image/PDF preview docs (view-only; the rope stays empty).
+    preview_docs: HashMap<usize, PreviewState>,
+    /// Terminal graphics protocol detected once at startup.
+    graphics_protocol: preview::GraphicsProtocol,
+    /// Re-emit inline graphics on the next frame (set on input/resize/open; the
+    /// idle 8ms poll never sets it, so static frames don't re-transmit).
+    graphics_dirty: bool,
 
     // ── DAP debugger (Phase 6 W40) ────────────────────────────────────────────────
     /// Configured debug adapters (dap.toml).
@@ -2025,7 +2050,9 @@ impl<B: Backend> App<B> {
 
     /// Path of the selected SCM entry, if any.
     fn scm_selected_path(&self) -> Option<String> {
-        self.scm_status.get(self.scm_selected).map(|f| f.path.clone())
+        self.scm_status
+            .get(self.scm_selected)
+            .map(|f| f.path.clone())
     }
 
     /// Source Control sidebar content keys (j/k move, a stage, u unstage, c commit,
@@ -2090,6 +2117,12 @@ impl<B: Backend> App<B> {
 
     /// Open `path` into a buffer in the focused window (shared by picker + tree).
     fn open_path_in_buffer(&mut self, path: &std::path::Path) {
+        // Image/PDF files preview as a read-only card (+ inline image on capable
+        // terminals) rather than loading binary bytes into the text rope (W39).
+        if let Some(kind) = preview::kind_for_path(path) {
+            self.open_preview(path, kind);
+            return;
+        }
         match Document::open(path) {
             Ok(doc) => {
                 let doc_idx = self.docs.len();
@@ -2101,6 +2134,49 @@ impl<B: Backend> App<B> {
             }
             Err(e) => self.message = Message::Error(format!("E: {e}")),
         }
+    }
+
+    /// Open an image/PDF as a view-only preview buffer (W39). The `Document` rope
+    /// stays empty; rendering is driven entirely by [`PreviewState`].
+    fn open_preview(&mut self, path: &std::path::Path, kind: preview::PreviewKind) {
+        // Cap how much we hold in memory for inline transmission (16 MB). Beyond
+        // that we still show the card, sized from the on-disk length.
+        const MAX_INLINE: u64 = 16 * 1024 * 1024;
+        let meta = std::fs::metadata(path).ok();
+        let byte_len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let bytes = if byte_len <= MAX_INLINE {
+            std::fs::read(path).ok()
+        } else {
+            None
+        };
+        let head = bytes.as_deref().unwrap_or(&[]);
+        let info = match kind {
+            preview::PreviewKind::Image => preview::sniff_image(head),
+            preview::PreviewKind::Pdf => None,
+        };
+        let pages = match kind {
+            preview::PreviewKind::Pdf => preview::pdf_page_count(head),
+            preview::PreviewKind::Image => None,
+        };
+
+        let mut doc = Document::new_empty();
+        doc.set_path(path.to_path_buf());
+        let doc_idx = self.docs.len();
+        self.docs.push(doc);
+        self.preview_docs.insert(
+            doc_idx,
+            PreviewState {
+                kind,
+                bytes,
+                info,
+                pages,
+                byte_len: byte_len as usize,
+            },
+        );
+        self.focused_win_mut().doc_idx = doc_idx;
+        *self.selection_mut() = Selection::point(0);
+        self.graphics_dirty = true;
+        self.message = Message::Info(format!("Preview: {}", path.display()));
     }
 
     /// Format the thread into styled panel lines (newest at the bottom).
@@ -2571,6 +2647,10 @@ impl<B: Backend> App<B> {
             Vec::new()
         };
 
+        // Inline-graphics payloads collected during render, emitted after the cell
+        // flush (they bypass the compositor — W39).
+        let mut pending_graphics: Vec<PreviewGraphic> = Vec::new();
+
         // ── Phase 3: render into grid ─────────────────────────────────────────
         {
             let theme = &self.theme;
@@ -2651,6 +2731,22 @@ impl<B: Backend> App<B> {
                     self.table_layout.get(&doc_idx),
                 ) {
                     render_table(grid, doc, sel, viewport, rect, *dialect, layout, theme);
+                    continue;
+                }
+
+                // Image/PDF preview takes over rendering for this window (W39).
+                if let Some(pv) = self.preview_docs.get(&doc_idx) {
+                    let graphical = matches!(
+                        self.graphics_protocol,
+                        preview::GraphicsProtocol::Kitty | preview::GraphicsProtocol::Iterm2
+                    ) && pv.bytes.is_some()
+                        && pv.kind == preview::PreviewKind::Image;
+                    render_preview(grid, pv, doc.path(), *rect, graphical, theme);
+                    if graphical && self.graphics_dirty {
+                        if let Some(g) = build_preview_graphic(pv, *rect, self.graphics_protocol) {
+                            pending_graphics.push(g);
+                        }
+                    }
                     continue;
                 }
 
@@ -2808,6 +2904,20 @@ impl<B: Backend> App<B> {
 
         self.compositor.flush(&mut self.backend, mode_ind)?;
 
+        // Emit inline-graphics escapes after the cell flush so terminal text never
+        // overwrites them. They bypass the compositor (W39); only re-sent when
+        // `graphics_dirty` (input/resize/open), never on the idle poll.
+        if !pending_graphics.is_empty() {
+            for g in &pending_graphics {
+                self.backend.set_cursor_position(g.col, g.row)?;
+                self.backend.write_passthrough(&g.payload)?;
+            }
+            // Restore the real cursor the image emission moved, and flush.
+            self.backend.set_cursor_position(cursor_col, cursor_row)?;
+            self.backend.flush()?;
+        }
+        self.graphics_dirty = false;
+
         #[cfg(feature = "bench")]
         self.tracer.mark_frame();
 
@@ -2865,6 +2975,9 @@ impl<B: Backend> App<B> {
 
 impl<B: Backend> App<B> {
     fn handle_event(&mut self, event: Event) -> Result<()> {
+        // Any real event may move/cover an inline image; re-emit graphics next
+        // frame (the idle 8ms poll doesn't reach here, so static frames don't).
+        self.graphics_dirty = true;
         match event {
             Event::Key(ev) if ev.kind == KeyEventKind::Press => {
                 #[cfg(feature = "bench")]
@@ -3612,6 +3725,10 @@ impl<B: Backend> App<B> {
                 self.running = false;
             }
             ExCommand::Write(path) => {
+                if self.preview_docs.contains_key(&self.focused_win().doc_idx) {
+                    self.message = Message::Error("E: preview buffer is read-only".to_string());
+                    return Ok(());
+                }
                 let result = if let Some(p) = path {
                     self.doc_mut().set_path(p.into());
                     self.doc().save()
@@ -3639,6 +3756,10 @@ impl<B: Backend> App<B> {
                 }
                 self.running = false;
             }
+            ExCommand::WriteQuit if self.preview_docs.contains_key(&self.focused_win().doc_idx) => {
+                self.message = Message::Error("E: preview buffer is read-only".to_string());
+                return Ok(());
+            }
             ExCommand::WriteQuit => match self.doc().save() {
                 Ok(()) => {
                     self.doc_mut().mark_saved();
@@ -3650,19 +3771,26 @@ impl<B: Backend> App<B> {
                     self.message = Message::Error(format!("E: {e}"));
                 }
             },
-            ExCommand::Edit(path) => match Document::open(&path) {
-                Ok(doc) => {
-                    let doc_idx = self.docs.len();
-                    self.docs.push(doc);
-                    self.focused_win_mut().doc_idx = doc_idx;
-                    *self.selection_mut() = Selection::point(0);
+            ExCommand::Edit(path) => {
+                if let Some(kind) = preview::kind_for_path(std::path::Path::new(&path)) {
+                    self.open_preview(std::path::Path::new(&path), kind);
                     *self.viewport_mut() = Viewport::new();
-                    self.try_spawn_syntax_worker_for_doc(doc_idx);
+                } else {
+                    match Document::open(&path) {
+                        Ok(doc) => {
+                            let doc_idx = self.docs.len();
+                            self.docs.push(doc);
+                            self.focused_win_mut().doc_idx = doc_idx;
+                            *self.selection_mut() = Selection::point(0);
+                            *self.viewport_mut() = Viewport::new();
+                            self.try_spawn_syntax_worker_for_doc(doc_idx);
+                        }
+                        Err(e) => {
+                            self.message = Message::Error(format!("E: {e}"));
+                        }
+                    }
                 }
-                Err(e) => {
-                    self.message = Message::Error(format!("E: {e}"));
-                }
-            },
+            }
             ExCommand::NextBuffer => {
                 if self.docs.len() > 1 {
                     let cur = self.focused_win().doc_idx;
@@ -5583,6 +5711,9 @@ fn make_app<B: Backend>(
         config,
         table_docs: HashMap::new(),
         table_layout: HashMap::new(),
+        preview_docs: HashMap::new(),
+        graphics_protocol: preview::detect_protocol(|k| std::env::var(k).ok()),
+        graphics_dirty: true,
         dap_registry: load_dap_registry(),
         dap_client: None,
         breakpoints: HashMap::new(),
@@ -6160,6 +6291,73 @@ fn draw_cmd_completion(grid: &mut onda_render::Grid, comp: &CmdCompletion, ancho
         grid.fill_rect(0, row, width, 1, style);
         grid.write_str(1, row, label, style);
     }
+}
+
+/// An inline-graphics escape sequence to emit at a screen cell after the cell
+/// flush (W39). Bypasses the compositor.
+struct PreviewGraphic {
+    col: u16,
+    row: u16,
+    payload: String,
+}
+
+/// Render an image/PDF preview into a window's cells (W39). On a graphics-capable
+/// terminal (`graphical`) the region is cleared so the inline image — emitted
+/// separately via passthrough — shows through; otherwise the metadata card is
+/// drawn (the universal fallback).
+fn render_preview(
+    grid: &mut onda_render::Grid,
+    pv: &PreviewState,
+    path: Option<&std::path::Path>,
+    rect: Rect,
+    graphical: bool,
+    theme: &onda_render::Theme,
+) {
+    // Clear the window region first (no stale text under/around the preview).
+    grid.fill_rect(
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
+        onda_render::Style::RESET,
+    );
+    if graphical {
+        // The inline image covers the region; nothing else to draw in cells.
+        return;
+    }
+    let path = path.unwrap_or_else(|| std::path::Path::new("<file>"));
+    let card = preview::metadata_card(path, pv.kind, pv.info, pv.pages, pv.byte_len);
+    let top = rect.y + (rect.height / 4).min(2);
+    let style = theme.text();
+    for (i, line) in card.iter().enumerate() {
+        let row = top + i as u16;
+        if row >= rect.y + rect.height {
+            break;
+        }
+        grid.write_str(rect.x + 2, row, line, style);
+    }
+}
+
+/// Build the inline-graphics payload for a preview, sized to the window, or `None`
+/// when the protocol/bytes don't support it.
+fn build_preview_graphic(
+    pv: &PreviewState,
+    rect: Rect,
+    protocol: preview::GraphicsProtocol,
+) -> Option<PreviewGraphic> {
+    let bytes = pv.bytes.as_ref()?;
+    let payload = match protocol {
+        preview::GraphicsProtocol::Kitty => preview::kitty_encode(bytes, rect.width, rect.height),
+        preview::GraphicsProtocol::Iterm2 => {
+            preview::iterm2_encode(bytes, "image", rect.width, rect.height)
+        }
+        _ => return None,
+    };
+    Some(PreviewGraphic {
+        col: rect.x,
+        row: rect.y,
+        payload,
+    })
 }
 
 /// Render a CSV/TSV document as an aligned virtual table (view-only; rope untouched).
@@ -7363,6 +7561,84 @@ mod edit_integration_tests {
         app.handle_key(Key::Esc).unwrap(); // unfocus → editor active
         keys(&mut app, "x"); // should edit the buffer
         assert_eq!(body(&app), "bc\n");
+    }
+
+    // ── Rich previews (W39) ──────────────────────────────────────────────────
+
+    /// A 1×1 PNG (valid signature + IHDR), enough to sniff dimensions.
+    fn tiny_png() -> Vec<u8> {
+        let mut b = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        b.extend_from_slice(&[0, 0, 0, 13]);
+        b.extend_from_slice(b"IHDR");
+        b.extend_from_slice(&1u32.to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn opening_image_creates_readonly_preview_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cat.png");
+        std::fs::write(&path, tiny_png()).unwrap();
+        let mut app = app_with("");
+        app.open_path_in_buffer(&path);
+        let idx = app.focused_win().doc_idx;
+        let pv = app.preview_docs.get(&idx).expect("preview registered");
+        assert_eq!(pv.kind, preview::PreviewKind::Image);
+        assert_eq!(
+            pv.info.map(|i| (i.format, i.width, i.height)),
+            Some(("PNG", 1, 1))
+        );
+        // The text rope stays empty (no binary loaded into the buffer).
+        assert!(app.doc().rope().to_string().is_empty());
+    }
+
+    #[test]
+    fn writing_a_preview_buffer_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cat.png");
+        std::fs::write(&path, tiny_png()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut app = app_with("");
+        app.open_path_in_buffer(&path);
+        app.execute_ex_command(ExCommand::Write(None)).unwrap();
+        assert!(matches!(app.message, Message::Error(_)));
+        // File on disk untouched (the empty rope did not clobber the image).
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn image_emits_inline_graphics_on_capable_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cat.png");
+        std::fs::write(&path, tiny_png()).unwrap();
+        let mut app = app_with("");
+        app.graphics_protocol = preview::GraphicsProtocol::Kitty;
+        app.open_path_in_buffer(&path);
+        app.backend.reset_stats();
+        app.graphics_dirty = true;
+        app.render_frame().unwrap();
+        assert!(
+            app.backend
+                .passthrough
+                .iter()
+                .any(|p| p.starts_with("\x1b_G")),
+            "expected a kitty graphics escape in passthrough"
+        );
+    }
+
+    #[test]
+    fn plain_terminal_shows_card_no_graphics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cat.png");
+        std::fs::write(&path, tiny_png()).unwrap();
+        let mut app = app_with("");
+        app.graphics_protocol = preview::GraphicsProtocol::None;
+        app.open_path_in_buffer(&path);
+        app.backend.reset_stats();
+        app.graphics_dirty = true;
+        app.render_frame().unwrap();
+        assert!(app.backend.passthrough.is_empty());
     }
 }
 

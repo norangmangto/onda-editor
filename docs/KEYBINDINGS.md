@@ -195,6 +195,21 @@ In the commit prompt: type the message, `<CR>` commits, `<Esc>` cancels.
 
 ---
 
+## Previews (images & PDF)
+Opening an image (`png` `jpg` `jpeg` `gif` `bmp` `webp` `ico`) or a `pdf` — via the
+file picker, the explorer, or `:e <path>` — shows a **read-only preview** instead of
+loading binary bytes into a text buffer:
+
+| Terminal | Behaviour |
+|---|---|
+| kitty graphics / iTerm2 (kitty, Ghostty, WezTerm, iTerm2, …) | the image is drawn inline |
+| any other terminal | a metadata card (name, format, dimensions, size) |
+
+PDFs always show the metadata card (page count when detectable); onda does not bundle a
+PDF rasterizer. Preview buffers reject `:w` (they have no text content to save).
+
+---
+
 ## Diff review (`:agent-review`)
 | Key | Action |
 |---|---|

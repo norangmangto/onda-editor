@@ -110,12 +110,25 @@ W40 DAP debugger (core) — independent, can run in parallel
   pending — see KNOWN_ISSUES); keeps libgit2 out of core as required. Hunk-level
   staging/discard + inline diff view deferred.
 
-## W39 — Rich content previews (weeks 6–7)
+## W39 — Rich content previews (weeks 6–7) ✅
 - **T39.1** Terminal graphics layer: detect & use kitty graphics / iTerm2 OSC 1337 /
   sixel; **plain-terminal fallback** to a metadata card. Inline images + PDF page render.
 - **T39.2** Wire previews for image/PDF buffers; reuse the existing CSV/JSONL data views.
 - **Accept:** open an image and a PDF inline on a supporting terminal; graceful
   degradation verified on a non-graphics terminal.
+- **Done:** `crates/onda/src/preview.rs` — protocol detection (kitty/iTerm2/sixel/none),
+  dependency-free image-header sniffing (PNG/JPEG/GIF/BMP/WebP), hand-rolled base64, and
+  the kitty/iTerm2 encoders + metadata card (all unit-tested). `Backend::write_passthrough`
+  emits the graphics escape after the cell flush (bypassing the compositor); re-sent only
+  when `graphics_dirty` (input/resize/open), never on the idle poll. Image/PDF files open
+  as read-only `PreviewState` buffers (empty rope; `:w` blocked) via the picker/tree/`:e`.
+  **Divergences (no new deps, per rule 4):** sixel is *detected* but renders the card
+  rather than encoding sixel (would need a decoder + quantizer); PDF shows the card with a
+  best-effort page count rather than a rasterized page (no PDF rasterizer bundled). Both
+  are honest graceful-degradation paths; revisit if a pre-approved rasterizer/sixel dep is
+  added. Inline image display can't be E2E-tested headlessly (like LSP); tests cover the
+  pure layer + that the right escape is emitted on a capable terminal and suppressed
+  otherwise.
 
 ## W40 — DAP debugger (core, weeks 1–3, parallel)
 Restores the debugger as a **core feature crate** (`onda-dap`), the same architectural

@@ -46,6 +46,14 @@ pub trait Backend {
     fn flush(&mut self) -> Result<(), RenderError>;
     fn size(&self) -> (u16, u16);
     fn clear(&mut self) -> Result<(), RenderError>;
+
+    /// Emit a raw escape-sequence string verbatim (no cell diffing), e.g. a
+    /// terminal-graphics image placement (W39). The caller positions the cursor
+    /// first via [`Backend::set_cursor_position`]. Bypasses the compositor, so use
+    /// it only for content the cell grid can't represent. Default: no-op.
+    fn write_passthrough(&mut self, _data: &str) -> Result<(), RenderError> {
+        Ok(())
+    }
 }
 
 // ── TerminalBackend ────────────────────────────────────────────────────────────
@@ -220,6 +228,12 @@ impl Backend for TerminalBackend {
         queue!(self.out, terminal::Clear(terminal::ClearType::All))?;
         Ok(())
     }
+
+    fn write_passthrough(&mut self, data: &str) -> Result<(), RenderError> {
+        use std::io::Write as _;
+        self.out.write_all(data.as_bytes())?;
+        Ok(())
+    }
 }
 
 // ── NullBackend ────────────────────────────────────────────────────────────────
@@ -235,6 +249,8 @@ pub struct NullBackend {
     /// Last cursor position.
     pub cursor_pos: (u16, u16),
     pub cursor_visible: bool,
+    /// Raw passthrough payloads emitted this run (graphics escapes), for tests.
+    pub passthrough: Vec<String>,
 }
 
 impl NullBackend {
@@ -246,12 +262,14 @@ impl NullBackend {
             flush_count: 0,
             cursor_pos: (0, 0),
             cursor_visible: false,
+            passthrough: Vec::new(),
         }
     }
 
     pub fn reset_stats(&mut self) {
         self.cells_drawn = 0;
         self.flush_count = 0;
+        self.passthrough.clear();
     }
 }
 
@@ -289,6 +307,11 @@ impl Backend for NullBackend {
     }
 
     fn clear(&mut self) -> Result<(), RenderError> {
+        Ok(())
+    }
+
+    fn write_passthrough(&mut self, data: &str) -> Result<(), RenderError> {
+        self.passthrough.push(data.to_string());
         Ok(())
     }
 }
