@@ -19,6 +19,7 @@ onda-data.workspace = true
 onda-agent.workspace = true
 onda-dap.workspace = true
 onda-lsp.workspace = true
+lsp-types.workspace = true
 onda-terminal.workspace = true
 onda-session.workspace = true
 onda-plugin.workspace = true

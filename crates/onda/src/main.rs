@@ -5,6 +5,7 @@ use std::time::Instant;
 
 mod doctor;
 mod file_tree;
+mod lsp_edit;
 mod plugin_host;
 
 use anyhow::{Context, Result};
@@ -1881,6 +1882,71 @@ impl<B: Backend> App<B> {
             }
         }
         Ok(())
+    }
+
+    /// Apply a batch of LSP `TextEdit`s to `doc_idx` as a single undo step (W36).
+    /// Returns the number of edits applied. When the doc is shown in the focused
+    /// window the change is undoable there; edits to other open docs are best-effort.
+    fn apply_lsp_edits(&mut self, doc_idx: usize, edits: &[lsp_types::TextEdit]) -> usize {
+        if doc_idx >= self.docs.len() || edits.is_empty() {
+            return 0;
+        }
+        let rope = self.docs[doc_idx].rope().clone();
+        let char_edits: Vec<(usize, usize, String)> = edits
+            .iter()
+            .map(|e| {
+                let (s, en) = lsp_edit::lsp_range_to_chars(
+                    &rope,
+                    (
+                        e.range.start.line as usize,
+                        e.range.start.character as usize,
+                    ),
+                    (e.range.end.line as usize, e.range.end.character as usize),
+                );
+                (s, en, e.new_text.clone())
+            })
+            .collect();
+        let cs = lsp_edit::text_edits_to_changeset(&rope, &char_edits);
+        if cs.is_empty() {
+            return 0;
+        }
+        let tx = Transaction::new(cs);
+        if self.focused_win().doc_idx == doc_idx {
+            let sel_before = self.selection().clone();
+            if let Ok(inv) = self.docs[doc_idx].apply(&tx) {
+                let new_sel = self.selection().map(&tx.changes);
+                *self.selection_mut() = new_sel.clone();
+                self.undo().push(tx, inv, sel_before, new_sel);
+            }
+        } else if self.docs[doc_idx].apply(&tx).is_err() {
+            return 0;
+        }
+        self.try_spawn_syntax_worker_for_doc(doc_idx);
+        edits.len()
+    }
+
+    /// Apply an LSP `WorkspaceEdit` (rename / code action) to all currently-open
+    /// affected documents (W36). Returns `(files, total_edits)`.
+    fn apply_workspace_edit(&mut self, edit: lsp_types::WorkspaceEdit) -> (usize, usize) {
+        let mut files = 0;
+        let mut total = 0;
+        if let Some(changes) = edit.changes {
+            for (uri, edits) in changes {
+                let path = uri_str_to_path(uri.as_str());
+                if let Some(doc_idx) = self
+                    .docs
+                    .iter()
+                    .position(|d| d.path().map(|p| p == path).unwrap_or(false))
+                {
+                    let n = self.apply_lsp_edits(doc_idx, &edits);
+                    if n > 0 {
+                        files += 1;
+                        total += n;
+                    }
+                }
+            }
+        }
+        (files, total)
     }
 
     /// Open `path` into a buffer in the focused window (shared by picker + tree).
@@ -4988,18 +5054,21 @@ impl<B: Backend> App<B> {
             LspEvent::RenameResult {
                 request_id: _,
                 edit,
-            } => {
-                if let Some(_edit) = edit {
-                    self.message = Message::Info("Rename: workspace edit applied (stub)".into());
+            } => match edit {
+                Some(edit) => {
+                    let (files, total) = self.apply_workspace_edit(edit);
+                    self.message =
+                        Message::Info(format!("Rename: {total} edit(s) across {files} file(s)"));
                 }
-            }
+                None => self.message = Message::Info("Rename: no changes".into()),
+            },
             LspEvent::FormattingResult {
                 request_id: _,
                 edits,
             } => {
-                if !edits.is_empty() {
-                    self.message = Message::Info(format!("Format: {} edits applied", edits.len()));
-                }
+                let doc_idx = self.focused_win().doc_idx;
+                let n = self.apply_lsp_edits(doc_idx, &edits);
+                self.message = Message::Info(format!("Format: {n} edit(s) applied"));
             }
             LspEvent::ServerError {
                 root: _root,
@@ -5593,6 +5662,28 @@ fn draw_dap_markers(
             }
         }
     }
+}
+
+/// Convert a `file://` URI string to a filesystem path (with percent-decode).
+fn uri_str_to_path(uri: &str) -> PathBuf {
+    let s = uri.strip_prefix("file://").unwrap_or(uri);
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            if let Ok(h) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(b) = u8::from_str_radix(h, 16) {
+                    out.push(b);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    PathBuf::from(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// Runnable command-palette entries (W35): `(title, key hint, invocation)`.
@@ -6893,6 +6984,56 @@ mod edit_integration_tests {
         app.handle_key(Key::Enter).unwrap();
         assert!(app.sidebar_open, "selecting the palette entry ran it");
         assert!(app.picker.as_ref().map(|p| !p.is_visible()).unwrap_or(true));
+    }
+
+    // ── LSP edit application (W36) ───────────────────────────────────────────
+
+    fn lsp_text_edit(l1: u32, c1: u32, l2: u32, c2: u32, text: &str) -> lsp_types::TextEdit {
+        lsp_types::TextEdit {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: l1,
+                    character: c1,
+                },
+                end: lsp_types::Position {
+                    line: l2,
+                    character: c2,
+                },
+            },
+            new_text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn lsp_edits_apply_to_focused_doc_and_undo() {
+        let mut app = app_with("hello\n");
+        let n = app.apply_lsp_edits(0, &[lsp_text_edit(0, 0, 0, 1, "H")]);
+        assert_eq!(n, 1);
+        assert_eq!(body(&app), "Hello\n");
+        keys(&mut app, "u"); // single undo step reverts the format
+        assert_eq!(body(&app), "hello\n");
+    }
+
+    #[test]
+    fn lsp_multi_edit_one_undo_step() {
+        let mut app = app_with("hello world\n");
+        let edits = vec![
+            lsp_text_edit(0, 6, 0, 11, "there"),
+            lsp_text_edit(0, 0, 0, 5, "hi"),
+        ];
+        let n = app.apply_lsp_edits(0, &edits);
+        assert_eq!(n, 2);
+        assert_eq!(body(&app), "hi there\n");
+        keys(&mut app, "u");
+        assert_eq!(body(&app), "hello world\n"); // both reverted together
+    }
+
+    #[test]
+    fn uri_to_path_decodes() {
+        assert_eq!(
+            uri_str_to_path("file:///tmp/a%20b.rs"),
+            PathBuf::from("/tmp/a b.rs")
+        );
     }
 
     // ── Tabline + shell mouse (W33 leftovers) ────────────────────────────────

@@ -9,6 +9,23 @@ you fix one, remove it here and land a regression test.
 
 ## Open
 
+### 🟠 LSP is not wired into the editor binary
+`onda-lsp` (the crate) is complete and tested, but the `onda` binary never spawns a
+server: `App.lsp_manager` is always `None`, there is no `ensure_server`/`did_open`/
+`did_change` on file open/edit, and no interactive request dispatch (hover, definition,
+format, rename, code action, symbols). Diagnostics/format/rename handlers exist but are
+dormant because no events ever arrive. This blocks the full W36 LSP UX.
+- **Done so far (W36):** a tested, UTF-16-aware edit applier (`lsp_edit`) and wiring so
+  `FormattingResult`/`RenameResult` actually apply edits *when* events flow.
+- **Needed:** spawn `LspManager` in `run_editor`; on file open call
+  `ensure_server` + `did_open`; on edit `did_change` (debounced, with versions); a
+  sync→async request-dispatch + `request_id` correlation; bind hover/definition/
+  references/format/rename/code-action/document-symbol to keys/commands; then build the
+  remaining W36 UX (code-actions menu, document-symbol picker, signature help,
+  rename preview, breadcrumb). Needs a live server (rust-analyzer) to validate, so it
+  won't be E2E-tested in CI.
+- **Where:** `crates/onda/src/main.rs` (LSP lifecycle + dispatch).
+
 ### ⚪ `onda-contrast` theme is not in the Phase 5 plan
 `runtime/themes/onda-contrast.toml` ships, but `PHASE5_PLAN.md` lists only
 `onda-dark`, `onda-light`, `onda-wave`. Decide whether to keep it (and add to the
