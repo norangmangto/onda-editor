@@ -202,6 +202,18 @@ In a create/rename prompt: type the name, `<CR>` confirms, `<Esc>` cancels.
 
 ---
 
+## Mouse
+| Action | Effect |
+|---|---|
+| click in the editor | move the cursor |
+| scroll | scroll the buffer |
+| click a buffer tab | switch buffer |
+| click the activity bar | select that sidebar view + focus it |
+| click in the sidebar | focus it (Explorer: select the row) |
+| drag the sidebar's right border | resize the sidebar |
+
+---
+
 ## Ex-commands (`:`)
 
 | Command | Action |

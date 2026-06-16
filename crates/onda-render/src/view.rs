@@ -874,6 +874,38 @@ pub fn render_agent_panel(
     }
 }
 
+/// Render a buffer tabline at `(x, y)` spanning `width` cells. Each tab is a
+/// `(name, active)` pair; the active tab uses the visual style, others a dim style.
+/// Returns the starting column of each rendered tab (for click hit-testing).
+pub fn render_tabline(
+    grid: &mut Grid,
+    x: u16,
+    y: u16,
+    width: u16,
+    tabs: &[(String, bool)],
+    theme: &Theme,
+) -> Vec<u16> {
+    let bg = theme.status_bg();
+    let active = theme.status_visual();
+    let inactive = theme.line_nr();
+    grid.fill_rect(x, y, width, 1, bg);
+    let mut col = x;
+    let mut starts = Vec::with_capacity(tabs.len());
+    for (name, is_active) in tabs {
+        let label = format!(" {name} ");
+        let w = label.chars().count() as u16;
+        if col + w > x + width {
+            break;
+        }
+        starts.push(col);
+        let style = if *is_active { active } else { inactive };
+        grid.fill_rect(col, y, w, 1, style);
+        grid.write_str(col, y, &label, style);
+        col += w;
+    }
+    starts
+}
+
 /// Render the IDE shell's left chrome: a vertical activity bar (view switcher)
 /// at `[0, activity_w)` plus a sidebar panel at `[activity_w, activity_w + width)`.
 ///
@@ -1202,6 +1234,19 @@ mod tests {
         assert!(title.contains("SOURCE CONTROL"), "got {title:?}");
         // Right border column at activity_w + width - 1 = 3 + 20 - 1 = 22.
         assert_eq!(grid.get(22, 5).unwrap().grapheme, "│");
+    }
+
+    #[test]
+    fn tabline_lays_out_tabs_and_returns_starts() {
+        let theme = Theme::default_dark();
+        let mut grid = Grid::new(40, 2);
+        let tabs = vec![("a.rs".to_string(), true), ("b.rs".to_string(), false)];
+        let starts = render_tabline(&mut grid, 0, 0, 40, &tabs, &theme);
+        assert_eq!(starts, vec![0, 6]); // " a.rs " is 6 cells wide
+        let row: String = (0..14)
+            .filter_map(|c| grid.get(c, 0).map(|x| x.grapheme.clone()))
+            .collect();
+        assert!(row.contains("a.rs") && row.contains("b.rs"), "got {row:?}");
     }
 
     #[test]

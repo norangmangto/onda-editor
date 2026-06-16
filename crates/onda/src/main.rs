@@ -514,6 +514,10 @@ struct App<B: Backend> {
     sidebar_body_rows: usize,
     /// In-progress file operation (create/rename/delete) awaiting input.
     sidebar_prompt: Option<SidebarPrompt>,
+    /// Per-tab start columns from the last tabline render (for click hit-testing).
+    tab_starts: Vec<u16>,
+    /// True while dragging the sidebar's right border to resize it.
+    sidebar_resizing: bool,
 
     // ── Soft wrap ─────────────────────────────────────────────────────────────
     #[allow(dead_code)]
@@ -1758,6 +1762,26 @@ impl<B: Backend> App<B> {
         (total / 3).clamp(30, 64).min(total.saturating_sub(20))
     }
 
+    /// Height of the buffer tabline (1 when more than one buffer is open, else 0 —
+    /// single-buffer use keeps the full-height editor).
+    fn tabline_height(&self) -> u16 {
+        if self.docs.len() > 1 {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Buffer tabs as `(name, is_active)` for the tabline.
+    fn tabline_tabs(&self) -> Vec<(String, bool)> {
+        let active = self.focused_win().doc_idx;
+        self.docs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (d.name().to_string(), i == active))
+            .collect()
+    }
+
     /// Width of the left IDE chrome (activity bar + sidebar); 0 when closed.
     fn left_chrome_width(&self) -> u16 {
         if self.sidebar_open {
@@ -2217,13 +2241,15 @@ impl<B: Backend> App<B> {
         if chrome_w > 0 && self.sidebar_view == SidebarView::Explorer {
             self.ensure_file_tree();
         }
+        // Reserve a top row for the buffer tabline when more than one buffer is open.
+        let tab_h = self.tabline_height();
 
         // ── Phase 1: update viewports (no grid access yet) ────────────────────
         let content_area = Rect::new(
             chrome_w,
-            0,
+            tab_h,
             editor_width.saturating_sub(chrome_w),
-            content_height,
+            content_height.saturating_sub(tab_h),
         );
         let rects = self.layout.rects(content_area);
         let focused_win_id = WindowId(self.focused_window);
@@ -2333,6 +2359,12 @@ impl<B: Backend> App<B> {
             Some(p) => p.display(),
             None => self.sidebar_view.title().to_string(),
         };
+        // Buffer tabs, formatted before the grid borrow.
+        let tabs: Vec<(String, bool)> = if tab_h > 0 {
+            self.tabline_tabs()
+        } else {
+            Vec::new()
+        };
 
         // ── Phase 3: render into grid ─────────────────────────────────────────
         {
@@ -2352,6 +2384,18 @@ impl<B: Backend> App<B> {
                     &sidebar_title,
                     &sidebar_body,
                     self.sidebar_focused,
+                    theme,
+                );
+            }
+
+            // Buffer tabline across the top of the editor area.
+            if tab_h > 0 {
+                self.tab_starts = onda_render::render_tabline(
+                    grid,
+                    chrome_w,
+                    0,
+                    editor_width.saturating_sub(chrome_w),
+                    &tabs,
                     theme,
                 );
             }
@@ -2662,21 +2706,97 @@ impl<B: Backend> App<B> {
         }
     }
 
+    /// Handle a left-click on the IDE shell chrome (activity bar / sidebar / tabline)
+    /// or the start of a sidebar resize. Returns true when the click was consumed.
+    fn handle_shell_click(&mut self, col: u16, row: u16, chrome_w: u16, tab_h: u16) -> bool {
+        let (_, height) = self.backend.size();
+        let content_height = height.saturating_sub(2);
+        if chrome_w > 0 && row < content_height {
+            if col < ACTIVITY_BAR_W {
+                // Activity bar: row index selects the view.
+                let i = row as usize;
+                if i < SidebarView::ALL.len() {
+                    self.sidebar_view = SidebarView::ALL[i];
+                    self.sidebar_focused = true;
+                    if self.sidebar_view == SidebarView::Explorer {
+                        self.ensure_file_tree();
+                    }
+                    self.compositor.buf.invalidate();
+                    return true;
+                }
+            } else if col == chrome_w - 1 {
+                // Right border → begin a drag-resize.
+                self.sidebar_resizing = true;
+                return true;
+            } else if col < chrome_w {
+                // Sidebar body → focus it; in Explorer, select the clicked row.
+                self.sidebar_focused = true;
+                if self.sidebar_view == SidebarView::Explorer && row >= 1 {
+                    if let Some(t) = self.file_tree.as_mut() {
+                        let idx = t.scroll + (row - 1) as usize;
+                        if idx < t.len() {
+                            t.selected = idx;
+                        }
+                    }
+                }
+                self.compositor.buf.invalidate();
+                return true;
+            }
+        }
+        // Tabline: click a tab to switch buffers.
+        if tab_h > 0 && row == 0 && col >= chrome_w {
+            for (i, &start) in self.tab_starts.iter().enumerate() {
+                let end = self.tab_starts.get(i + 1).copied().unwrap_or(u16::MAX);
+                if col >= start && col < end {
+                    if i < self.docs.len() {
+                        self.focused_win_mut().doc_idx = i;
+                        *self.selection_mut() = Selection::point(0);
+                        self.compositor.buf.invalidate();
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Resize the sidebar so its right border follows the cursor `col`.
+    fn resize_sidebar_to(&mut self, col: u16) {
+        self.sidebar_width = (col.saturating_sub(ACTIVITY_BAR_W) + 1).clamp(16, 80);
+        self.compositor.buf.invalidate();
+    }
+
     fn handle_mouse_event(&mut self, ev: MouseEvent) -> Result<()> {
         let (width, height) = self.backend.size();
         let content_height = height.saturating_sub(2);
-        // Match render_frame's editor area: inset by the agent panel (right) and the
-        // IDE chrome (left) so clicks map to the right cell.
+        // Match render_frame's editor area: inset by the agent panel (right), the
+        // IDE chrome (left) and the tabline (top) so clicks map to the right cell.
         let panel_width = self.agent_panel_width(width);
         let editor_width = width - panel_width;
         let chrome_w = self
             .left_chrome_width()
             .min(editor_width.saturating_sub(20));
+        let tab_h = self.tabline_height();
+
+        // Shell hit-testing takes precedence (activity bar / sidebar / tabs / resize).
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.handle_shell_click(ev.column, ev.row, chrome_w, tab_h)
+        {
+            return Ok(());
+        }
+        if matches!(ev.kind, MouseEventKind::Drag(MouseButton::Left)) && self.sidebar_resizing {
+            self.resize_sidebar_to(ev.column);
+            return Ok(());
+        }
+        if matches!(ev.kind, MouseEventKind::Up(MouseButton::Left)) {
+            self.sidebar_resizing = false;
+        }
+
         let content_area = Rect::new(
             chrome_w,
-            0,
+            tab_h,
             editor_width.saturating_sub(chrome_w),
-            content_height,
+            content_height.saturating_sub(tab_h),
         );
         let rects = self.layout.rects(content_area);
 
@@ -5270,6 +5390,8 @@ fn make_app<B: Backend>(
         file_tree: None,
         sidebar_body_rows: 0,
         sidebar_prompt: None,
+        tab_starts: Vec::new(),
+        sidebar_resizing: false,
         soft_wrap: false,
         #[cfg(feature = "bench")]
         tracer: LatencyTracer::default(),
@@ -6771,6 +6893,53 @@ mod edit_integration_tests {
         app.handle_key(Key::Enter).unwrap();
         assert!(app.sidebar_open, "selecting the palette entry ran it");
         assert!(app.picker.as_ref().map(|p| !p.is_visible()).unwrap_or(true));
+    }
+
+    // ── Tabline + shell mouse (W33 leftovers) ────────────────────────────────
+
+    #[test]
+    fn tabline_appears_with_multiple_buffers() {
+        let mut app = app_with("one\n");
+        assert_eq!(app.tabline_height(), 0); // single buffer: no tabline
+        app.docs.push(Document::new_empty());
+        assert_eq!(app.tabline_height(), 1);
+        let tabs = app.tabline_tabs();
+        assert_eq!(tabs.len(), 2);
+        assert!(tabs[0].1, "first tab is active");
+    }
+
+    #[test]
+    fn tab_click_switches_buffer() {
+        let mut app = app_with("one\n");
+        app.docs.push(Document::new_empty());
+        app.tab_starts = vec![0, 8]; // as if rendered: tab 0 at col 0, tab 1 at col 8
+        assert_eq!(app.focused_win().doc_idx, 0);
+        // Click within tab 1's range (chrome closed → chrome_w 0, tab_h 1).
+        assert!(app.handle_shell_click(9, 0, 0, 1));
+        assert_eq!(app.focused_win().doc_idx, 1);
+    }
+
+    #[test]
+    fn activity_bar_click_selects_view() {
+        let mut app = app_with("x\n");
+        keys(&mut app, " e"); // open sidebar (chrome on)
+        let chrome = app.left_chrome_width();
+        // Click activity bar row 2 → SourceControl (index 2).
+        assert!(app.handle_shell_click(0, 2, chrome, 0));
+        assert_eq!(app.sidebar_view, SidebarView::SourceControl);
+        assert!(app.sidebar_focused);
+    }
+
+    #[test]
+    fn sidebar_border_drag_resizes() {
+        let mut app = app_with("x\n");
+        keys(&mut app, " e");
+        let chrome = app.left_chrome_width();
+        // Click the right border → begin resize.
+        assert!(app.handle_shell_click(chrome - 1, 1, chrome, 0));
+        assert!(app.sidebar_resizing);
+        app.resize_sidebar_to(40); // width = 40 - ACTIVITY_BAR_W + 1
+        assert_eq!(app.sidebar_width, 40 - ACTIVITY_BAR_W + 1);
     }
 
     #[test]
