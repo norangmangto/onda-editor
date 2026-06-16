@@ -451,10 +451,12 @@ struct App<B: Backend> {
     dap_stop_line: Option<(PathBuf, u32)>,
     /// Focused thread id at the current stop.
     dap_thread: Option<i64>,
-    /// Latest call stack (for `:DapStack`).
+    /// Latest call stack (for `:DapStack` and the Run & Debug panel).
     dap_frames: Vec<onda_dap::StackFrame>,
     /// Latest variables (for `:DapVars`); flat for v1.
     dap_vars: Vec<onda_dap::Variable>,
+    /// Selected stack frame in the Run & Debug panel (index into `dap_frames`).
+    dap_selected_frame: usize,
 
     // ── Agent panel (W23) ───────────────────────────────────────────────────────
     /// Configured agents (agents.toml).
@@ -1094,7 +1096,12 @@ impl<B: Backend> App<B> {
         match ev {
             DapEvent::Stopped { thread_id, reason } => {
                 self.dap_thread = thread_id;
+                self.dap_selected_frame = 0;
                 self.message = Message::Info(format!("DAP: stopped ({reason})"));
+                // Surface the Run & Debug panel on stop (VS Code-like), without
+                // stealing focus — stepping/editing keys keep working.
+                self.sidebar_open = true;
+                self.sidebar_view = SidebarView::Run;
                 // Pull the call stack for the focused thread → drives the stop marker.
                 if let Some(client) = self.dap_client.as_ref() {
                     client.dispatch(onda_dap::DapCommand::StackTrace {
@@ -1103,6 +1110,9 @@ impl<B: Backend> App<B> {
                 }
             }
             DapEvent::StackTrace(frames) => {
+                if self.dap_selected_frame >= frames.len() {
+                    self.dap_selected_frame = 0;
+                }
                 if let Some(top) = frames.first() {
                     if let Some(p) = top.source.as_ref().and_then(|s| s.path.clone()) {
                         self.dap_stop_line = Some((PathBuf::from(p), top.line));
@@ -1139,6 +1149,7 @@ impl<B: Backend> App<B> {
                 self.dap_stop_line = None;
                 self.dap_frames.clear();
                 self.dap_vars.clear();
+                self.dap_selected_frame = 0;
             }
             DapEvent::Evaluated { result } => {
                 self.hover_float = Some(HoverFloat {
@@ -1160,6 +1171,7 @@ impl<B: Backend> App<B> {
                 self.dap_frames.clear();
                 self.dap_vars.clear();
                 self.dap_thread = None;
+                self.dap_selected_frame = 0;
                 self.message = Message::Info("DAP: session ended".into());
             }
             DapEvent::Error(msg) => {
@@ -1614,6 +1626,7 @@ impl<B: Backend> App<B> {
                 match self.sidebar_view {
                     SidebarView::Explorer => self.handle_explorer_key(key),
                     SidebarView::SourceControl => self.handle_scm_key(key),
+                    SidebarView::Run => self.handle_run_key(key),
                     _ => {}
                 }
                 return true; // consume everything else while focused
@@ -1865,7 +1878,7 @@ impl<B: Backend> App<B> {
             },
             SidebarView::Search => vec![line("(live grep — W35)")],
             SidebarView::SourceControl => self.scm_body(),
-            SidebarView::Run => vec![line("(debug — W40)")],
+            SidebarView::Run => self.run_body(),
             SidebarView::Agent => vec![line("(use :agent for the panel)")],
         }
     }
@@ -1946,6 +1959,12 @@ impl<B: Backend> App<B> {
                     self.sidebar_open = true;
                     self.sidebar_focused = true;
                     self.sidebar_view = SidebarView::SourceControl;
+                    self.on_sidebar_view_entered();
+                }
+                "run" => {
+                    self.sidebar_open = true;
+                    self.sidebar_focused = true;
+                    self.sidebar_view = SidebarView::Run;
                     self.on_sidebar_view_entered();
                 }
                 _ => {}
@@ -2113,6 +2132,145 @@ impl<B: Backend> App<B> {
                 (style, format!("{} {}", f.badge(), f.path))
             })
             .collect()
+    }
+
+    // ── Run & Debug panel (W40) ────────────────────────────────────────────────
+
+    /// Run & Debug sidebar body: session state, call stack, variables, breakpoints.
+    fn run_body(&self) -> Vec<(onda_render::Style, String)> {
+        let head = self.theme.status_bg();
+        let text = self.theme.text();
+        let sel = self.theme.menu_selected();
+        let dim = self.theme.line_nr();
+        let mut out: Vec<(onda_render::Style, String)> = Vec::new();
+
+        // Session state + control hint.
+        if self.dap_client.is_none() {
+            out.push((dim, "  no session — :DapRun or F5".into()));
+        } else if self.dap_stop_line.is_some() || !self.dap_frames.is_empty() {
+            out.push((self.theme.diff_change(), "  ● stopped".into()));
+        } else {
+            out.push((self.theme.diff_add(), "  ▶ running".into()));
+        }
+        out.push((dim, "  F5 ▶ F10 ↷ F11 ↓ F12 ↑".into()));
+        out.push((text, String::new()));
+
+        // Call stack (selectable).
+        out.push((head, " CALL STACK".into()));
+        if self.dap_frames.is_empty() {
+            out.push((dim, "  —".into()));
+        } else {
+            for (i, f) in self.dap_frames.iter().enumerate() {
+                let line = format!("{}:{}", short_frame_loc(f), f.line);
+                let marker = if i == self.dap_selected_frame {
+                    "›"
+                } else {
+                    " "
+                };
+                let style = if i == self.dap_selected_frame {
+                    sel
+                } else {
+                    text
+                };
+                out.push((style, format!(" {marker} {}  {line}", f.name)));
+            }
+        }
+
+        // Variables for the selected frame.
+        out.push((text, String::new()));
+        out.push((head, " VARIABLES".into()));
+        if self.dap_vars.is_empty() {
+            out.push((dim, "  —".into()));
+        } else {
+            for v in &self.dap_vars {
+                out.push((text, format!("  {} = {}", v.name, v.value)));
+            }
+        }
+
+        // Breakpoints across all files.
+        out.push((text, String::new()));
+        out.push((head, " BREAKPOINTS".into()));
+        let mut any_bp = false;
+        let mut paths: Vec<&PathBuf> = self.breakpoints.keys().collect();
+        paths.sort();
+        for path in paths {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+            for (line, cond) in &self.breakpoints[path] {
+                any_bp = true;
+                let c = cond
+                    .as_deref()
+                    .map(|c| format!("  [{c}]"))
+                    .unwrap_or_default();
+                out.push((text, format!("  ● {name}:{line}{c}")));
+            }
+        }
+        if !any_bp {
+            out.push((dim, "  (none — F9 to toggle)".into()));
+        }
+        out
+    }
+
+    /// Key handling for the Run & Debug view: navigate frames + step control.
+    fn handle_run_key(&mut self, key: &Key) {
+        match key {
+            Key::Char('j', _) | Key::Down => {
+                if !self.dap_frames.is_empty() {
+                    let next = (self.dap_selected_frame + 1).min(self.dap_frames.len() - 1);
+                    self.dap_select_frame(next);
+                }
+            }
+            Key::Char('k', _) | Key::Up => {
+                let prev = self.dap_selected_frame.saturating_sub(1);
+                self.dap_select_frame(prev);
+            }
+            Key::Char('l', _) | Key::Enter => self.dap_jump_to_selected_frame(),
+            // Step control also works while the panel is focused.
+            Key::F(5) => self.dap_control(DapControl::Continue),
+            Key::F(10) => self.dap_control(DapControl::Next),
+            Key::F(11) => self.dap_control(DapControl::StepIn),
+            Key::F(12) => self.dap_control(DapControl::StepOut),
+            _ => {}
+        }
+        self.compositor.buf.invalidate();
+    }
+
+    /// Select stack frame `idx`: refresh its variables (re-request scopes).
+    fn dap_select_frame(&mut self, idx: usize) {
+        if idx >= self.dap_frames.len() {
+            return;
+        }
+        self.dap_selected_frame = idx;
+        let frame_id = self.dap_frames[idx].id;
+        if let Some(client) = self.dap_client.as_ref() {
+            client.dispatch(onda_dap::DapCommand::Scopes { frame_id });
+        }
+    }
+
+    /// Open the selected frame's source and move the cursor to its line.
+    fn dap_jump_to_selected_frame(&mut self) {
+        let Some(frame) = self.dap_frames.get(self.dap_selected_frame) else {
+            return;
+        };
+        let Some(path) = frame.source.as_ref().and_then(|s| s.path.clone()) else {
+            return;
+        };
+        let line = frame.line.saturating_sub(1) as usize; // DAP lines are 1-based
+        let path = PathBuf::from(path);
+        // Reuse the existing doc if already open; else open it.
+        let existing = self
+            .docs
+            .iter()
+            .position(|d| d.path() == Some(path.as_path()));
+        let doc_idx = match existing {
+            Some(i) => i,
+            None => {
+                self.open_path_in_buffer(&path);
+                self.focused_win().doc_idx
+            }
+        };
+        self.focused_win_mut().doc_idx = doc_idx;
+        let char_pos = self.docs[doc_idx].line_to_char(line);
+        *self.selection_mut() = Selection::point(char_pos);
     }
 
     /// Open `path` into a buffer in the focused window (shared by picker + tree).
@@ -5722,6 +5880,7 @@ fn make_app<B: Backend>(
         dap_thread: None,
         dap_frames: Vec::new(),
         dap_vars: Vec::new(),
+        dap_selected_frame: 0,
         agent_registry: load_agent_registry(),
         agent_client: None,
         agent_name: None,
@@ -6000,6 +6159,7 @@ fn command_palette_entries() -> &'static [(&'static str, &'static str, &'static 
         ("Switch buffer", "<space>b", "act:bufferpicker"),
         ("Toggle sidebar", "<space>e", "act:sidebar"),
         ("Source control", "", "act:scm"),
+        ("Run and debug", "", "act:run"),
         ("Split horizontally", ":sp", "ex:sp"),
         ("Split vertically", ":vsp", "ex:vsp"),
         ("Clear search highlight", ":noh", "ex:noh"),
@@ -6291,6 +6451,21 @@ fn draw_cmd_completion(grid: &mut onda_render::Grid, comp: &CmdCompletion, ancho
         grid.fill_rect(0, row, width, 1, style);
         grid.write_str(1, row, label, style);
     }
+}
+
+/// Short source location for a DAP stack frame (file name, or frame name).
+fn short_frame_loc(f: &onda_dap::StackFrame) -> String {
+    f.source
+        .as_ref()
+        .and_then(|s| s.path.as_deref().or(s.name.as_deref()))
+        .map(|p| {
+            std::path::Path::new(p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(p)
+                .to_string()
+        })
+        .unwrap_or_else(|| "?".to_string())
 }
 
 /// An inline-graphics escape sequence to emit at a screen cell after the cell
@@ -7639,6 +7814,94 @@ mod edit_integration_tests {
         app.graphics_dirty = true;
         app.render_frame().unwrap();
         assert!(app.backend.passthrough.is_empty());
+    }
+
+    // ── Run & Debug panel (W40) ──────────────────────────────────────────────
+
+    fn frame(id: i64, name: &str, path: &str, line: u32) -> onda_dap::StackFrame {
+        onda_dap::StackFrame {
+            id,
+            name: name.into(),
+            source: Some(onda_dap::protocol::SourcePath {
+                name: None,
+                path: Some(path.into()),
+            }),
+            line,
+            column: 0,
+        }
+    }
+    fn var(name: &str, value: &str) -> onda_dap::Variable {
+        onda_dap::Variable {
+            name: name.into(),
+            value: value.into(),
+            ty: None,
+            variables_reference: 0,
+        }
+    }
+
+    #[test]
+    fn run_body_shows_state_stack_vars_breakpoints() {
+        let mut app = app_with("x\n");
+        app.dap_frames = vec![frame(1, "main", "/src/m.rs", 10)];
+        app.dap_vars = vec![var("n", "42")];
+        app.breakpoints
+            .insert(PathBuf::from("/src/m.rs"), vec![(10, None)]);
+        let joined: String = app.run_body().into_iter().map(|(_, s)| s + "\n").collect();
+        assert!(joined.contains("CALL STACK"));
+        assert!(joined.contains("main"));
+        assert!(joined.contains("m.rs:10"));
+        assert!(joined.contains("VARIABLES"));
+        assert!(joined.contains("n = 42"));
+        assert!(joined.contains("BREAKPOINTS"));
+        assert!(joined.contains("● m.rs:10"));
+    }
+
+    #[test]
+    fn run_panel_frame_navigation() {
+        let mut app = app_with("x\n");
+        app.dap_frames = vec![frame(1, "inner", "/a.rs", 3), frame(2, "outer", "/b.rs", 7)];
+        keys(&mut app, " e"); // open + focus sidebar
+        app.sidebar_view = SidebarView::Run;
+        app.handle_key(Key::char('j')).unwrap();
+        assert_eq!(app.dap_selected_frame, 1);
+        app.handle_key(Key::char('k')).unwrap();
+        assert_eq!(app.dap_selected_frame, 0);
+        // Down is clamped at the last frame.
+        app.handle_key(Key::char('j')).unwrap();
+        app.handle_key(Key::char('j')).unwrap();
+        assert_eq!(app.dap_selected_frame, 1);
+    }
+
+    #[test]
+    fn dap_stop_opens_run_panel() {
+        let mut app = app_with("x\n");
+        app.dap_selected_frame = 3; // stale
+        app.handle_dap_event(onda_dap::DapEvent::Stopped {
+            thread_id: Some(1),
+            reason: "breakpoint".into(),
+        });
+        assert!(app.sidebar_open);
+        assert_eq!(app.sidebar_view, SidebarView::Run);
+        assert_eq!(app.dap_selected_frame, 0);
+    }
+
+    #[test]
+    fn stacktrace_clamps_selected_frame() {
+        let mut app = app_with("x\n");
+        app.dap_selected_frame = 5;
+        app.handle_dap_event(onda_dap::DapEvent::StackTrace(vec![frame(
+            1, "only", "/a.rs", 1,
+        )]));
+        assert_eq!(app.dap_frames.len(), 1);
+        assert_eq!(app.dap_selected_frame, 0);
+    }
+
+    #[test]
+    fn palette_opens_run_and_debug() {
+        let mut app = app_with("x\n");
+        app.run_palette_value("act:run").unwrap();
+        assert_eq!(app.sidebar_view, SidebarView::Run);
+        assert!(app.sidebar_open && app.sidebar_focused);
     }
 }
 

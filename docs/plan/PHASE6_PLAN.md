@@ -130,7 +130,7 @@ W40 DAP debugger (core) — independent, can run in parallel
   pure layer + that the right escape is emitted on a capable terminal and suppressed
   otherwise.
 
-## W40 — DAP debugger (core, weeks 1–3, parallel)
+## W40 — DAP debugger (core, weeks 1–3, parallel) ✅
 Restores the debugger as a **core feature crate** (`onda-dap`), the same architectural
 tier as LSP (DESIGN §1.3 lists LSP in core; DAP is structurally identical — external
 adapter process + Content-Length framed protocol + deep editor integration). A WASM
@@ -147,6 +147,16 @@ host; see the decision rationale recorded below.
   the sandbox. (Engine = core, surface = extensible.)
 - **Accept:** mock-adapter E2E green; breakpoints/stepping/stack/vars/eval work; the
   `dap_on_keypress_p99_ms < 10` gate holds while a session is attached.
+- **Done:** T40.1/T40.2 landed with the DAP-as-core restore (`onda-dap` engine +
+  `onda-mock-dap`; `tests/e2e.rs` green: `full_debug_session`, `step_produces_new_stop`).
+  W40's UI integration now adds the **Run & Debug sidebar panel** (`run_body`/
+  `handle_run_key`): live session state, a selectable call stack (`j`/`k` selects a frame
+  and refreshes its variables via re-`Scopes`; `l`/`<CR>` jumps to the frame's source),
+  the selected frame's variables, and all breakpoints. The panel opens automatically on
+  stop (VS Code-like) without stealing editor focus; F5/F10/F11/F12 step control also work
+  while it's focused. Command palette: "Run and debug". The float-based `:DapStack`/
+  `:DapVars`/`:DapEval` remain. **T40.3** (read-only debug state to plugins via the W37
+  host API) stays deferred with the rest of W37's callback contributions.
 
 ## Decisions (recorded 2026-06-15)
 

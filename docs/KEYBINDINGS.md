@@ -193,6 +193,16 @@ In a create/rename prompt: type the name, `<CR>` confirms, `<Esc>` cancels.
 Each row shows a two-char `git status` badge (e.g. `M `, ` M`, `??`) and the path.
 In the commit prompt: type the message, `<CR>` commits, `<Esc>` cancels.
 
+### Run & Debug view (DAP)
+Opens automatically when the debugger stops (without stealing focus). Shows the
+session state, call stack, the selected frame's variables, and all breakpoints.
+
+| Key | Action |
+|---|---|
+| `j` / `<Down>`, `k` / `<Up>` | select a stack frame (loads its variables) |
+| `l` / `<CR>` | jump to the selected frame's source line |
+| `<F5>` `<F10>` `<F11>` `<F12>` | continue / step over / in / out (also work globally) |
+
 ---
 
 ## Previews (images & PDF)
