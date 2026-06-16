@@ -495,6 +495,8 @@ struct App<B: Backend> {
     plugin_idle_fired: bool,
     /// Plugin decorations to paint: doc index → namespace → batch.
     plugin_decorations: HashMap<usize, HashMap<String, onda_plugin::DecorationBatch>>,
+    /// Plugin-contributed statusline segments (id → text), shown right-aligned (W37).
+    plugin_statusline: Vec<(String, String)>,
 
     /// Last buffer char-length we reparsed syntax for, per doc (change detector).
     doc_last_len: HashMap<usize, usize>,
@@ -1858,6 +1860,10 @@ impl<B: Backend> App<B> {
                 Ok(ex) => self.execute_ex_command(ex)?,
                 Err(e) => self.message = Message::Error(format!("E: {e}")),
             }
+        } else if let Some(name) = value.strip_prefix("plugin:") {
+            if !self.try_plugin_command(name) {
+                self.message = Message::Error(format!("plugin command not found: {name}"));
+            }
         } else if let Some(act) = value.strip_prefix("act:") {
             match act {
                 "filepicker" => {
@@ -2575,6 +2581,18 @@ impl<B: Backend> App<B> {
                 let doc = &self.docs[focused_doc_idx];
                 let sel = &self.windows[self.focused_window].selection;
                 Statusline::render(grid, status_row, mode_ind, doc, sel, macro_recording, theme);
+            }
+
+            // Plugin-contributed statusline segments, right-aligned (W37).
+            if !self.plugin_statusline.is_empty() {
+                let text: String = self
+                    .plugin_statusline
+                    .iter()
+                    .map(|(_, t)| format!(" {t} "))
+                    .collect();
+                let w = text.chars().count() as u16;
+                let start = width.saturating_sub(w);
+                grid.write_str(start, status_row, &text, theme.status_visual());
             }
 
             // Message line
@@ -4335,7 +4353,12 @@ impl<B: Backend> App<B> {
                 self.picker_kind = PickerKind::Buffer;
             }
             Action::OpenCommandPalette => {
-                self.picker = Some(build_command_palette());
+                let plugin_cmds = self
+                    .plugin_host
+                    .as_ref()
+                    .map(|h| h.command_names())
+                    .unwrap_or_default();
+                self.picker = Some(build_command_palette(&plugin_cmds));
                 self.picker_kind = PickerKind::Command;
             }
             Action::ToggleSidebar => {
@@ -4855,11 +4878,19 @@ impl<B: Backend> App<B> {
                     }
                     self.compositor.buf.invalidate();
                 }
-                // Picker contributions, statusline segments, and plugin keymaps
-                // are follow-ups — see docs/BACKLOG.md. CmdCreate is owned by
-                // PluginHost (the command registry).
+                PluginApiCall::StatuslineSegment { id, text, .. } => {
+                    // Upsert by id so a plugin can update its own segment.
+                    if let Some(seg) = self.plugin_statusline.iter_mut().find(|(i, _)| *i == id) {
+                        seg.1 = text;
+                    } else {
+                        self.plugin_statusline.push((id, text));
+                    }
+                    self.compositor.buf.invalidate();
+                }
+                // Picker contributions and plugin keymaps need a guest-callback
+                // round-trip — follow-ups (see docs/BACKLOG.md). CmdCreate is owned
+                // by PluginHost (the command registry; surfaced in the palette).
                 PluginApiCall::UiPick { .. }
-                | PluginApiCall::StatuslineSegment { .. }
                 | PluginApiCall::CmdCreate { .. }
                 | PluginApiCall::KeymapSet { .. } => {}
             }
@@ -5451,6 +5482,7 @@ fn make_app<B: Backend>(
         plugin_host: None,
         plugin_idle_fired: false,
         plugin_decorations: HashMap::new(),
+        plugin_statusline: Vec::new(),
         doc_last_len: HashMap::new(),
         sidebar_open: false,
         sidebar_view: SidebarView::Explorer,
@@ -5726,13 +5758,19 @@ fn command_palette_entries() -> &'static [(&'static str, &'static str, &'static 
 }
 
 /// Build the fuzzy command palette picker.
-fn build_command_palette() -> onda_modal::picker::Picker {
+fn build_command_palette(plugin_cmds: &[String]) -> onda_modal::picker::Picker {
     use onda_modal::picker::{Picker, PickerItem};
     let mut p = Picker::new("Command palette");
-    let items = command_palette_entries()
+    let mut items: Vec<PickerItem> = command_palette_entries()
         .iter()
         .map(|(title, hint, value)| PickerItem::new(format!("{title:30} {hint}"), *value))
         .collect();
+    for name in plugin_cmds {
+        items.push(PickerItem::new(
+            format!("{:30} :{name} (plugin)", format!("Plugin: {name}")),
+            format!("plugin:{name}"),
+        ));
+    }
     p.open(items);
     p
 }
@@ -6984,6 +7022,43 @@ mod edit_integration_tests {
         app.handle_key(Key::Enter).unwrap();
         assert!(app.sidebar_open, "selecting the palette entry ran it");
         assert!(app.picker.as_ref().map(|p| !p.is_visible()).unwrap_or(true));
+    }
+
+    // ── Plugin UI contributions (W37) ────────────────────────────────────────
+
+    #[test]
+    fn plugin_statusline_segment_upserts() {
+        let mut app = app_with("x\n");
+        app.apply_plugin_calls(vec![onda_plugin::PluginApiCall::StatuslineSegment {
+            id: "git".into(),
+            text: "main".into(),
+            style: onda_plugin::Style::default(),
+        }]);
+        assert_eq!(app.plugin_statusline, vec![("git".into(), "main".into())]);
+        // Same id updates in place (no duplicate).
+        app.apply_plugin_calls(vec![onda_plugin::PluginApiCall::StatuslineSegment {
+            id: "git".into(),
+            text: "feature".into(),
+            style: onda_plugin::Style::default(),
+        }]);
+        assert_eq!(
+            app.plugin_statusline,
+            vec![("git".into(), "feature".into())]
+        );
+    }
+
+    #[test]
+    fn command_palette_includes_plugin_commands() {
+        let p = build_command_palette(&["http".to_string()]);
+        let has_plugin = p.filtered_items().any(|it| it.value == "plugin:http");
+        assert!(has_plugin, "plugin command should appear in the palette");
+    }
+
+    #[test]
+    fn palette_plugin_value_without_host_errors() {
+        let mut app = app_with("x\n");
+        app.run_palette_value("plugin:nope").unwrap();
+        assert!(matches!(app.message, Message::Error(_)));
     }
 
     // ── LSP edit application (W36) ───────────────────────────────────────────
