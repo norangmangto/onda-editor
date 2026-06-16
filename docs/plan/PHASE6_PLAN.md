@@ -97,11 +97,18 @@ W40 DAP debugger (core) — independent, can run in parallel
 - **T37.2** Capability + activation wiring for UI contributions; review doc.
 - **Accept:** a sample plugin adds a sidebar view + palette item; perf budget held.
 
-## W38 — Source-control surface (weeks 5–6)
+## W38 — Source-control surface (weeks 5–6) ✅
 - **T38.1** SCM panel: changed files, stage/unstage/discard, hunk view, diff, commit —
   built on the Phase 3 git plugin (`git-blame-inline` → grow into `git`) via the W37 UI
   API and a host `vcs` interface. **No libgit2 in the editor core.**
 - **Accept:** stage→commit a change entirely from the SCM panel.
+- **Done (3050f7b):** Source Control sidebar view backed by the `git` CLI on a worker
+  thread (`crates/onda/src/scm.rs`: porcelain parser + `run_git`/`status`). Lists
+  changed files with status badges; `a` stage / `u` unstage / `c` commit / `R` refresh;
+  command-palette entry. **Diverges from plan:** implemented via the `git` CLI subprocess
+  rather than the W37 plugin `vcs` host interface (W37 callback contributions are still
+  pending — see KNOWN_ISSUES); keeps libgit2 out of core as required. Hunk-level
+  staging/discard + inline diff view deferred.
 
 ## W39 — Rich content previews (weeks 6–7)
 - **T39.1** Terminal graphics layer: detect & use kitty graphics / iTerm2 OSC 1337 /
