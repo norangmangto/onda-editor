@@ -97,7 +97,9 @@ Prefix `i` = inner, `a` = around/outer.
 | `<C-v>` | enter visual-block mode |
 | `<space>f` | fuzzy file picker |
 | `<space>b` | buffer picker |
-| `<space>e` | open + focus the IDE sidebar (W33) |
+| `<space>e` | open + focus the IDE sidebar |
+| `<space>p` | command palette (fuzzy) |
+| `<F1>` | keybinding reference (searchable) |
 
 ### Debugger (DAP) function keys
 | Key | Action |

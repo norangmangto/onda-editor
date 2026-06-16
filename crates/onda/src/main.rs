@@ -141,6 +141,10 @@ const ACTIVITY_BAR_W: u16 = 3;
 enum PickerKind {
     File,
     Buffer,
+    /// Fuzzy command palette (W35); item values are `ex:<cmd>` or `act:<name>`.
+    Command,
+    /// Read-only keybinding reference (`F1`); Enter just closes.
+    KeyRef,
 }
 
 /// Which view the IDE-shell sidebar is showing (Phase 6 W33; activity bar order).
@@ -1821,6 +1825,40 @@ impl<B: Backend> App<B> {
         }
     }
 
+    /// Run a command-palette selection: `ex:<cmd>` parses + runs an `:` command;
+    /// `act:<name>` triggers a built-in.
+    fn run_palette_value(&mut self, value: &str) -> Result<()> {
+        if let Some(cmd) = value.strip_prefix("ex:") {
+            match onda_modal::ExCommand::parse(cmd) {
+                Ok(ex) => self.execute_ex_command(ex)?,
+                Err(e) => self.message = Message::Error(format!("E: {e}")),
+            }
+        } else if let Some(act) = value.strip_prefix("act:") {
+            match act {
+                "filepicker" => {
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                    self.picker = Some(build_file_picker(&cwd));
+                    self.picker_kind = PickerKind::File;
+                }
+                "bufferpicker" => {
+                    let names: Vec<String> =
+                        self.docs.iter().map(|d| d.name().to_string()).collect();
+                    self.picker = Some(build_buffer_picker(&names));
+                    self.picker_kind = PickerKind::Buffer;
+                }
+                "sidebar" => {
+                    self.sidebar_open = true;
+                    self.sidebar_focused = true;
+                    if self.sidebar_view == SidebarView::Explorer {
+                        self.ensure_file_tree();
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Open `path` into a buffer in the focused window (shared by picker + tree).
     fn open_path_in_buffer(&mut self, path: &std::path::Path) {
         match Document::open(path) {
@@ -2841,6 +2879,8 @@ impl<B: Backend> App<B> {
                                 *self.selection_mut() = Selection::point(0);
                             }
                         }
+                        PickerKind::Command => self.run_palette_value(&value)?,
+                        PickerKind::KeyRef => {} // reference only
                     }
                 }
             }
@@ -3427,6 +3467,13 @@ impl<B: Backend> App<B> {
     }
 
     fn handle_normal_key(&mut self, key: Key) -> Result<()> {
+        // F1: open the read-only keybinding reference.
+        if key == Key::F(1) {
+            self.picker = Some(build_keyref_picker());
+            self.picker_kind = PickerKind::KeyRef;
+            return Ok(());
+        }
+
         // Debugger function keys (W40): F9 toggles a breakpoint; F5/F10/F11/F12 control.
         match key {
             Key::F(9) => {
@@ -4100,6 +4147,10 @@ impl<B: Backend> App<B> {
                 let picker = build_buffer_picker(&names);
                 self.picker = Some(picker);
                 self.picker_kind = PickerKind::Buffer;
+            }
+            Action::OpenCommandPalette => {
+                self.picker = Some(build_command_palette());
+                self.picker_kind = PickerKind::Command;
             }
             Action::ToggleSidebar => {
                 // `<space>e` opens the sidebar and jumps focus into it. Within the
@@ -5422,6 +5473,105 @@ fn draw_dap_markers(
     }
 }
 
+/// Runnable command-palette entries (W35): `(title, key hint, invocation)`.
+/// Invocation is `ex:<cmd>` (parsed + run as an `:` command) or `act:<name>`
+/// (a built-in handled in `handle_picker_key`).
+fn command_palette_entries() -> &'static [(&'static str, &'static str, &'static str)] {
+    &[
+        ("Save file", ":w", "ex:w"),
+        ("Quit", ":q", "ex:q"),
+        ("Save & quit", ":wq", "ex:wq"),
+        ("Open file picker", "<space>f", "act:filepicker"),
+        ("Switch buffer", "<space>b", "act:bufferpicker"),
+        ("Toggle sidebar", "<space>e", "act:sidebar"),
+        ("Split horizontally", ":sp", "ex:sp"),
+        ("Split vertically", ":vsp", "ex:vsp"),
+        ("Clear search highlight", ":noh", "ex:noh"),
+        ("Format buffer (LSP)", ":Format", "ex:Format"),
+        ("Fetch grammars", ":GrammarFetch", "ex:GrammarFetch"),
+        ("Show messages", ":messages", "ex:messages"),
+        ("List buffers", ":ls", "ex:ls"),
+        ("Cycle theme", ":theme", "ex:theme"),
+        ("Open terminal", ":terminal", "ex:terminal"),
+        ("Save session", ":session save", "ex:session save"),
+        ("Restore session", ":session restore", "ex:session restore"),
+        ("CSV/TSV table view", ":table", "ex:table"),
+        ("JSONL field schema", ":fields", "ex:fields"),
+        ("Connect agent", ":agent", "ex:agent"),
+        ("Review agent edits", ":agent-review", "ex:agent-review"),
+        (
+            "Export agent transcript",
+            ":agent-export",
+            "ex:agent-export",
+        ),
+        ("Debug: run", ":DapRun", "ex:DapRun"),
+        ("Debug: stop", ":DapStop", "ex:DapStop"),
+        ("Debug: toggle breakpoint", "<F9>", "ex:DapBreakpoint"),
+        ("Debug: call stack", ":DapStack", "ex:DapStack"),
+        ("Debug: variables", ":DapVars", "ex:DapVars"),
+    ]
+}
+
+/// Build the fuzzy command palette picker.
+fn build_command_palette() -> onda_modal::picker::Picker {
+    use onda_modal::picker::{Picker, PickerItem};
+    let mut p = Picker::new("Command palette");
+    let items = command_palette_entries()
+        .iter()
+        .map(|(title, hint, value)| PickerItem::new(format!("{title:30} {hint}"), *value))
+        .collect();
+    p.open(items);
+    p
+}
+
+/// Read-only keybinding reference shown by `F1`: `(keys, description)`.
+fn keybinding_reference() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("h j k l", "move left/down/up/right"),
+        ("w b e", "word forward / back / end"),
+        ("0 ^ $", "line start / first non-blank / end"),
+        ("gg G", "document start / end"),
+        ("<C-d> <C-u>", "half-page down / up"),
+        ("<C-o> <C-i>", "jump list older / newer"),
+        ("f{c} t{c}", "find / till char"),
+        ("i a o", "insert / append / open line"),
+        ("x D C", "delete char / to-EOL / change-to-EOL"),
+        ("d c y + motion", "delete / change / yank"),
+        ("dd cc yy", "line-wise operator"),
+        ("p P", "paste after / before"),
+        ("u <C-r>", "undo / redo"),
+        (". ", "repeat last change"),
+        ("/ ? n N", "search / next / prev"),
+        ("* #", "search word under cursor"),
+        ("m{c} `{c} '{c}", "set / jump mark"),
+        ("q{c} @{c} @@", "record / play macro"),
+        ("v V <C-v>", "visual / line / block"),
+        ("<C-w>", "focus next window"),
+        (
+            "<space>f / b / e / p",
+            "file / buffer picker · sidebar · palette",
+        ),
+        ("<F1>", "this reference"),
+        (
+            "<F5> <F9> <F10>/<F11>/<F12>",
+            "debug: continue / breakpoint / step",
+        ),
+        (":", "command line"),
+    ]
+}
+
+/// Build the read-only keybinding-reference picker.
+fn build_keyref_picker() -> onda_modal::picker::Picker {
+    use onda_modal::picker::{Picker, PickerItem};
+    let mut p = Picker::new("Keybindings (F1)");
+    let items = keybinding_reference()
+        .iter()
+        .map(|(keys, desc)| PickerItem::new(format!("{keys:28} {desc}"), ""))
+        .collect();
+    p.open(items);
+    p
+}
+
 /// Parse a plugin color string (`#rrggbb` or a basic name) to a render `Color`.
 fn plugin_color(s: &str) -> Option<onda_render::Color> {
     use onda_render::Color;
@@ -6577,6 +6727,50 @@ mod edit_integration_tests {
         app.handle_key(Key::char('n')).unwrap(); // cancel
         assert!(dir.path().join("keep.txt").exists());
         assert!(app.sidebar_prompt.is_none());
+    }
+
+    // ── Command palette + F1 reference (W35) ─────────────────────────────────
+
+    #[test]
+    fn command_palette_opens() {
+        let mut app = app_with("x\n");
+        keys(&mut app, " p"); // <space>p
+        assert!(app.picker.as_ref().map(|p| p.is_visible()).unwrap_or(false));
+        assert_eq!(app.picker_kind, PickerKind::Command);
+    }
+
+    #[test]
+    fn f1_opens_keybinding_reference() {
+        let mut app = app_with("x\n");
+        app.handle_key(Key::F(1)).unwrap();
+        assert_eq!(app.picker_kind, PickerKind::KeyRef);
+        assert!(app.picker.as_ref().map(|p| p.is_visible()).unwrap_or(false));
+    }
+
+    #[test]
+    fn palette_runs_builtin_action() {
+        let mut app = app_with("x\n");
+        app.run_palette_value("act:sidebar").unwrap();
+        assert!(app.sidebar_open);
+        app.run_palette_value("act:filepicker").unwrap();
+        assert_eq!(app.picker_kind, PickerKind::File);
+    }
+
+    #[test]
+    fn palette_reports_unknown_ex_command() {
+        let mut app = app_with("x\n");
+        app.run_palette_value("ex:definitelynotacommand").unwrap();
+        assert!(matches!(app.message, Message::Error(_)));
+    }
+
+    #[test]
+    fn palette_select_and_run_via_enter() {
+        let mut app = app_with("x\n");
+        keys(&mut app, " p"); // open palette
+        keys(&mut app, "Toggle"); // fuzzy-filter to "Toggle sidebar"
+        app.handle_key(Key::Enter).unwrap();
+        assert!(app.sidebar_open, "selecting the palette entry ran it");
+        assert!(app.picker.as_ref().map(|p| !p.is_visible()).unwrap_or(true));
     }
 
     #[test]

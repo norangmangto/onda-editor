@@ -174,6 +174,8 @@ pub enum Action {
 
     // IDE shell (Phase 6 W33): toggle/focus the activity bar + sidebar.
     ToggleSidebar,
+    // IDE shell (Phase 6 W35): open the fuzzy command palette.
+    OpenCommandPalette,
 
     // Command-line operations (dispatched to app)
     WriteFile,
@@ -263,6 +265,7 @@ impl Keymap {
             sp.insert(Key::char('f'), KeymapNode::Leaf(Action::OpenFilePicker));
             sp.insert(Key::char('b'), KeymapNode::Leaf(Action::OpenBufferPicker));
             sp.insert(Key::char('e'), KeymapNode::Leaf(Action::ToggleSidebar));
+            sp.insert(Key::char('p'), KeymapNode::Leaf(Action::OpenCommandPalette));
             m.insert(Key::char(' '), KeymapNode::Node(sp));
         }
 
