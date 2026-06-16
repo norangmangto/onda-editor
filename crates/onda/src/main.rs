@@ -6,6 +6,7 @@ use std::time::Instant;
 mod doctor;
 mod file_tree;
 mod lsp_edit;
+mod scm;
 mod plugin_host;
 
 use anyhow::{Context, Result};
@@ -69,6 +70,8 @@ enum BgMessage {
     AgentClientReady(onda_agent::AgentClient),
     /// The active theme file changed on disk (live reload, T18.1).
     ThemeReload,
+    /// Source-control status (changed files) fetched on a worker (W38), or an error.
+    ScmStatus(Result<Vec<scm::FileStatus>, String>),
 }
 
 // ── Latency tracer ────────────────────────────────────────────────────────────
@@ -210,6 +213,7 @@ enum PromptKind {
     NewDir,
     Rename,
     Delete,
+    Commit,
 }
 
 impl SidebarPrompt {
@@ -226,6 +230,7 @@ impl SidebarPrompt {
             PromptKind::NewDir => format!("new dir: {}", self.input),
             PromptKind::Rename => format!("rename: {}", self.input),
             PromptKind::Delete => format!("delete {name}? (y/n)"),
+            PromptKind::Commit => format!("commit: {}", self.input),
         }
     }
 }
@@ -497,6 +502,10 @@ struct App<B: Backend> {
     plugin_decorations: HashMap<usize, HashMap<String, onda_plugin::DecorationBatch>>,
     /// Plugin-contributed statusline segments (id → text), shown right-aligned (W37).
     plugin_statusline: Vec<(String, String)>,
+    /// Source-control changed files (W38), shown in the Source Control sidebar view.
+    scm_status: Vec<scm::FileStatus>,
+    /// Selected row in the Source Control view.
+    scm_selected: usize,
 
     /// Last buffer char-length we reparsed syntax for, per doc (change detector).
     doc_last_len: HashMap<usize, usize>,
@@ -1556,14 +1565,18 @@ impl<B: Backend> App<B> {
                 self.sidebar_open = false;
                 self.sidebar_focused = false;
             }
-            Key::Tab => self.cycle_sidebar_view(1),
-            Key::BackTab => self.cycle_sidebar_view(-1),
+            Key::Tab => {
+                self.cycle_sidebar_view(1);
+                self.on_sidebar_view_entered();
+            }
+            Key::BackTab => {
+                self.cycle_sidebar_view(-1);
+                self.on_sidebar_view_entered();
+            }
             Key::Char(c, _) if ('1'..='5').contains(c) => {
                 let i = (*c as u8 - b'1') as usize;
                 self.sidebar_view = SidebarView::ALL[i];
-                if self.sidebar_view == SidebarView::Explorer {
-                    self.ensure_file_tree();
-                }
+                self.on_sidebar_view_entered();
             }
             Key::Char('>', _) | Key::Char('L', _) => {
                 self.sidebar_width = (self.sidebar_width + 4).min(80);
@@ -1573,8 +1586,10 @@ impl<B: Backend> App<B> {
             }
             _ => {
                 // View-specific content keys.
-                if self.sidebar_view == SidebarView::Explorer {
-                    self.handle_explorer_key(key);
+                match self.sidebar_view {
+                    SidebarView::Explorer => self.handle_explorer_key(key),
+                    SidebarView::SourceControl => self.handle_scm_key(key),
+                    _ => {}
                 }
                 return true; // consume everything else while focused
             }
@@ -1694,6 +1709,16 @@ impl<B: Backend> App<B> {
 
     /// Perform the file operation described by `prompt` and refresh the tree.
     fn commit_prompt(&mut self, prompt: &SidebarPrompt) {
+        // A git commit runs on a worker; the rest are local filesystem operations.
+        if prompt.kind == PromptKind::Commit {
+            if prompt.input.trim().is_empty() {
+                self.message = Message::Info("commit aborted: empty message".into());
+                return;
+            }
+            self.scm_run_then_refresh(vec!["commit".into(), "-m".into(), prompt.input.clone()]);
+            self.message = Message::Info("committing…".into());
+            return;
+        }
         let result: std::io::Result<String> = match prompt.kind {
             PromptKind::NewFile => file_tree::create_file(&prompt.dir, &prompt.input)
                 .map(|p| format!("created {}", p.display())),
@@ -1708,6 +1733,7 @@ impl<B: Backend> App<B> {
                 Some(t) => file_tree::delete_entry(t).map(|_| format!("deleted {}", t.display())),
                 None => Ok(String::new()),
             },
+            PromptKind::Commit => Ok(String::new()), // handled above
         };
         match result {
             Ok(msg) => self.message = Message::Info(msg),
@@ -1715,6 +1741,15 @@ impl<B: Backend> App<B> {
         }
         if let Some(t) = self.file_tree.as_mut() {
             t.refresh();
+        }
+    }
+
+    /// Side effects when a sidebar view becomes active (lazy-build / refresh).
+    fn on_sidebar_view_entered(&mut self) {
+        match self.sidebar_view {
+            SidebarView::Explorer => self.ensure_file_tree(),
+            SidebarView::SourceControl => self.refresh_scm(),
+            _ => {}
         }
     }
 
@@ -1804,7 +1839,7 @@ impl<B: Backend> App<B> {
                 None => vec![line("(opening…)")],
             },
             SidebarView::Search => vec![line("(live grep — W35)")],
-            SidebarView::SourceControl => vec![line("(git — W38)")],
+            SidebarView::SourceControl => self.scm_body(),
             SidebarView::Run => vec![line("(debug — W40)")],
             SidebarView::Agent => vec![line("(use :agent for the panel)")],
         }
@@ -1880,9 +1915,13 @@ impl<B: Backend> App<B> {
                 "sidebar" => {
                     self.sidebar_open = true;
                     self.sidebar_focused = true;
-                    if self.sidebar_view == SidebarView::Explorer {
-                        self.ensure_file_tree();
-                    }
+                    self.on_sidebar_view_entered();
+                }
+                "scm" => {
+                    self.sidebar_open = true;
+                    self.sidebar_focused = true;
+                    self.sidebar_view = SidebarView::SourceControl;
+                    self.on_sidebar_view_entered();
                 }
                 _ => {}
             }
@@ -1953,6 +1992,100 @@ impl<B: Backend> App<B> {
             }
         }
         (files, total)
+    }
+
+    // ── Source control (W38) ─────────────────────────────────────────────────
+
+    /// Repo root for SCM operations (the working directory).
+    fn scm_root(&self) -> PathBuf {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+
+    /// Fetch `git status` on a worker thread; result arrives as `BgMessage::ScmStatus`.
+    fn refresh_scm(&self) {
+        let tx = self.bg_tx.clone();
+        let root = self.scm_root();
+        std::thread::spawn(move || {
+            let _ = tx.send(BgMessage::ScmStatus(scm::status(&root)));
+        });
+    }
+
+    /// Run a `git` subcommand on a worker, then re-fetch status.
+    fn scm_run_then_refresh(&self, args: Vec<String>) {
+        let tx = self.bg_tx.clone();
+        let root = self.scm_root();
+        std::thread::spawn(move || {
+            let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            if let Err(e) = scm::run_git(&root, &argv) {
+                tracing::warn!("git {argv:?} failed: {e}");
+            }
+            let _ = tx.send(BgMessage::ScmStatus(scm::status(&root)));
+        });
+    }
+
+    /// Path of the selected SCM entry, if any.
+    fn scm_selected_path(&self) -> Option<String> {
+        self.scm_status.get(self.scm_selected).map(|f| f.path.clone())
+    }
+
+    /// Source Control sidebar content keys (j/k move, a stage, u unstage, c commit,
+    /// R refresh).
+    fn handle_scm_key(&mut self, key: &Key) {
+        match key {
+            Key::Char('j', _) | Key::Down => {
+                if !self.scm_status.is_empty() {
+                    self.scm_selected = (self.scm_selected + 1).min(self.scm_status.len() - 1);
+                }
+            }
+            Key::Char('k', _) | Key::Up => {
+                self.scm_selected = self.scm_selected.saturating_sub(1);
+            }
+            Key::Char('a', _) => {
+                if let Some(p) = self.scm_selected_path() {
+                    self.scm_run_then_refresh(vec!["add".into(), p]);
+                }
+            }
+            Key::Char('u', _) => {
+                if let Some(p) = self.scm_selected_path() {
+                    self.scm_run_then_refresh(vec!["reset".into(), "HEAD".into(), "--".into(), p]);
+                }
+            }
+            Key::Char('R', _) => self.refresh_scm(),
+            Key::Char('c', _) => {
+                self.sidebar_prompt = Some(SidebarPrompt {
+                    kind: PromptKind::Commit,
+                    input: String::new(),
+                    dir: self.scm_root(),
+                    target: None,
+                });
+            }
+            _ => {}
+        }
+        self.compositor.buf.invalidate();
+    }
+
+    /// Source Control sidebar body lines.
+    fn scm_body(&self) -> Vec<(onda_render::Style, String)> {
+        if self.scm_status.is_empty() {
+            return vec![(self.theme.line_nr(), "  (clean)".into())];
+        }
+        let sel = self.theme.menu_selected();
+        let staged = self.theme.diff_add();
+        let dirty = self.theme.diff_change();
+        self.scm_status
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let style = if i == self.scm_selected {
+                    sel
+                } else if f.is_staged() {
+                    staged
+                } else {
+                    dirty
+                };
+                (style, format!("{} {}", f.badge(), f.path))
+            })
+            .collect()
     }
 
     /// Open `path` into a buffer in the focused window (shared by picker + tree).
@@ -2802,9 +2935,7 @@ impl<B: Backend> App<B> {
                 if i < SidebarView::ALL.len() {
                     self.sidebar_view = SidebarView::ALL[i];
                     self.sidebar_focused = true;
-                    if self.sidebar_view == SidebarView::Explorer {
-                        self.ensure_file_tree();
-                    }
+                    self.on_sidebar_view_entered();
                     self.compositor.buf.invalidate();
                     return true;
                 }
@@ -4367,9 +4498,7 @@ impl<B: Backend> App<B> {
                 // closes it.
                 self.sidebar_open = true;
                 self.sidebar_focused = true;
-                if self.sidebar_view == SidebarView::Explorer {
-                    self.ensure_file_tree();
-                }
+                self.on_sidebar_view_entered();
                 self.compositor.buf.invalidate();
             }
 
@@ -4938,6 +5067,14 @@ impl<B: Backend> App<B> {
                 BgMessage::ThemeReload => {
                     self.reload_theme_file();
                 }
+                BgMessage::ScmStatus(result) => match result {
+                    Ok(files) => {
+                        self.scm_selected = self.scm_selected.min(files.len().saturating_sub(1));
+                        self.scm_status = files;
+                        self.compositor.buf.invalidate();
+                    }
+                    Err(e) => self.message = Message::Error(format!("git: {e}")),
+                },
                 BgMessage::Dap(ev) => self.handle_dap_event(ev),
                 BgMessage::DapClientReady(client) => {
                     self.dap_client = Some(client);
@@ -5483,6 +5620,8 @@ fn make_app<B: Backend>(
         plugin_idle_fired: false,
         plugin_decorations: HashMap::new(),
         plugin_statusline: Vec::new(),
+        scm_status: Vec::new(),
+        scm_selected: 0,
         doc_last_len: HashMap::new(),
         sidebar_open: false,
         sidebar_view: SidebarView::Explorer,
@@ -5729,6 +5868,7 @@ fn command_palette_entries() -> &'static [(&'static str, &'static str, &'static 
         ("Open file picker", "<space>f", "act:filepicker"),
         ("Switch buffer", "<space>b", "act:bufferpicker"),
         ("Toggle sidebar", "<space>e", "act:sidebar"),
+        ("Source control", "", "act:scm"),
         ("Split horizontally", ":sp", "ex:sp"),
         ("Split vertically", ":vsp", "ex:vsp"),
         ("Clear search highlight", ":noh", "ex:noh"),
@@ -7059,6 +7199,63 @@ mod edit_integration_tests {
         let mut app = app_with("x\n");
         app.run_palette_value("plugin:nope").unwrap();
         assert!(matches!(app.message, Message::Error(_)));
+    }
+
+    // ── Source control (W38) ─────────────────────────────────────────────────
+
+    fn fstat(staged: char, unstaged: char, path: &str) -> scm::FileStatus {
+        scm::FileStatus {
+            staged,
+            unstaged,
+            path: path.to_string(),
+        }
+    }
+
+    #[test]
+    fn scm_status_drains_into_state() {
+        let mut app = app_with("x\n");
+        app.bg_tx
+            .send(BgMessage::ScmStatus(Ok(vec![fstat('M', ' ', "a.rs")])))
+            .unwrap();
+        app.drain_bg_channel();
+        assert_eq!(app.scm_status.len(), 1);
+        assert_eq!(app.scm_status[0].path, "a.rs");
+    }
+
+    #[test]
+    fn scm_body_lists_changes() {
+        let mut app = app_with("x\n");
+        app.scm_status = vec![fstat('M', ' ', "a.rs"), fstat('?', '?', "b.rs")];
+        let body = app.scm_body();
+        assert_eq!(body.len(), 2);
+        assert!(body[0].1.contains("a.rs"));
+        assert!(body[1].1.contains("b.rs"));
+    }
+
+    #[test]
+    fn scm_navigation_and_commit_prompt() {
+        let mut app = app_with("x\n");
+        app.scm_status = vec![fstat('M', ' ', "a.rs"), fstat('?', '?', "b.rs")];
+        keys(&mut app, " e"); // open + focus sidebar
+        app.sidebar_view = SidebarView::SourceControl;
+        app.handle_key(Key::char('j')).unwrap(); // move selection down
+        assert_eq!(app.scm_selected, 1);
+        app.handle_key(Key::char('c')).unwrap(); // open commit prompt
+        assert!(matches!(
+            app.sidebar_prompt.as_ref().map(|p| p.kind),
+            Some(PromptKind::Commit)
+        ));
+        // Empty commit aborts and clears the prompt.
+        app.handle_key(Key::Enter).unwrap();
+        assert!(app.sidebar_prompt.is_none());
+    }
+
+    #[test]
+    fn palette_opens_source_control() {
+        let mut app = app_with("x\n");
+        app.run_palette_value("act:scm").unwrap();
+        assert_eq!(app.sidebar_view, SidebarView::SourceControl);
+        assert!(app.sidebar_open && app.sidebar_focused);
     }
 
     // ── LSP edit application (W36) ───────────────────────────────────────────

@@ -181,6 +181,18 @@ Prefix `i` = inner, `a` = around/outer.
 
 In a create/rename prompt: type the name, `<CR>` confirms, `<Esc>` cancels.
 
+### Source Control view (git)
+| Key | Action |
+|---|---|
+| `j` / `<Down>`, `k` / `<Up>` | move selection through changed files |
+| `a` | stage the selected file (`git add`) |
+| `u` | unstage the selected file (`git reset HEAD`) |
+| `c` | commit (prompts for a message; empty cancels) |
+| `R` | refresh the status |
+
+Each row shows a two-char `git status` badge (e.g. `M `, ` M`, `??`) and the path.
+In the commit prompt: type the message, `<CR>` commits, `<Esc>` cancels.
+
 ---
 
 ## Diff review (`:agent-review`)
