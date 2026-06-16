@@ -1643,13 +1643,17 @@ impl<B: Backend> App<B> {
         let base_dir = self.explorer_base_dir();
         let mut open_path: Option<PathBuf> = None;
         let mut start_prompt: Option<SidebarPrompt> = None;
+        let mut refresh_badges = false;
         if let Some(t) = self.file_tree.as_mut() {
             match key {
                 Key::Char('j', _) | Key::Down => t.move_selection(1, rows),
                 Key::Char('k', _) | Key::Up => t.move_selection(-1, rows),
                 Key::Char('l', _) | Key::Enter => open_path = t.activate(),
                 Key::Char('h', _) => t.collapse_or_parent(),
-                Key::Char('R', _) => t.refresh(),
+                Key::Char('R', _) => {
+                    t.refresh();
+                    refresh_badges = true;
+                }
                 Key::Char('a', _) => {
                     start_prompt = Some(SidebarPrompt {
                         kind: PromptKind::NewFile,
@@ -1695,6 +1699,9 @@ impl<B: Backend> App<B> {
         if let Some(p) = open_path {
             self.open_path_in_buffer(&p);
             self.sidebar_focused = false; // hand focus to the editor after opening
+        }
+        if refresh_badges {
+            self.refresh_scm(); // re-fetch git status for the tree badges (W34)
         }
         self.compositor.buf.invalidate();
     }
@@ -1785,7 +1792,10 @@ impl<B: Backend> App<B> {
     /// Side effects when a sidebar view becomes active (lazy-build / refresh).
     fn on_sidebar_view_entered(&mut self) {
         match self.sidebar_view {
-            SidebarView::Explorer => self.ensure_file_tree(),
+            SidebarView::Explorer => {
+                self.ensure_file_tree();
+                self.refresh_scm(); // populate git-status badges (W34)
+            }
             SidebarView::SourceControl => self.refresh_scm(),
             _ => {}
         }
@@ -1883,11 +1893,20 @@ impl<B: Backend> App<B> {
         }
     }
 
+    /// Map absolute path → git-status indicator char for the file tree (W34).
+    fn scm_tree_badges(&self) -> HashMap<PathBuf, char> {
+        scm_tree_badges_for(&self.scm_root(), &self.scm_status)
+    }
+
     /// Render the visible window of the file tree as styled sidebar lines.
     fn render_tree_lines(&self, t: &file_tree::FileTree) -> Vec<(onda_render::Style, String)> {
         let sel_style = self.theme.menu_selected();
         let dir_style = self.theme.line_nr_current();
         let file_style = self.theme.text();
+        let add_style = self.theme.diff_add();
+        let mod_style = self.theme.diff_change();
+        let del_style = self.theme.diag_error();
+        let badges = self.scm_tree_badges();
         let rows = self.sidebar_body_rows.max(1);
         let start = t.scroll.min(t.len());
         let end = (start + rows).min(t.len());
@@ -1905,14 +1924,28 @@ impl<B: Backend> App<B> {
                 "  "
             };
             let suffix = if e.is_dir { "/" } else { "" };
+            let badge = badges.get(&e.path).copied();
+            // Selection wins; otherwise a git status tints the row (VS Code-like).
             let style = if idx == t.selected {
                 sel_style
-            } else if e.is_dir {
-                dir_style
             } else {
-                file_style
+                match badge {
+                    Some('?') | Some('A') => add_style,
+                    Some('D') => del_style,
+                    Some(c) if c != '•' => mod_style,
+                    Some('•') if !e.is_dir => mod_style,
+                    _ if e.is_dir => dir_style,
+                    _ => file_style,
+                }
             };
-            out.push((style, format!("{indent}{icon}{}{suffix}", e.name)));
+            let badge_str = match badge {
+                Some(c) => format!("  {c}"),
+                None => String::new(),
+            };
+            out.push((
+                style,
+                format!("{indent}{icon}{}{suffix}{badge_str}", e.name),
+            ));
         }
         out
     }
@@ -6453,6 +6486,29 @@ fn draw_cmd_completion(grid: &mut onda_render::Grid, comp: &CmdCompletion, ancho
     }
 }
 
+/// Build the file-tree git-badge map (W34): each changed file (absolute path) →
+/// its status char, plus `•` on every ancestor directory up to (not including)
+/// `root`. Pure, so it can be unit-tested without a live repo.
+fn scm_tree_badges_for(
+    root: &std::path::Path,
+    statuses: &[scm::FileStatus],
+) -> HashMap<PathBuf, char> {
+    let mut map = HashMap::new();
+    for fs in statuses {
+        let abs = root.join(&fs.path);
+        map.insert(abs.clone(), fs.status_char());
+        let mut cur = abs.parent();
+        while let Some(dir) = cur {
+            if dir == root {
+                break;
+            }
+            map.entry(dir.to_path_buf()).or_insert('•');
+            cur = dir.parent();
+        }
+    }
+    map
+}
+
 /// Short source location for a DAP stack frame (file name, or frame name).
 fn short_frame_loc(f: &onda_dap::StackFrame) -> String {
     f.source
@@ -7902,6 +7958,39 @@ mod edit_integration_tests {
         app.run_palette_value("act:run").unwrap();
         assert_eq!(app.sidebar_view, SidebarView::Run);
         assert!(app.sidebar_open && app.sidebar_focused);
+    }
+
+    // ── File-tree git badges (W34) ───────────────────────────────────────────
+
+    #[test]
+    fn tree_badges_map_files_and_ancestor_dirs() {
+        let root = PathBuf::from("/repo");
+        let statuses = vec![
+            scm::FileStatus {
+                staged: 'M',
+                unstaged: ' ',
+                path: "src/main.rs".into(),
+            },
+            scm::FileStatus {
+                staged: '?',
+                unstaged: '?',
+                path: "new.txt".into(),
+            },
+        ];
+        let map = scm_tree_badges_for(&root, &statuses);
+        // Files carry their status char.
+        assert_eq!(map.get(&PathBuf::from("/repo/src/main.rs")), Some(&'M'));
+        assert_eq!(map.get(&PathBuf::from("/repo/new.txt")), Some(&'?'));
+        // Ancestor dir of the changed file is marked with a rollup dot.
+        assert_eq!(map.get(&PathBuf::from("/repo/src")), Some(&'•'));
+        // The root itself is never marked.
+        assert!(!map.contains_key(&root));
+    }
+
+    #[test]
+    fn tree_badges_empty_when_clean() {
+        let map = scm_tree_badges_for(&PathBuf::from("/repo"), &[]);
+        assert!(map.is_empty());
     }
 }
 

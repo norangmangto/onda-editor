@@ -181,6 +181,10 @@ Prefix `i` = inner, `a` = around/outer.
 
 In a create/rename prompt: type the name, `<CR>` confirms, `<Esc>` cancels.
 
+Changed files show a git-status badge and tint: `M` modified, `A`/`?` added/untracked
+(green), `D` deleted (red); directories containing changes are marked with `•`. `R`
+refreshes both the tree and the badges.
+
 ### Source Control view (git)
 | Key | Action |
 |---|---|

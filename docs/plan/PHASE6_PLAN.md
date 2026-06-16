@@ -73,6 +73,11 @@ W40 DAP debugger (core) — independent, can run in parallel
 - **T34.2** Actions: open, create file/dir, rename, delete (trash-safe), reveal-current;
   full keyboard map + mouse.
 - **T34.3** Git-status badges via the Phase 3 git plugin / host vcs interface (optional).
+  **Done:** badges come from the W38 SCM status (`git` CLI on a worker), not a plugin —
+  files show their status char and a status tint (added/untracked green, deleted red,
+  modified yellow), directories containing changes get a `•` rollup. Pure mapping
+  (`scm_tree_badges_for`) is unit-tested; status refreshes on entering the Explorer and
+  on `R`. (Same CLI-vs-plugin divergence noted for W38, since W37 host vcs is pending.)
 - **Accept:** navigate and mutate a large repo tree from the keyboard; no frame stalls.
 
 ## W35 — Command palette & action registry (weeks 2–3)

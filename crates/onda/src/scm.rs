@@ -33,6 +33,18 @@ impl FileStatus {
     pub fn badge(&self) -> String {
         format!("{}{}", self.staged, self.unstaged)
     }
+
+    /// Single most-relevant status char for a compact indicator (file-tree badge).
+    /// Untracked → `?`; otherwise the worktree change if any, else the staged one.
+    pub fn status_char(&self) -> char {
+        if self.staged == '?' || self.unstaged == '?' {
+            '?'
+        } else if self.unstaged != ' ' {
+            self.unstaged
+        } else {
+            self.staged
+        }
+    }
 }
 
 /// Parse `git status --porcelain=v1` output into a list of changed files.
@@ -101,6 +113,16 @@ A  added.rs
         assert_eq!(s[3].badge(), "??");
         assert!(s[3].is_unstaged() && !s[3].is_staged()); // untracked
         assert!(s[4].is_staged());
+    }
+
+    #[test]
+    fn status_char_picks_relevant() {
+        let s = parse_status("M  a\n M b\nMM c\n?? d\nA  e\n");
+        assert_eq!(s[0].status_char(), 'M'); // staged only
+        assert_eq!(s[1].status_char(), 'M'); // worktree only
+        assert_eq!(s[2].status_char(), 'M'); // both → worktree wins
+        assert_eq!(s[3].status_char(), '?'); // untracked
+        assert_eq!(s[4].status_char(), 'A'); // staged add
     }
 
     #[test]
