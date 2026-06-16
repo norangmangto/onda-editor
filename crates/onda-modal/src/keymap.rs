@@ -303,6 +303,11 @@ impl Keymap {
         // Window splits
         leaf!(Key::ctrl('w'), Action::FocusWindowNext);
 
+        // Jump list (`<C-o>` older, `<C-i>` newer). Note: many terminals deliver
+        // `<C-i>` as Tab, so it also doubles as the newer-jump key.
+        leaf!(Key::ctrl('o'), Action::JumpOlder);
+        leaf!(Key::ctrl('i'), Action::JumpNewer);
+
         m
     }
 

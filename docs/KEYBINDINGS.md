@@ -93,6 +93,7 @@ Prefix `i` = inner, `a` = around/outer.
 | Key | Action |
 |---|---|
 | `<C-w>` | focus next window |
+| `<C-o>` `<C-i>` | jump list older / newer (`<C-i>` may arrive as Tab) |
 | `<C-v>` | enter visual-block mode |
 | `<space>f` | fuzzy file picker |
 | `<space>b` | buffer picker |
