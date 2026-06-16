@@ -156,8 +156,16 @@ rejects Lua). The shipped `onda-lua` (mlua) system is a divergence being reverse
 - **Lazy-by-event activation**: plugins currently instantiate eagerly at startup
   (so command tables are known). Switch command-activated plugins to instantiate on
   first `:name` once a manifest pre-scan registers their command names.
-- **Plugin keymaps / picker contributions / statusline segments**: received, not
-  yet applied.
+- **Plugin keymaps / picker contributions / statusline segments**: wired (W37) —
+  statusline segments render; `KeymapSet` registers normal-mode keymaps (matched on
+  unbound single keys, ADR-106 keeps static bindings winning); `UiPick` opens a picker
+  whose selection invokes the plugin callback; `CmdCreate` (init **and** runtime) feeds
+  the command palette + `:`. Callback attribution flows via a packed `(plugin_idx,
+  callback_id)` handle through the flat call stream (`plugin_host::pack_handle`).
+  **Remaining:** a plugin-contributed **sidebar tree/panel** (needs a new `wit/onda`
+  contribution surface + guest binding), multi-key plugin `lhs`, and a compiled sample
+  plugin to exercise `KeymapSet`/`UiPick` end-to-end in CI (current fixtures only emit
+  decorations/blame).
 - **W19 polish**: `update` (re-resolve lockfile), `onda plugin dev --watch`,
   `cargo generate` template, full `docs/plugin-book/` (quickstart drafted).
 - **`http` host impl** (currently v0-stub) + a `vcs` host interface for real blame.

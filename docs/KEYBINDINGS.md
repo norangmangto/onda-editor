@@ -285,5 +285,6 @@ PDF rasterizer. Preview buffers reject `:w` (they have no text content to save).
 | `:DapStack` / `:DapVars` | show call stack / variables |
 | `:DapEval <expr>` | evaluate an expression at the stop |
 
-> Plugins and the (future) command palette can register additional commands and
-> keybindings; this file covers the built-ins.
+> Plugins can register additional `:` commands (shown in the palette), normal-mode
+> keymaps (single keys the built-in keymap leaves unbound — built-ins always win), and
+> pickers; this file covers the built-ins.

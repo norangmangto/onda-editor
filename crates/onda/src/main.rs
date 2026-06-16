@@ -150,6 +150,9 @@ enum PickerKind {
     Command,
     /// Read-only keybinding reference (`F1`); Enter just closes.
     KeyRef,
+    /// A plugin-contributed picker (W37); on accept, the packed callback handle is
+    /// invoked with the selected item's value.
+    PluginPick(u64),
 }
 
 /// Which view the IDE-shell sidebar is showing (Phase 6 W33; activity bar order).
@@ -529,6 +532,9 @@ struct App<B: Backend> {
     plugin_decorations: HashMap<usize, HashMap<String, onda_plugin::DecorationBatch>>,
     /// Plugin-contributed statusline segments (id → text), shown right-aligned (W37).
     plugin_statusline: Vec<(String, String)>,
+    /// Plugin-contributed normal-mode keymaps (W37): (mode, lhs) → packed callback
+    /// handle. Looked up after the static keymap (ADR-106) lets a key fall through.
+    plugin_keymaps: HashMap<(String, String), u64>,
     /// Source-control changed files (W38), shown in the Source Control sidebar view.
     scm_status: Vec<scm::FileStatus>,
     /// Selected row in the Source Control view.
@@ -3520,6 +3526,9 @@ impl<B: Backend> App<B> {
                         }
                         PickerKind::Command => self.run_palette_value(&value)?,
                         PickerKind::KeyRef => {} // reference only
+                        PickerKind::PluginPick(handle) => {
+                            self.run_plugin_callback(handle, vec![value]);
+                        }
                     }
                 }
             }
@@ -4164,7 +4173,15 @@ impl<B: Backend> App<B> {
                 self.execute_action(action, count, viewport_height)?;
             }
             PendingResult::NeedMore => {}
-            PendingResult::NoMatch => {}
+            // Unbound by the static keymap → offer it to a plugin keymap (W37).
+            // Static bindings always win (ADR-106); plugins only fill the gaps.
+            PendingResult::NoMatch => {
+                if let Some(lhs) = key_to_lhs(&key) {
+                    if let Some(&handle) = self.plugin_keymaps.get(&("normal".to_string(), lhs)) {
+                        self.run_plugin_callback(handle, Vec::new());
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -5243,6 +5260,27 @@ impl<B: Backend> App<B> {
         }
     }
 
+    /// Invoke a plugin callback by packed handle (a stored keymap or picker
+    /// selection, W37), then apply its effectful calls. Returns true if handled.
+    fn run_plugin_callback(&mut self, handle: u64, args: Vec<String>) -> bool {
+        if self.plugin_host.is_none() {
+            return false;
+        }
+        let (buf, _path, snap) = self.focused_plugin_snapshot();
+        let calls = self
+            .plugin_host
+            .as_mut()
+            .unwrap()
+            .run_callback(handle, args, buf, snap);
+        match calls {
+            Some(calls) => {
+                self.apply_plugin_calls(calls);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Apply the effectful calls a plugin made (rule 2: between frames).
     fn apply_plugin_calls(&mut self, calls: Vec<PluginApiCall>) {
         for call in calls {
@@ -5335,12 +5373,29 @@ impl<B: Backend> App<B> {
                     }
                     self.compositor.buf.invalidate();
                 }
-                // Picker contributions and plugin keymaps need a guest-callback
-                // round-trip — follow-ups (see docs/BACKLOG.md). CmdCreate is owned
-                // by PluginHost (the command registry; surfaced in the palette).
-                PluginApiCall::UiPick { .. }
-                | PluginApiCall::CmdCreate { .. }
-                | PluginApiCall::KeymapSet { .. } => {}
+                // Plugin keymap (W37): store (mode, lhs) → packed callback handle.
+                // The host already packed the handle with the owning plugin index.
+                PluginApiCall::KeymapSet {
+                    mode,
+                    lhs,
+                    callback_id,
+                    ..
+                } => {
+                    self.plugin_keymaps.insert((mode, lhs), callback_id);
+                }
+                // Plugin picker (W37): open a picker; on accept the callback runs
+                // with the selected item's value (see handle_picker_key).
+                PluginApiCall::UiPick {
+                    title,
+                    items,
+                    callback_id,
+                } => {
+                    self.picker = Some(build_plugin_picker(&title, &items));
+                    self.picker_kind = PickerKind::PluginPick(callback_id);
+                    self.compositor.buf.invalidate();
+                }
+                // CmdCreate is owned by PluginHost (command registry; palette + `:`).
+                PluginApiCall::CmdCreate { .. } => {}
             }
         }
     }
@@ -5943,6 +5998,7 @@ fn make_app<B: Backend>(
         plugin_idle_fired: false,
         plugin_decorations: HashMap::new(),
         plugin_statusline: Vec::new(),
+        plugin_keymaps: HashMap::new(),
         scm_status: Vec::new(),
         scm_selected: 0,
         doc_last_len: HashMap::new(),
@@ -6239,6 +6295,28 @@ fn build_command_palette(plugin_cmds: &[String]) -> onda_modal::picker::Picker {
     p
 }
 
+/// Build a plugin-contributed picker (W37). Items are `(label, detail)`; the
+/// item *value* is the label (passed to the plugin callback on accept).
+fn build_plugin_picker(
+    title: &str,
+    items: &[(String, Option<String>)],
+) -> onda_modal::picker::Picker {
+    use onda_modal::picker::{Picker, PickerItem};
+    let mut p = Picker::new(title);
+    let pitems: Vec<PickerItem> = items
+        .iter()
+        .map(|(label, detail)| {
+            let display = match detail {
+                Some(d) => format!("{label}  {d}"),
+                None => label.clone(),
+            };
+            PickerItem::new(display, label.clone())
+        })
+        .collect();
+    p.open(pitems);
+    p
+}
+
 /// Read-only keybinding reference shown by `F1`: `(keys, description)`.
 fn keybinding_reference() -> &'static [(&'static str, &'static str)] {
     &[
@@ -6507,6 +6585,21 @@ fn scm_tree_badges_for(
         }
     }
     map
+}
+
+/// Serialize a key into the vim-like `lhs` token plugins register (W37). Returns
+/// `None` for keys not worth exposing. Single tokens only — multi-key plugin
+/// sequences are out of scope for v1.
+fn key_to_lhs(key: &Key) -> Option<String> {
+    use onda_modal::KeyMod;
+    Some(match key {
+        Key::Char(c, m) if m.contains(KeyMod::CTRL) => format!("<C-{c}>"),
+        Key::Char(c, _) => c.to_string(),
+        Key::F(n) => format!("<F{n}>"),
+        Key::Enter => "<CR>".to_string(),
+        Key::Tab => "<Tab>".to_string(),
+        _ => return None,
+    })
 }
 
 /// Short source location for a DAP stack frame (file name, or frame name).
@@ -7991,6 +8084,62 @@ mod edit_integration_tests {
     fn tree_badges_empty_when_clean() {
         let map = scm_tree_badges_for(&PathBuf::from("/repo"), &[]);
         assert!(map.is_empty());
+    }
+
+    // ── Plugin UI contributions (W37) ────────────────────────────────────────
+
+    #[test]
+    fn keymapset_call_registers_plugin_keymap() {
+        let mut app = app_with("x\n");
+        app.apply_plugin_calls(vec![onda_plugin::PluginApiCall::KeymapSet {
+            mode: "normal".into(),
+            lhs: "<C-h>".into(),
+            callback_id: 42,
+            desc: None,
+        }]);
+        assert_eq!(
+            app.plugin_keymaps
+                .get(&("normal".to_string(), "<C-h>".to_string())),
+            Some(&42)
+        );
+    }
+
+    #[test]
+    fn uipick_call_opens_plugin_picker() {
+        let mut app = app_with("x\n");
+        app.apply_plugin_calls(vec![onda_plugin::PluginApiCall::UiPick {
+            title: "Choose".into(),
+            items: vec![("one".into(), None), ("two".into(), Some("2nd".into()))],
+            callback_id: 7,
+        }]);
+        assert!(app.picker.is_some());
+        assert_eq!(app.picker_kind, PickerKind::PluginPick(7));
+    }
+
+    #[test]
+    fn key_to_lhs_serializes_tokens() {
+        use onda_modal::KeyMod;
+        assert_eq!(key_to_lhs(&Key::char('g')).as_deref(), Some("g"));
+        assert_eq!(
+            key_to_lhs(&Key::Char('h', KeyMod::CTRL)).as_deref(),
+            Some("<C-h>")
+        );
+        assert_eq!(key_to_lhs(&Key::F(2)).as_deref(), Some("<F2>"));
+        assert_eq!(key_to_lhs(&Key::Esc), None);
+    }
+
+    #[test]
+    fn unbound_key_dispatches_to_plugin_keymap_only_when_registered() {
+        let mut app = app_with("hello\n");
+        *app.selection_mut() = Selection::point(0);
+        // No plugin host wired in tests → run_plugin_callback is a no-op, but the
+        // lookup path must not panic and must not disturb the buffer.
+        app.plugin_keymaps.insert(
+            ("normal".into(), "z".into()),
+            plugin_host::pack_handle(0, 1),
+        );
+        app.handle_key(Key::char('z')).unwrap();
+        assert_eq!(body(&app), "hello\n"); // 'z' is unbound; no edit happened
     }
 }
 

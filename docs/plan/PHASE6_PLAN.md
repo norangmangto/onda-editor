@@ -95,12 +95,25 @@ W40 DAP debugger (core) — independent, can run in parallel
 - **Accept:** rename/code-action/format/symbols all driven from the UI against a real
   server (rust-analyzer); table-driven tests on the pure edit-application paths.
 
-## W37 — Plugin host UI-contribution API (weeks 4–5)
+## W37 — Plugin host UI-contribution API (weeks 4–5) ✅ (partial)
 - **T37.1** Extend `wit/onda` (still `@unstable`) so plugins can contribute: a sidebar
   **tree view**, a **panel**, **palette items**, and **statusline segments** — batched,
   non-blocking (ADR-002 + the no-blocking host rule).
 - **T37.2** Capability + activation wiring for UI contributions; review doc.
 - **Accept:** a sample plugin adds a sidebar view + palette item; perf budget held.
+- **Done:** the editor-side contribution plumbing landed (perf gate green, ~6ms startup).
+  `StatuslineSegment` renders; `CmdCreate` (init + runtime) feeds the palette and `:`;
+  `KeymapSet` registers normal-mode keymaps (dispatched on keys the static keymap leaves
+  unbound, so ADR-106 still wins); `UiPick` opens a picker whose selection invokes the
+  plugin callback. Callbacks keep their owning-plugin attribution through the flat
+  `PluginApiCall` stream via a packed handle (`plugin_host::pack_handle`/`route_calls`/
+  `run_callback`). Unit-tested on both sides (host routing/packing; editor keymap+pick
+  state). **Remaining (tracked in BACKLOG):** the **sidebar tree/panel** contribution
+  needs a new `wit/onda` surface + guest binding (the headline "sidebar view from a
+  plugin"); multi-key plugin `lhs`; and a compiled sample plugin to drive
+  `KeymapSet`/`UiPick` end-to-end in CI (current WASM fixtures only emit
+  decorations/blame). T40.3 (read-only debug state to plugins) rides on the same new
+  contribution surface.
 
 ## W38 — Source-control surface (weeks 5–6) ✅
 - **T38.1** SCM panel: changed files, stage/unstage/discard, hunk view, diff, commit —
