@@ -1,7 +1,8 @@
 # onda — Phase 6 Plan: IDE Shell & Croft-Parity
 
-**Status:** Approved (decisions recorded below, 2026-06-15). Derived from the Croft /
-Fresh competitive analysis.
+**Status:** Implemented & tagged **v0.2** (2026-06-16). W33–W40 landed (W37 partial —
+plugin sidebar tree/panel + sample plugin tracked in BACKLOG; LSP base wiring tracked in
+KNOWN_ISSUES). Derived from the Croft / Fresh competitive analysis.
 **Duration:** ~8 weeks | **Milestone:** **v0.2** — onda is a *complete* terminal IDE:
 file tree, command palette, full LSP UX, source-control, previews, and a debugger —
 without losing vim-first speed or the plugin/agent platform.
