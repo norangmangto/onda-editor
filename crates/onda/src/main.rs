@@ -4,6 +4,7 @@ use std::{collections::HashMap, path::PathBuf, sync::mpsc, time::Duration};
 use std::time::Instant;
 
 mod doctor;
+mod file_tree;
 mod plugin_host;
 
 use anyhow::{Context, Result};
@@ -465,6 +466,10 @@ struct App<B: Backend> {
     sidebar_width: u16,
     /// True when keystrokes are routed to the sidebar instead of the editor.
     sidebar_focused: bool,
+    /// Lazy file tree backing the Explorer view (built on first use).
+    file_tree: Option<file_tree::FileTree>,
+    /// Visible rows in the sidebar body (updated each render; for tree scrolling).
+    sidebar_body_rows: usize,
 
     // ── Soft wrap ─────────────────────────────────────────────────────────────
     #[allow(dead_code)]
@@ -644,6 +649,11 @@ impl<B: Backend> App<B> {
     }
 
     fn try_spawn_syntax_worker_for_doc(&mut self, doc_idx: usize) {
+        // The syntax worker lives on the tokio runtime; skip it when none is running
+        // (bench/test contexts) — highlighting just stays empty there.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
         while self.syntax_workers.len() <= doc_idx {
             self.syntax_workers.push(None);
             self.syntax_versions.push(0);
@@ -1479,9 +1489,9 @@ impl<B: Backend> App<B> {
         self.message = Message::Info("agent: transcript exported to a new buffer".into());
     }
 
-    /// Keystrokes while the panel input is focused. Returns true if consumed.
-    /// Keystrokes while the IDE-shell sidebar has focus (Phase 6 W33). Returns true
-    /// when consumed. View content interaction (file tree, etc.) arrives in W34+.
+    /// Keystrokes while the IDE-shell sidebar has focus (Phase 6 W33/W34). Returns
+    /// true when consumed. View-switching keys are handled here; content keys
+    /// (file-tree navigation) are delegated per active view.
     fn handle_sidebar_key(&mut self, key: &Key) -> bool {
         match key {
             Key::Esc => self.sidebar_focused = false, // back to the editor, keep open
@@ -1489,11 +1499,14 @@ impl<B: Backend> App<B> {
                 self.sidebar_open = false;
                 self.sidebar_focused = false;
             }
-            Key::Char('j', _) | Key::Down | Key::Tab => self.cycle_sidebar_view(1),
-            Key::Char('k', _) | Key::Up => self.cycle_sidebar_view(-1),
+            Key::Tab => self.cycle_sidebar_view(1),
+            Key::BackTab => self.cycle_sidebar_view(-1),
             Key::Char(c, _) if ('1'..='5').contains(c) => {
                 let i = (*c as u8 - b'1') as usize;
                 self.sidebar_view = SidebarView::ALL[i];
+                if self.sidebar_view == SidebarView::Explorer {
+                    self.ensure_file_tree();
+                }
             }
             Key::Char('>', _) | Key::Char('L', _) => {
                 self.sidebar_width = (self.sidebar_width + 4).min(80);
@@ -1501,10 +1514,38 @@ impl<B: Backend> App<B> {
             Key::Char('<', _) | Key::Char('H', _) => {
                 self.sidebar_width = self.sidebar_width.saturating_sub(4).max(16);
             }
-            _ => return true, // consume all other keys while the sidebar is focused
+            _ => {
+                // View-specific content keys.
+                if self.sidebar_view == SidebarView::Explorer {
+                    self.handle_explorer_key(key);
+                }
+                return true; // consume everything else while focused
+            }
         }
         self.compositor.buf.invalidate();
         true
+    }
+
+    /// File-tree navigation keys for the Explorer view.
+    fn handle_explorer_key(&mut self, key: &Key) {
+        self.ensure_file_tree();
+        let rows = self.sidebar_body_rows.max(1);
+        let mut open_path: Option<PathBuf> = None;
+        if let Some(t) = self.file_tree.as_mut() {
+            match key {
+                Key::Char('j', _) | Key::Down => t.move_selection(1, rows),
+                Key::Char('k', _) | Key::Up => t.move_selection(-1, rows),
+                Key::Char('l', _) | Key::Enter => open_path = t.activate(),
+                Key::Char('h', _) => t.collapse_or_parent(),
+                Key::Char('R', _) => t.refresh(),
+                _ => {}
+            }
+        }
+        if let Some(p) = open_path {
+            self.open_path_in_buffer(&p);
+            self.sidebar_focused = false; // hand focus to the editor after opening
+        }
+        self.compositor.buf.invalidate();
     }
 
     /// Move the active sidebar view by `delta` (wrapping).
@@ -1563,16 +1604,76 @@ impl<B: Backend> App<B> {
         }
     }
 
-    /// Placeholder sidebar body per view (real content arrives in W34+).
+    /// Sidebar body lines for the active view (placeholders for not-yet-built views).
     fn sidebar_body(&self) -> Vec<(onda_render::Style, String)> {
         let dim = self.theme.line_nr();
         let line = |s: &str| (dim, format!("  {s}"));
         match self.sidebar_view {
-            SidebarView::Explorer => vec![line("(file tree — W34)")],
+            SidebarView::Explorer => match &self.file_tree {
+                Some(t) => self.render_tree_lines(t),
+                None => vec![line("(opening…)")],
+            },
             SidebarView::Search => vec![line("(live grep — W35)")],
             SidebarView::SourceControl => vec![line("(git — W38)")],
             SidebarView::Run => vec![line("(debug — W40)")],
             SidebarView::Agent => vec![line("(use :agent for the panel)")],
+        }
+    }
+
+    /// Render the visible window of the file tree as styled sidebar lines.
+    fn render_tree_lines(&self, t: &file_tree::FileTree) -> Vec<(onda_render::Style, String)> {
+        let sel_style = self.theme.menu_selected();
+        let dir_style = self.theme.line_nr_current();
+        let file_style = self.theme.text();
+        let rows = self.sidebar_body_rows.max(1);
+        let start = t.scroll.min(t.len());
+        let end = (start + rows).min(t.len());
+        let mut out = Vec::with_capacity(end - start);
+        for (i, e) in t.entries()[start..end].iter().enumerate() {
+            let idx = start + i;
+            let indent = "  ".repeat(e.depth);
+            let icon = if e.is_dir {
+                if e.expanded {
+                    "▾ "
+                } else {
+                    "▸ "
+                }
+            } else {
+                "  "
+            };
+            let suffix = if e.is_dir { "/" } else { "" };
+            let style = if idx == t.selected {
+                sel_style
+            } else if e.is_dir {
+                dir_style
+            } else {
+                file_style
+            };
+            out.push((style, format!("{indent}{icon}{}{suffix}", e.name)));
+        }
+        out
+    }
+
+    /// Build the Explorer file tree (rooted at the cwd) if it isn't built yet.
+    fn ensure_file_tree(&mut self) {
+        if self.file_tree.is_none() {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            self.file_tree = Some(file_tree::FileTree::new(cwd));
+        }
+    }
+
+    /// Open `path` into a buffer in the focused window (shared by picker + tree).
+    fn open_path_in_buffer(&mut self, path: &std::path::Path) {
+        match Document::open(path) {
+            Ok(doc) => {
+                let doc_idx = self.docs.len();
+                self.docs.push(doc);
+                self.focused_win_mut().doc_idx = doc_idx;
+                *self.selection_mut() = Selection::point(0);
+                self.message = Message::Info(format!("Opened: {}", path.display()));
+                self.try_spawn_syntax_worker_for_doc(doc_idx);
+            }
+            Err(e) => self.message = Message::Error(format!("E: {e}")),
         }
     }
 
@@ -1914,6 +2015,11 @@ impl<B: Backend> App<B> {
         let chrome_w = self
             .left_chrome_width()
             .min(editor_width.saturating_sub(20));
+        // Track sidebar body height (for tree scrolling) and lazily build the tree.
+        self.sidebar_body_rows = content_height.saturating_sub(1) as usize;
+        if chrome_w > 0 && self.sidebar_view == SidebarView::Explorer {
+            self.ensure_file_tree();
+        }
 
         // ── Phase 1: update viewports (no grid access yet) ────────────────────
         let content_area = Rect::new(
@@ -3837,6 +3943,9 @@ impl<B: Backend> App<B> {
                 // closes it.
                 self.sidebar_open = true;
                 self.sidebar_focused = true;
+                if self.sidebar_view == SidebarView::Explorer {
+                    self.ensure_file_tree();
+                }
                 self.compositor.buf.invalidate();
             }
 
@@ -4943,6 +5052,8 @@ fn make_app<B: Backend>(
         sidebar_view: SidebarView::Explorer,
         sidebar_width: 30,
         sidebar_focused: false,
+        file_tree: None,
+        sidebar_body_rows: 0,
         soft_wrap: false,
         #[cfg(feature = "bench")]
         tracer: LatencyTracer::default(),
@@ -6221,12 +6332,32 @@ mod edit_integration_tests {
         let mut app = app_with("x\n");
         keys(&mut app, " e"); // open + focus, default Explorer
         assert_eq!(app.sidebar_view, SidebarView::Explorer);
-        app.handle_key(Key::char('j')).unwrap(); // next view
+        app.handle_key(Key::Tab).unwrap(); // next view
         assert_eq!(app.sidebar_view, SidebarView::Search);
         app.handle_key(Key::char('3')).unwrap(); // jump to 3rd view
         assert_eq!(app.sidebar_view, SidebarView::SourceControl);
-        app.handle_key(Key::char('k')).unwrap(); // prev
+        app.handle_key(Key::BackTab).unwrap(); // prev (SourceControl → Search)
         assert_eq!(app.sidebar_view, SidebarView::Search);
+    }
+
+    #[test]
+    fn explorer_opens_file_from_tree() {
+        // Build the app rooted in a temp dir with a known file, then open it via the
+        // Explorer tree (cwd-based). We drive the tree's model directly to avoid
+        // depending on the process cwd.
+        let mut app = app_with("");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.rs"), "fn hello() {}\n").unwrap();
+        keys(&mut app, " e"); // open + focus Explorer (builds a tree at cwd)
+                              // Replace the cwd tree with one rooted at our fixture for determinism.
+        app.file_tree = Some(file_tree::FileTree::new(dir.path().to_path_buf()));
+        // Select hello.rs and open it (Enter).
+        app.handle_key(Key::Enter).unwrap();
+        assert!(body(&app).contains("fn hello"));
+        assert!(
+            !app.sidebar_focused,
+            "focus moves to the editor after opening"
+        );
     }
 
     #[test]

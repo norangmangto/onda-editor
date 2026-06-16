@@ -160,11 +160,19 @@ Prefix `i` = inner, `a` = around/outer.
 ## IDE sidebar (when focused — `<space>e`)
 | Key | Action |
 |---|---|
-| `j` / `<Down>` / `<Tab>`, `k` / `<Up>` | next / previous view |
+| `<Tab>` / `<S-Tab>` | next / previous view |
 | `1`–`5` | jump to Explorer / Search / Source Control / Run / Agent |
 | `<` `>` (or `H` `L`) | shrink / grow the sidebar |
 | `<Esc>` | return to the editor (keep the sidebar open) |
 | `q` | close the sidebar |
+
+### Explorer view (file tree)
+| Key | Action |
+|---|---|
+| `j` / `<Down>`, `k` / `<Up>` | move selection |
+| `l` / `<CR>` | expand a directory, or open a file (focus → editor) |
+| `h` | collapse the directory, or jump to its parent |
+| `R` | refresh the tree |
 
 ---
 

@@ -39,3 +39,6 @@ notify.workspace = true
 default = []
 debug-overlay = ["onda-render/debug-overlay"]
 bench = []
+
+[dev-dependencies]
+tempfile.workspace = true
