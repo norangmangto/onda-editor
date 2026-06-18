@@ -97,7 +97,7 @@ Prefix `i` = inner, `a` = around/outer.
 | `<C-v>` | enter visual-block mode |
 | `<space>f` | fuzzy file picker |
 | `<space>b` | buffer picker |
-| `<space>e` | open + focus the IDE sidebar |
+| `<space>e` | toggle the IDE sidebar (open+focus if closed; close if open) |
 | `<space>p` | command palette (fuzzy) |
 | `<F1>` | keybinding reference (searchable) |
 
@@ -167,6 +167,9 @@ Prefix `i` = inner, `a` = around/outer.
 | `<` `>` (or `H` `L`) | shrink / grow the sidebar |
 | `<Esc>` | return to the editor (keep the sidebar open) |
 | `q` | close the sidebar |
+
+Leader-key bindings (`<space>f`, `<space>b`, `<space>p`, `<space>e`) work even while
+the sidebar is focused — `<space>` passes through to the editor's keymap.
 
 ### Explorer view (file tree)
 | Key | Action |

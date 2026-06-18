@@ -1603,6 +1603,12 @@ impl<B: Backend> App<B> {
             return true;
         }
         match key {
+            Key::Char(' ', _) => {
+                // Space is the editor's leader key. Don't consume it here — let it
+                // fall through to handle_normal_key so that leader sequences like
+                // `<space>e` / `<space>f` work even when the sidebar is focused.
+                return false;
+            }
             Key::Esc => self.sidebar_focused = false, // back to the editor, keep open
             Key::Char('q', _) => {
                 self.sidebar_open = false;
@@ -1992,17 +1998,20 @@ impl<B: Backend> App<B> {
                 "sidebar" => {
                     self.sidebar_open = true;
                     self.sidebar_focused = true;
+                    self.keymap_state.reset();
                     self.on_sidebar_view_entered();
                 }
                 "scm" => {
                     self.sidebar_open = true;
                     self.sidebar_focused = true;
+                    self.keymap_state.reset();
                     self.sidebar_view = SidebarView::SourceControl;
                     self.on_sidebar_view_entered();
                 }
                 "run" => {
                     self.sidebar_open = true;
                     self.sidebar_focused = true;
+                    self.keymap_state.reset();
                     self.sidebar_view = SidebarView::Run;
                     self.on_sidebar_view_entered();
                 }
@@ -3245,6 +3254,7 @@ impl<B: Backend> App<B> {
                 if i < SidebarView::ALL.len() {
                     self.sidebar_view = SidebarView::ALL[i];
                     self.sidebar_focused = true;
+                    self.keymap_state.reset();
                     self.on_sidebar_view_entered();
                     self.compositor.buf.invalidate();
                     return true;
@@ -3256,6 +3266,7 @@ impl<B: Backend> App<B> {
             } else if col < chrome_w {
                 // Sidebar body → focus it; in Explorer, select the clicked row.
                 self.sidebar_focused = true;
+                self.keymap_state.reset();
                 if self.sidebar_view == SidebarView::Explorer && row >= 1 {
                     if let Some(t) = self.file_tree.as_mut() {
                         let idx = t.scroll + (row - 1) as usize;
@@ -3417,8 +3428,17 @@ impl<B: Backend> App<B> {
         }
 
         // Route to the IDE-shell sidebar when it has focus.
-        if self.sidebar_focused && self.handle_sidebar_key(&key) {
-            return Ok(());
+        // Exception: when a trie prefix sequence is in progress (e.g. space pressed
+        // while in the sidebar), bypass the sidebar so leader-key bindings like
+        // `<space>e`/`<space>f` work from the sidebar. Sidebar prompts always capture
+        // regardless so rename/delete confirmations aren't interrupted.
+        if self.sidebar_focused {
+            let prompt_active = self.sidebar_prompt.is_some();
+            if (prompt_active || !self.keymap_state.has_pending_prefix())
+                && self.handle_sidebar_key(&key)
+            {
+                return Ok(());
+            }
         }
 
         // Dot-repeat: track editing keys (Normal/Insert/Visual) so `.` can replay
@@ -4829,12 +4849,18 @@ impl<B: Backend> App<B> {
                 self.picker_kind = PickerKind::Command;
             }
             Action::ToggleSidebar => {
-                // `<space>e` opens the sidebar and jumps focus into it. Within the
-                // sidebar, `<Esc>` returns to the editor (keeps it open) and `q`
-                // closes it.
-                self.sidebar_open = true;
-                self.sidebar_focused = true;
-                self.on_sidebar_view_entered();
+                // `<space>e` toggles the sidebar: closes it if already open,
+                // opens + focuses it if closed. `<Esc>` inside the sidebar returns
+                // to the editor while keeping it open; `q` closes it.
+                if self.sidebar_open {
+                    self.sidebar_open = false;
+                    self.sidebar_focused = false;
+                } else {
+                    self.sidebar_open = true;
+                    self.sidebar_focused = true;
+                    self.keymap_state.reset();
+                    self.on_sidebar_view_entered();
+                }
                 self.compositor.buf.invalidate();
             }
 
@@ -7547,12 +7573,28 @@ mod edit_integration_tests {
         // Focused: `<Esc>` returns to the editor but keeps it open.
         app.handle_key(Key::Esc).unwrap();
         assert!(app.sidebar_open && !app.sidebar_focused);
-        // `<space>e` while open+unfocused refocuses.
+        // `<space>e` while open (unfocused) closes it (true toggle).
         keys(&mut app, " e");
-        assert!(app.sidebar_focused);
-        // `q` in the sidebar closes it.
-        app.handle_key(Key::char('q')).unwrap();
         assert!(!app.sidebar_open && !app.sidebar_focused);
+        // `<space>e` when closed opens + focuses again.
+        keys(&mut app, " e");
+        assert!(app.sidebar_open && app.sidebar_focused);
+        // `<space>e` while open+focused also closes (via space-pass-through fix).
+        keys(&mut app, " e");
+        assert!(!app.sidebar_open && !app.sidebar_focused);
+    }
+
+    #[test]
+    fn space_leader_works_from_sidebar() {
+        // `<space>f` / `<space>p` should open pickers even when the sidebar is focused.
+        let mut app = app_with("x\n");
+        keys(&mut app, " e"); // open + focus
+        assert!(app.sidebar_focused);
+        // `<space>p` → command palette (picker) while sidebar is focused.
+        keys(&mut app, " p");
+        assert!(app.picker.is_some(), "command palette should open from sidebar");
+        // Close the picker.
+        app.handle_key(Key::Esc).unwrap();
     }
 
     #[test]

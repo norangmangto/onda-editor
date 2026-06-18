@@ -849,6 +849,14 @@ impl KeymapState {
             || self.pending_visual_textobj_outer
             || self.pending_op_g
     }
+
+    /// True only when a trie prefix sequence is in progress (e.g. `<space>` has been
+    /// pressed and we're waiting for the next key in a leader binding).  Does NOT
+    /// include pending operators or single-char pending states (f/t/r/q/…) so that
+    /// those don't accidentally bypass the sidebar key handler.
+    pub fn has_pending_prefix(&self) -> bool {
+        !self.pending_keys.is_empty()
+    }
 }
 
 fn key_to_motion(key: &Key) -> Option<Motion> {

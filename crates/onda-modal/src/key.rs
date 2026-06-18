@@ -60,7 +60,18 @@ impl Key {
     pub fn from_event(ev: &KeyEvent) -> Self {
         let mods = KeyMod::from(ev.modifiers);
         match ev.code {
-            KeyCode::Char(c) => Key::Char(c, mods),
+            KeyCode::Char(c) => {
+                // Space has no uppercase form; some terminals (e.g. those using the
+                // kitty keyboard protocol) may report SHIFT with space even when only
+                // the plain spacebar was pressed. Strip SHIFT so that `<space>` leader
+                // sequences (`<space>e`, `<space>f`, …) match regardless.
+                let mods = if c == ' ' {
+                    KeyMod(mods.0 & !KeyMod::SHIFT.0)
+                } else {
+                    mods
+                };
+                Key::Char(c, mods)
+            }
             KeyCode::Esc => Key::Esc,
             KeyCode::Enter => Key::Enter,
             KeyCode::Backspace => Key::Backspace,
@@ -112,5 +123,41 @@ impl std::fmt::Display for Key {
             Key::PageDown => write!(f, "<PageDown>"),
             Key::F(n) => write!(f, "<F{n}>"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState};
+
+    fn ev(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: mods,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn space_with_shift_normalizes_to_none() {
+        // Some kitty-protocol terminals report SHIFT+space as space with SHIFT set.
+        // We strip the SHIFT so that `<space>` leader sequences always match.
+        let key = Key::from_event(&ev(KeyCode::Char(' '), KeyModifiers::SHIFT));
+        assert_eq!(key, Key::char(' '));
+    }
+
+    #[test]
+    fn space_without_modifier_stays_none() {
+        let key = Key::from_event(&ev(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(key, Key::char(' '));
+    }
+
+    #[test]
+    fn shift_on_other_chars_preserved() {
+        // SHIFT should NOT be stripped from other characters (e.g. 'A' from Shift+a).
+        let key = Key::from_event(&ev(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        assert_eq!(key, Key::Char('A', KeyMod::SHIFT));
     }
 }
