@@ -101,13 +101,35 @@ impl Highlights {
 // Tree-sitter language resolution
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Convert a `LanguageFn` to a `tree_sitter::Language`.
+///
+/// Grammar crates that target the `tree-sitter-language` stable-ABI layer (rather
+/// than a specific tree-sitter release) expose `LANGUAGE: LanguageFn` instead of
+/// `language() -> tree_sitter::Language`. tree-sitter 0.22 does not yet implement
+/// `From<LanguageFn> for Language`, so we bridge the gap here.
+///
+/// # Safety
+/// `LanguageFn` wraps a C function returning `*const TSLanguage` (type-erased as
+/// `*const ()`). `tree_sitter::Language` is a single-pointer newtype over
+/// `*const TSLanguage`. Both types are pointer-sized with identical representation,
+/// making the transmute sound for any grammar produced by the tree-sitter CLI.
+unsafe fn lang_fn(f: tree_sitter_language::LanguageFn) -> tree_sitter::Language {
+    std::mem::transmute(f.into_raw()())
+}
+
 /// Return the tree-sitter `Language` for the given language name, if known.
 fn ts_language(language_name: &str) -> Option<tree_sitter::Language> {
     match language_name {
         "rust" => Some(tree_sitter_rust::language()),
         "python" => Some(tree_sitter_python::language()),
         "json" => Some(tree_sitter_json::language()),
-        // TOML has no bundled grammar in the workspace — skip.
+        // SAFETY: see lang_fn
+        "toml" => Some(unsafe { lang_fn(tree_sitter_toml_ng::LANGUAGE) }),
+        "yaml" => Some(unsafe { lang_fn(tree_sitter_yaml::LANGUAGE) }),
+        // "markdown" and "hcl" grammars use ABI version 15 (tree-sitter-md, tree-sitter-hcl
+        // >=1.0) which requires tree-sitter >=0.23. The extensions are registered in
+        // LanguageRegistry so files open correctly; highlighting is deferred until the
+        // workspace upgrades past 0.22.
         _ => None,
     }
 }
@@ -198,6 +220,81 @@ fn json_scope(kind: &str) -> Option<Scope> {
     }
 }
 
+/// Map a tree-sitter node kind to a `Scope`, for TOML source.
+fn toml_scope(kind: &str) -> Option<Scope> {
+    match kind {
+        "comment" => Some(Scope::Comment),
+        "string" => Some(Scope::String),
+        "integer" | "float" | "local_date" | "local_date_time" | "local_time"
+        | "offset_date_time" => Some(Scope::Number),
+        "boolean" => Some(Scope::Constant),
+        "bare_key" | "quoted_key" => Some(Scope::Type),
+        "ERROR" => Some(Scope::Error),
+        _ => None,
+    }
+}
+
+/// Map a tree-sitter node kind to a `Scope`, for YAML source.
+fn yaml_scope(kind: &str) -> Option<Scope> {
+    match kind {
+        "comment" => Some(Scope::Comment),
+        "double_quote_scalar" | "single_quote_scalar" | "block_scalar" | "string_scalar" => {
+            Some(Scope::String)
+        }
+        "integer_scalar" | "float_scalar" | "timestamp_scalar" => Some(Scope::Number),
+        "boolean_scalar" | "null_scalar" => Some(Scope::Constant),
+        "anchor" | "alias" | "tag" => Some(Scope::Attribute),
+        "ERROR" => Some(Scope::Error),
+        _ => None,
+    }
+}
+
+// Scope functions for markdown and HCL are prepared but not yet wired to a tree-sitter
+// language because the grammar crates that support those languages (tree-sitter-md,
+// tree-sitter-hcl) require ABI version 15 (tree-sitter >=0.23). They will be activated
+// when the workspace upgrades past 0.22.  The scope function bodies are kept here so
+// the mapping logic isn't lost; they are dead code until then.
+#[allow(dead_code)]
+fn markdown_scope(kind: &str) -> Option<Scope> {
+    match kind {
+        "atx_h1_marker" | "atx_h2_marker" | "atx_h3_marker" | "atx_h4_marker"
+        | "atx_h5_marker" | "atx_h6_marker" | "setext_h1_underline" | "setext_h2_underline" => {
+            Some(Scope::Keyword)
+        }
+        "list_marker_dot"
+        | "list_marker_minus"
+        | "list_marker_parenthesis"
+        | "list_marker_plus"
+        | "list_marker_star" => Some(Scope::Keyword),
+        "code_fence_content" | "indented_code_block" => Some(Scope::String),
+        "fenced_code_block_delimiter" | "thematic_break" => Some(Scope::Operator),
+        "link_destination" | "link_title" => Some(Scope::String),
+        "link_label" => Some(Scope::Variable),
+        "info_string" | "language" => Some(Scope::Attribute),
+        "block_quote_marker" => Some(Scope::Comment),
+        "ERROR" => Some(Scope::Error),
+        _ => None,
+    }
+}
+
+#[allow(dead_code)]
+fn hcl_scope(kind: &str) -> Option<Scope> {
+    match kind {
+        "comment" => Some(Scope::Comment),
+        "string_lit" | "template_literal" | "heredoc_template" | "quoted_template_start"
+        | "quoted_template_end" => Some(Scope::String),
+        "numeric_lit" => Some(Scope::Number),
+        "bool_lit" => Some(Scope::Constant),
+        "null_lit" => Some(Scope::Constant),
+        "identifier" => Some(Scope::Variable),
+        "{" | "}" | "[" | "]" | "(" | ")" | "," | "." => Some(Scope::Punctuation),
+        "=" | "==" | "!=" | "<" | ">" | "<=" | ">=" | "&&" | "||" | "!" | "+" | "-" | "*"
+        | "/" | "%" => Some(Scope::Operator),
+        "ERROR" => Some(Scope::Error),
+        _ => None,
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tree walker
 // ─────────────────────────────────────────────────────────────────────────────
@@ -223,6 +320,8 @@ fn walk_node(node: Node<'_>, language_name: &str, spans: &mut Vec<Span>) {
         "rust" => rust_scope(kind),
         "python" => python_scope(kind),
         "json" => json_scope(kind),
+        "toml" => toml_scope(kind),
+        "yaml" => yaml_scope(kind),
         _ => None,
     };
 
@@ -317,8 +416,13 @@ mod tests {
         assert!(ts_language("rust").is_some());
         assert!(ts_language("python").is_some());
         assert!(ts_language("json").is_some());
-        assert!(ts_language("toml").is_none()); // no bundled grammar
-        assert!(ts_language("go").is_none());
+        assert!(ts_language("toml").is_some());
+        assert!(ts_language("yaml").is_some());
+        // markdown + hcl grammars require tree-sitter ABI 15 (>=0.23) — deferred.
+        assert!(ts_language("markdown").is_none());
+        assert!(ts_language("hcl").is_none());
+        assert!(ts_language("go").is_none()); // not bundled
+        assert!(ts_language("csv").is_none()); // plain text, no grammar
         assert!(ts_language("nonsense").is_none());
     }
 
@@ -337,5 +441,48 @@ mod tests {
     fn python_scope_mapping() {
         assert_eq!(python_scope("def"), Some(Scope::Keyword));
         assert_eq!(python_scope("return"), Some(Scope::Keyword));
+    }
+
+    #[test]
+    fn toml_scope_mapping() {
+        assert_eq!(toml_scope("comment"), Some(Scope::Comment));
+        assert_eq!(toml_scope("string"), Some(Scope::String));
+        assert_eq!(toml_scope("integer"), Some(Scope::Number));
+        assert_eq!(toml_scope("float"), Some(Scope::Number));
+        assert_eq!(toml_scope("boolean"), Some(Scope::Constant));
+        assert_eq!(toml_scope("bare_key"), Some(Scope::Type));
+        assert_eq!(toml_scope("quoted_key"), Some(Scope::Type));
+        assert_eq!(toml_scope("ERROR"), Some(Scope::Error));
+    }
+
+    #[test]
+    fn yaml_scope_mapping() {
+        assert_eq!(yaml_scope("comment"), Some(Scope::Comment));
+        assert_eq!(yaml_scope("double_quote_scalar"), Some(Scope::String));
+        assert_eq!(yaml_scope("integer_scalar"), Some(Scope::Number));
+        assert_eq!(yaml_scope("boolean_scalar"), Some(Scope::Constant));
+        assert_eq!(yaml_scope("null_scalar"), Some(Scope::Constant));
+        assert_eq!(yaml_scope("anchor"), Some(Scope::Attribute));
+        assert_eq!(yaml_scope("ERROR"), Some(Scope::Error));
+    }
+
+    #[test]
+    fn parse_highlights_produces_spans_for_new_languages() {
+        let toml_src = Rope::from_str("[package]\nname = \"foo\"\nversion = \"1.0\"\n# comment\n");
+        let toml_hl = parse_highlights(&toml_src, "toml", 1).expect("toml grammar");
+        assert!(!toml_hl.spans.is_empty(), "TOML should produce spans");
+
+        let yaml_src = Rope::from_str("key: value\nflag: true\ncount: 42\n# comment\n");
+        let yaml_hl = parse_highlights(&yaml_src, "yaml", 1).expect("yaml grammar");
+        assert!(!yaml_hl.spans.is_empty(), "YAML should produce spans");
+
+        // Markdown and HCL grammars are deferred (ABI 15 needs tree-sitter >=0.23).
+        assert!(parse_highlights(&Rope::from_str("# Heading\n"), "markdown", 1).is_none());
+        assert!(
+            parse_highlights(&Rope::from_str("resource \"r\" \"n\" {}\n"), "hcl", 1).is_none()
+        );
+
+        // CSV has no grammar — returns None gracefully.
+        assert!(parse_highlights(&Rope::from_str("a,b,c\n1,2,3\n"), "csv", 1).is_none());
     }
 }

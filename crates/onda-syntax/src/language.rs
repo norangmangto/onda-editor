@@ -40,7 +40,7 @@ pub struct LanguageRegistry {
 }
 
 impl LanguageRegistry {
-    /// Build the registry with the four built-in languages.
+    /// Build the registry with built-in languages.
     pub fn new() -> Self {
         let mut reg = Self::default();
 
@@ -76,7 +76,8 @@ impl LanguageRegistry {
                 indent_unit: "  ".into(),
                 indent_width: 2,
             },
-            &["json", "jsonc"],
+            // jsonl: one JSON value per line; reuse the JSON grammar
+            &["json", "jsonc", "jsonl"],
             &[],
         );
 
@@ -89,6 +90,56 @@ impl LanguageRegistry {
                 indent_width: 2,
             },
             &["toml"],
+            &[],
+        );
+
+        reg.add(
+            LanguageConfig {
+                name: "yaml".into(),
+                grammar_name: "yaml".into(),
+                comment_token: "#".into(),
+                indent_unit: "  ".into(),
+                indent_width: 2,
+            },
+            &["yaml", "yml"],
+            &[],
+        );
+
+        reg.add(
+            LanguageConfig {
+                name: "markdown".into(),
+                grammar_name: "markdown".into(),
+                comment_token: "".into(),
+                indent_unit: "  ".into(),
+                indent_width: 2,
+            },
+            &["md", "markdown"],
+            &[],
+        );
+
+        reg.add(
+            LanguageConfig {
+                name: "hcl".into(),
+                grammar_name: "hcl".into(),
+                comment_token: "#".into(),
+                indent_unit: "  ".into(),
+                indent_width: 2,
+            },
+            // .tf and .tfvars are Terraform HCL; .hcl is generic HCL
+            &["hcl", "tf", "tfvars"],
+            &[],
+        );
+
+        // CSV: plain-text columnar data; no tree-sitter grammar (use `:table` view).
+        reg.add(
+            LanguageConfig {
+                name: "csv".into(),
+                grammar_name: "csv".into(),
+                comment_token: "".into(),
+                indent_unit: "".into(),
+                indent_width: 0,
+            },
+            &["csv", "tsv"],
             &[],
         );
 
@@ -159,15 +210,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_four_builtin_languages() {
+    fn registry_has_builtin_languages() {
         let r = LanguageRegistry::new();
         for (name, ext) in [
             ("rust", "rs"),
             ("python", "py"),
             ("json", "json"),
+            ("json", "jsonl"),
             ("toml", "toml"),
+            ("yaml", "yaml"),
+            ("yaml", "yml"),
+            ("markdown", "md"),
+            ("hcl", "tf"),
+            ("hcl", "tfvars"),
+            ("hcl", "hcl"),
+            ("csv", "csv"),
+            ("csv", "tsv"),
         ] {
-            assert_eq!(r.by_extension(ext).map(|c| c.name.as_str()), Some(name));
+            assert_eq!(
+                r.by_extension(ext).map(|c| c.name.as_str()),
+                Some(name),
+                "extension .{ext} should map to {name}"
+            );
         }
     }
 
@@ -185,6 +249,26 @@ mod tests {
         assert_eq!(
             r.detect("data.jsonc", None).map(|c| c.name.as_str()),
             Some("json")
+        );
+        assert_eq!(
+            r.detect("events.jsonl", None).map(|c| c.name.as_str()),
+            Some("json")
+        );
+        assert_eq!(
+            r.detect("ci.yml", None).map(|c| c.name.as_str()),
+            Some("yaml")
+        );
+        assert_eq!(
+            r.detect("main.tf", None).map(|c| c.name.as_str()),
+            Some("hcl")
+        );
+        assert_eq!(
+            r.detect("README.md", None).map(|c| c.name.as_str()),
+            Some("markdown")
+        );
+        assert_eq!(
+            r.detect("data.csv", None).map(|c| c.name.as_str()),
+            Some("csv")
         );
     }
 

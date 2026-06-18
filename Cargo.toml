@@ -69,6 +69,12 @@ tree-sitter = "0.22"
 tree-sitter-rust = "0.21"
 tree-sitter-python = "0.21"
 tree-sitter-json = "0.21"
+tree-sitter-language = "0.1"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
+# tree-sitter-md and tree-sitter-hcl use grammar ABI version 15 (requires tree-sitter
+# >=0.23). Wire their extensions via LanguageRegistry but skip ts_language() entries
+# until the workspace upgrades past 0.22.
 
 # Regex
 regex = "1"
