@@ -62,6 +62,19 @@ impl MacroRecorder {
         }
     }
 
+    /// Drop the most recently recorded key.
+    ///
+    /// `record_key` runs unconditionally on every keystroke, before the editor
+    /// knows whether that keystroke is the bare `q` that *stops* the recording
+    /// (vim: `q{c}...q` — the terminating `q` is not part of the macro body).
+    /// Call this right before [`stop_recording`](Self::stop_recording) to strip
+    /// that trailing key back out.
+    pub fn discard_last_recorded_key(&mut self) {
+        if self.recording.is_some() {
+            self.current.pop();
+        }
+    }
+
     /// Retrieve the stored macro for `reg`, or `None` if it doesn't exist.
     pub fn get_macro(&self, reg: char) -> Option<&[Key]> {
         self.macros.get(&reg).map(Vec::as_slice)

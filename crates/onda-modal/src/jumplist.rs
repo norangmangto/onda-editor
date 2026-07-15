@@ -64,17 +64,20 @@ impl JumpList {
             return None;
         }
 
-        // Already at the oldest entry — nowhere further back to go.
-        if self.current == 0 {
-            return None;
-        }
-
         // If we are sitting at the very end (not currently navigating), save
         // the current position before jumping away so that `newer` can return
-        // to it later.
+        // to it later. This must run *before* the "already at the oldest
+        // entry" check below: with exactly one recorded entry, `current == 0`
+        // already, but that entry hasn't been visited yet — it's still the
+        // single jump target of the very first `<C-o>`, not "no more history".
         if self.current + 1 == self.entries.len() && self.entries.last() != Some(&current_pos) {
             self.entries.push(current_pos);
             self.current = self.entries.len() - 1;
+        }
+
+        // Already at the oldest entry — nowhere further back to go.
+        if self.current == 0 {
+            return None;
         }
 
         self.current -= 1;
@@ -156,11 +159,27 @@ mod tests {
     }
 
     #[test]
-    fn older_at_start_returns_none() {
+    fn older_undoes_the_very_first_jump() {
+        // A single recorded entry must still be reachable: this is the ordinary
+        // "one big jump, then <C-o> to go back" case (e.g. `G` then `<C-o>`).
         let mut jl = JumpList::new();
         let p = jp(5);
         jl.push(p);
-        // older from the only entry: we save current and try to go back, but current is 0.
+        let live = jp(99); // where the cursor ended up after the jump
+        assert_eq!(jl.older(live), Some(p));
+        // `newer` returns to the live position, which `older` auto-saved.
+        assert_eq!(jl.newer(), Some(live));
+    }
+
+    #[test]
+    fn older_returns_none_once_truly_exhausted() {
+        let mut jl = JumpList::new();
+        let p1 = jp(1);
+        jl.push(p1);
+        // First call walks back to the one recorded entry (auto-saving the live
+        // position first, so there's now history *and* a saved "future").
+        assert_eq!(jl.older(jp(99)), Some(p1));
+        // Now at the oldest entry — nowhere further back to go.
         assert!(jl.older(jp(99)).is_none());
     }
 
