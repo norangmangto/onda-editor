@@ -244,10 +244,14 @@ fn yaml_scope(kind: &str) -> Option<Scope> {
 /// Map a tree-sitter node kind to a `Scope`, for Markdown (tree-sitter-md block grammar).
 fn markdown_scope(kind: &str) -> Option<Scope> {
     match kind {
-        "atx_h1_marker" | "atx_h2_marker" | "atx_h3_marker" | "atx_h4_marker"
-        | "atx_h5_marker" | "atx_h6_marker" | "setext_h1_underline" | "setext_h2_underline" => {
-            Some(Scope::Keyword)
-        }
+        "atx_h1_marker"
+        | "atx_h2_marker"
+        | "atx_h3_marker"
+        | "atx_h4_marker"
+        | "atx_h5_marker"
+        | "atx_h6_marker"
+        | "setext_h1_underline"
+        | "setext_h2_underline" => Some(Scope::Keyword),
         "list_marker_dot"
         | "list_marker_minus"
         | "list_marker_parenthesis"
@@ -268,15 +272,18 @@ fn markdown_scope(kind: &str) -> Option<Scope> {
 fn hcl_scope(kind: &str) -> Option<Scope> {
     match kind {
         "comment" => Some(Scope::Comment),
-        "string_lit" | "template_literal" | "heredoc_template" | "quoted_template_start"
+        "string_lit"
+        | "template_literal"
+        | "heredoc_template"
+        | "quoted_template_start"
         | "quoted_template_end" => Some(Scope::String),
         "numeric_lit" => Some(Scope::Number),
         "bool_lit" => Some(Scope::Constant),
         "null_lit" => Some(Scope::Constant),
         "identifier" => Some(Scope::Variable),
         "{" | "}" | "[" | "]" | "(" | ")" | "," | "." => Some(Scope::Punctuation),
-        "=" | "==" | "!=" | "<" | ">" | "<=" | ">=" | "&&" | "||" | "!" | "+" | "-" | "*"
-        | "/" | "%" => Some(Scope::Operator),
+        "=" | "==" | "!=" | "<" | ">" | "<=" | ">=" | "&&" | "||" | "!" | "+" | "-" | "*" | "/"
+        | "%" => Some(Scope::Operator),
         "ERROR" => Some(Scope::Error),
         _ => None,
     }
@@ -317,9 +324,10 @@ fn make_scope(kind: &str) -> Option<Scope> {
 fn go_scope(kind: &str) -> Option<Scope> {
     match kind {
         "package" | "import" | "func" | "return" | "if" | "else" | "for" | "range" | "type"
-        | "struct" | "interface" | "map" | "chan" | "go" | "defer" | "var" | "const"
-        | "switch" | "case" | "default" | "break" | "continue" | "fallthrough" | "select"
-        | "goto" => Some(Scope::Keyword),
+        | "struct" | "interface" | "map" | "chan" | "go" | "defer" | "var" | "const" | "switch"
+        | "case" | "default" | "break" | "continue" | "fallthrough" | "select" | "goto" => {
+            Some(Scope::Keyword)
+        }
         "comment" => Some(Scope::Comment),
         "interpreted_string_literal" | "raw_string_literal" | "rune_literal" => Some(Scope::String),
         "int_literal" | "float_literal" | "imaginary_literal" => Some(Scope::Number),
@@ -359,9 +367,9 @@ fn typescript_scope(kind: &str) -> Option<Scope> {
     match kind {
         "const" | "let" | "var" | "function" | "return" | "if" | "else" | "for" | "while"
         | "class" | "extends" | "implements" | "interface" | "type" | "enum" | "namespace"
-        | "new" | "typeof" | "keyof" | "as" | "in" | "of" | "public" | "private"
-        | "protected" | "readonly" | "static" | "abstract" | "async" | "await" | "import"
-        | "export" | "from" | "declare" => Some(Scope::Keyword),
+        | "new" | "typeof" | "keyof" | "as" | "in" | "of" | "public" | "private" | "protected"
+        | "readonly" | "static" | "abstract" | "async" | "await" | "import" | "export" | "from"
+        | "declare" => Some(Scope::Keyword),
         "comment" => Some(Scope::Comment),
         "string" | "template_string" => Some(Scope::String),
         "number" => Some(Scope::Number),
@@ -678,8 +686,7 @@ mod tests {
         let md_hl = parse_highlights(&md_src, "markdown", 1).expect("markdown grammar");
         assert!(!md_hl.spans.is_empty(), "Markdown should produce spans");
 
-        let hcl_src =
-            Rope::from_str("resource \"aws_instance\" \"web\" {\n  count = 2 # n\n}\n");
+        let hcl_src = Rope::from_str("resource \"aws_instance\" \"web\" {\n  count = 2 # n\n}\n");
         let hcl_hl = parse_highlights(&hcl_src, "hcl", 1).expect("hcl grammar");
         assert!(!hcl_hl.spans.is_empty(), "HCL should produce spans");
     }
@@ -687,11 +694,26 @@ mod tests {
     #[test]
     fn parse_highlights_produces_spans_for_batch_languages() {
         let cases: &[(&str, &str)] = &[
-            ("bash", "#!/bin/bash\n# c\nfor i in 1 2; do\n  echo \"$i\"\ndone\n"),
-            ("make", "# c\nCC = gcc\nall: main.o\n\t$(CC) -o app main.o\n"),
-            ("go", "package main\nimport \"fmt\"\n// c\nfunc main() { x := 42 }\n"),
-            ("javascript", "// c\nconst x = 42;\nfunction f(a) { return a; }\n"),
-            ("typescript", "// c\ninterface I { n: number }\nconst x: number = 42;\n"),
+            (
+                "bash",
+                "#!/bin/bash\n# c\nfor i in 1 2; do\n  echo \"$i\"\ndone\n",
+            ),
+            (
+                "make",
+                "# c\nCC = gcc\nall: main.o\n\t$(CC) -o app main.o\n",
+            ),
+            (
+                "go",
+                "package main\nimport \"fmt\"\n// c\nfunc main() { x := 42 }\n",
+            ),
+            (
+                "javascript",
+                "// c\nconst x = 42;\nfunction f(a) { return a; }\n",
+            ),
+            (
+                "typescript",
+                "// c\ninterface I { n: number }\nconst x: number = 42;\n",
+            ),
             ("html", "<!-- c -->\n<div class=\"a\"><p>hi</p></div>\n"),
             ("css", "/* c */\n.a { color: #fff; width: 100%; }\n"),
         ];
@@ -754,5 +776,4 @@ mod tests {
         assert_eq!(hl.spans[0].scope, CSV_COLUMN_SCOPES[0]);
         assert_eq!(hl.spans[1].scope, CSV_COLUMN_SCOPES[2]);
     }
-
 }
