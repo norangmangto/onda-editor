@@ -36,6 +36,7 @@ pub struct LanguageConfig {
 pub struct LanguageRegistry {
     configs: Vec<LanguageConfig>,
     by_extension: HashMap<String, usize>,
+    by_filename: HashMap<String, usize>,
     by_shebang: HashMap<String, usize>,
 }
 
@@ -54,6 +55,7 @@ impl LanguageRegistry {
             },
             &["rs"],
             &[],
+            &[],
         );
 
         reg.add(
@@ -65,6 +67,7 @@ impl LanguageRegistry {
                 indent_width: 4,
             },
             &["py", "pyw"],
+            &[],
             &["python", "python3", "python2"],
         );
 
@@ -79,6 +82,7 @@ impl LanguageRegistry {
             // jsonl: one JSON value per line; reuse the JSON grammar
             &["json", "jsonc", "jsonl"],
             &[],
+            &[],
         );
 
         reg.add(
@@ -90,6 +94,7 @@ impl LanguageRegistry {
                 indent_width: 2,
             },
             &["toml"],
+            &[],
             &[],
         );
 
@@ -103,6 +108,7 @@ impl LanguageRegistry {
             },
             &["yaml", "yml"],
             &[],
+            &[],
         );
 
         reg.add(
@@ -114,6 +120,7 @@ impl LanguageRegistry {
                 indent_width: 2,
             },
             &["md", "markdown"],
+            &[],
             &[],
         );
 
@@ -128,9 +135,10 @@ impl LanguageRegistry {
             // .tf and .tfvars are Terraform HCL; .hcl is generic HCL
             &["hcl", "tf", "tfvars"],
             &[],
+            &[],
         );
 
-        // CSV: plain-text columnar data; no tree-sitter grammar (use `:table` view).
+        // CSV: plain-text columnar data; tree-sitter-free column tinting (also `:table`).
         reg.add(
             LanguageConfig {
                 name: "csv".into(),
@@ -141,15 +149,118 @@ impl LanguageRegistry {
             },
             &["csv", "tsv"],
             &[],
+            &[],
+        );
+
+        // Shell (bash grammar covers sh/bash/zsh).
+        reg.add(
+            LanguageConfig {
+                name: "bash".into(),
+                grammar_name: "bash".into(),
+                comment_token: "#".into(),
+                indent_unit: "  ".into(),
+                indent_width: 2,
+            },
+            &["sh", "bash", "zsh"],
+            &[],
+            &["sh", "bash", "zsh", "dash", "ksh"],
+        );
+
+        // Makefile — extensionless; detected by exact file name (tabs are significant).
+        reg.add(
+            LanguageConfig {
+                name: "make".into(),
+                grammar_name: "make".into(),
+                comment_token: "#".into(),
+                indent_unit: "\t".into(),
+                indent_width: 4,
+            },
+            &["mk"],
+            &["Makefile", "makefile", "GNUmakefile"],
+            &[],
+        );
+
+        reg.add(
+            LanguageConfig {
+                name: "go".into(),
+                grammar_name: "go".into(),
+                comment_token: "//".into(),
+                indent_unit: "\t".into(),
+                indent_width: 4,
+            },
+            &["go"],
+            &[],
+            &[],
+        );
+
+        reg.add(
+            LanguageConfig {
+                name: "javascript".into(),
+                grammar_name: "javascript".into(),
+                comment_token: "//".into(),
+                indent_unit: "  ".into(),
+                indent_width: 2,
+            },
+            &["js", "mjs", "cjs", "jsx"],
+            &[],
+            &["node"],
+        );
+
+        reg.add(
+            LanguageConfig {
+                name: "typescript".into(),
+                grammar_name: "typescript".into(),
+                comment_token: "//".into(),
+                indent_unit: "  ".into(),
+                indent_width: 2,
+            },
+            &["ts", "tsx"],
+            &[],
+            &[],
+        );
+
+        reg.add(
+            LanguageConfig {
+                name: "html".into(),
+                grammar_name: "html".into(),
+                comment_token: "".into(),
+                indent_unit: "  ".into(),
+                indent_width: 2,
+            },
+            &["html", "htm"],
+            &[],
+            &[],
+        );
+
+        reg.add(
+            LanguageConfig {
+                name: "css".into(),
+                grammar_name: "css".into(),
+                comment_token: "".into(),
+                indent_unit: "  ".into(),
+                indent_width: 2,
+            },
+            &["css"],
+            &[],
+            &[],
         );
 
         reg
     }
 
-    fn add(&mut self, config: LanguageConfig, extensions: &[&str], shebangs: &[&str]) {
+    fn add(
+        &mut self,
+        config: LanguageConfig,
+        extensions: &[&str],
+        filenames: &[&str],
+        shebangs: &[&str],
+    ) {
         let idx = self.configs.len();
         for ext in extensions {
             self.by_extension.insert((*ext).to_owned(), idx);
+        }
+        for name in filenames {
+            self.by_filename.insert((*name).to_owned(), idx);
         }
         for shebang in shebangs {
             self.by_shebang.insert((*shebang).to_owned(), idx);
@@ -160,6 +271,11 @@ impl LanguageRegistry {
     /// Look up a language config by file extension (without leading dot).
     pub fn by_extension(&self, ext: &str) -> Option<&LanguageConfig> {
         self.by_extension.get(ext).map(|&i| &self.configs[i])
+    }
+
+    /// Look up a language config by exact file name (e.g. `Makefile`, `Dockerfile`).
+    pub fn by_filename(&self, filename: &str) -> Option<&LanguageConfig> {
+        self.by_filename.get(filename).map(|&i| &self.configs[i])
     }
 
     /// Look up a language config by the shebang interpreter name.
@@ -175,6 +291,12 @@ impl LanguageRegistry {
     /// Detect the language for a file given its path and (optionally) the first
     /// line of its content.  Tries extension first, then shebang.
     pub fn detect(&self, path: &str, first_line: Option<&str>) -> Option<&LanguageConfig> {
+        // 0. Exact file name (e.g. Makefile, Dockerfile — extensionless).
+        let basename = path.rsplit(['/', '\\']).next().unwrap_or(path);
+        if let Some(cfg) = self.by_filename(basename) {
+            return Some(cfg);
+        }
+
         // 1. Try file extension.
         if let Some(ext) = path.rsplit('.').next() {
             if let Some(cfg) = self.by_extension(ext) {
@@ -276,7 +398,52 @@ mod tests {
     fn detect_unknown_extension_is_none() {
         let r = LanguageRegistry::new();
         assert!(r.detect("notes.xyz", None).is_none());
-        assert!(r.detect("Makefile", None).is_none());
+        assert!(r.detect("LICENSE", None).is_none());
+    }
+
+    #[test]
+    fn detect_by_exact_filename() {
+        let r = LanguageRegistry::new();
+        for path in ["Makefile", "src/Makefile", "/a/b/GNUmakefile", "makefile"] {
+            assert_eq!(
+                r.detect(path, None).map(|c| c.name.as_str()),
+                Some("make"),
+                "{path} should detect as make"
+            );
+        }
+        // .mk extension also maps to make.
+        assert_eq!(
+            r.detect("rules.mk", None).map(|c| c.name.as_str()),
+            Some("make")
+        );
+    }
+
+    #[test]
+    fn detect_new_languages_by_extension() {
+        let r = LanguageRegistry::new();
+        for (path, name) in [
+            ("build.sh", "bash"),
+            ("main.go", "go"),
+            ("app.js", "javascript"),
+            ("app.tsx", "typescript"),
+            ("index.html", "html"),
+            ("style.css", "css"),
+        ] {
+            assert_eq!(
+                r.detect(path, None).map(|c| c.name.as_str()),
+                Some(name),
+                "{path} should detect as {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_shell_by_shebang() {
+        let r = LanguageRegistry::new();
+        let got = r.detect("configure", Some("#!/bin/bash"));
+        assert_eq!(got.map(|c| c.name.as_str()), Some("bash"));
+        let got = r.detect("run", Some("#!/usr/bin/env zsh"));
+        assert_eq!(got.map(|c| c.name.as_str()), Some("bash"));
     }
 
     #[test]

@@ -8,6 +8,9 @@
 
 use onda_core::Range;
 use ropey::Rope;
+// tree-sitter 0.25's `QueryCursor::matches` returns a `StreamingIterator`, not a
+// std `Iterator`; the trait must be in scope to drive it with `while let`.
+use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
 /// Buffers larger than this are not parsed synchronously for a text object — the
@@ -32,8 +35,8 @@ pub enum TextObjectScope {
 /// Return the tree-sitter `Language` for `name`, if a grammar is bundled.
 fn ts_language(name: &str) -> Option<tree_sitter::Language> {
     match name {
-        "rust" => Some(tree_sitter_rust::language()),
-        "python" => Some(tree_sitter_python::language()),
+        "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
+        "python" => Some(tree_sitter_python::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -128,7 +131,8 @@ fn resolve_paired(
     let mut cursor = QueryCursor::new();
     let mut best: Option<(usize, (usize, usize))> = None; // (outer span len, chosen range)
 
-    for m in cursor.matches(query, *root, text) {
+    let mut matches = cursor.matches(query, *root, text);
+    while let Some(m) = matches.next() {
         // Locate the outer node in this match and verify it contains the cursor.
         // Matches from other patterns (e.g. parameter) lack this capture — skip them.
         let outer_node = match m.captures.iter().find(|c| c.index == outer_idx) {
@@ -177,7 +181,8 @@ fn resolve_parameter(
     let mut cursor = QueryCursor::new();
     let mut best: Option<Node> = None;
 
-    for m in cursor.matches(query, *root, text) {
+    let mut matches = cursor.matches(query, *root, text);
+    while let Some(m) = matches.next() {
         for cap in m.captures.iter().filter(|c| c.index == inner_idx) {
             if !contains(&cap.node, byte_pos) {
                 continue;

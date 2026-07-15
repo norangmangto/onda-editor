@@ -9,6 +9,26 @@ you fix one, remove it here and land a regression test.
 
 ## Open
 
+### ⚪ Syntax highlighting uses node-kind→scope heuristics, not highlight queries
+The highlighter maps tree-sitter node **kinds** to `Scope` via hand-written per-language
+`*_scope()` functions (`crates/onda-syntax/src/highlight.rs`), not `.scm` highlight
+queries. Coverage is therefore approximate per language — it colors keywords/strings/
+numbers/comments/types well, but misses query-only distinctions (e.g. function *call* vs
+definition, injected languages, contextual captures). Migrating to compiled
+`highlights.scm` per language (`HighlightConfig` is the placeholder) would improve fidelity.
+
+### ⚪ CSV/TSV tinting is naive (no quoted-field handling)
+`csv_highlights` splits on the raw delimiter and does not honour RFC-4180 quoted fields —
+a `,` inside `"..."` still starts a new column tint. Adequate for visual column
+separation; structured CSV work uses the `:table` view.
+- **Where:** `crates/onda-syntax/src/highlight.rs` `csv_highlights`.
+
+### ⚪ Dockerfile highlighting not yet bundled
+Shell, Makefile, Go, JS, TS, HTML, CSS were added alongside HCL/Markdown, but the
+`tree-sitter-dockerfile` crate lags the stable-ABI layer (latest 0.2.0, pre-`LanguageFn`);
+deferred until a compatible release. Registry detection (filename-based, like Makefile)
+can be added when the grammar is wired.
+
 ### 🟡 LSP: full-document `didChange` sync only (no incremental)
 `LspClient::did_change` sends the whole buffer text on every debounced flush, not an
 LSP-incremental range edit. DESIGN.md's "디바운스된 증분 didChange" calls for incremental
