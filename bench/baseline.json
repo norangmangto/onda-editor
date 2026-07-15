@@ -2,19 +2,19 @@
   "results": [
     {
       "name": "startup_ms",
-      "median_ms": 27.263917,
-      "mean_ms": 196.96499590000002,
-      "min_ms": 16.004333,
-      "max_ms": 1747.087125,
+      "median_ms": 5.415875,
+      "mean_ms": 5.5000667000000005,
+      "min_ms": 4.5716660000000005,
+      "max_ms": 7.37975,
       "runs": 10,
       "budget_ms": null
     },
     {
       "name": "large_file_open_ms",
-      "median_ms": 15.102292,
-      "mean_ms": 15.210683399999999,
-      "min_ms": 14.578000000000001,
-      "max_ms": 15.73225,
+      "median_ms": 4.433333,
+      "mean_ms": 4.4392416,
+      "min_ms": 4.226583,
+      "max_ms": 4.590707999999999,
       "runs": 5,
       "budget_ms": null
     },
@@ -82,6 +82,6 @@
       "budget_ms": 40.0
     }
   ],
-  "git_sha": "30d4cf7",
-  "timestamp": "2026-06-15"
+  "git_sha": "bf41d00",
+  "timestamp": ""
 }
