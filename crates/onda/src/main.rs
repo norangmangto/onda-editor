@@ -38,6 +38,7 @@ use onda_terminal::{PtyEvent, PtyProcess, TerminalScreen};
 use plugin_host::{PluginEvent, PluginHost};
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::debug;
+use unicode_width::UnicodeWidthStr;
 
 // ── Background message channel ─────────────────────────────────────────────────
 
@@ -153,6 +154,10 @@ enum PickerKind {
     /// A plugin-contributed picker (W37); on accept, the packed callback handle is
     /// invoked with the selected item's value.
     PluginPick(u64),
+    /// LSP document-symbol picker (W36); item `value` is an index into `lsp_symbols`.
+    LspSymbol,
+    /// LSP code-action picker (W36); item `value` is an index into `lsp_code_actions`.
+    LspCodeAction,
 }
 
 /// Which view the IDE-shell sidebar is showing (Phase 6 W33; activity bar order).
@@ -316,6 +321,18 @@ struct HoverFloat {
     /// Screen position where the float should appear.
     col: u16,
     row: u16,
+}
+
+// ── LspRenamePrompt ───────────────────────────────────────────────────────────
+
+/// An in-progress `<space>rn` rename: the new-name input buffer plus the
+/// buffer/position the rename request was started at (captured up front so
+/// the request still targets the right symbol even though nothing else can
+/// move the cursor while the prompt has focus).
+struct LspRenamePrompt {
+    input: String,
+    path: PathBuf,
+    position: lsp_types::Position,
 }
 
 // ── PreviewState ─────────────────────────────────────────────────────────────
@@ -494,10 +511,15 @@ struct App<B: Backend> {
     undo_loaded: std::collections::HashSet<usize>,
 
     // ── LSP ───────────────────────────────────────────────────────────────────
-    /// LSP manager (None when tokio runtime unavailable, e.g. bench).
-    #[allow(dead_code)]
-    lsp_manager: Option<LspManager>,
-    /// LSP event sender — used to bridge tokio → std channel.
+    /// LSP manager (None when tokio runtime unavailable, e.g. bench/tests). Shared
+    /// (`Arc<tokio::sync::Mutex<_>>`) because every interaction — `ensure_server`,
+    /// `did_open`, `did_change`, and every request method — is `async fn` on
+    /// `LspManager`/`LspClient`, so callers from the sync main loop always go
+    /// through a `tokio::spawn`'d task that locks the mutex; the main thread
+    /// itself never blocks on it (rule 2).
+    lsp_manager: Option<std::sync::Arc<tokio::sync::Mutex<LspManager>>>,
+    /// LSP event sender, kept alongside the manager so a future `:lsp-restart`
+    /// can rebuild it without re-wiring the tokio → std bridge task.
     #[allow(dead_code)]
     lsp_event_tx: Option<tokio_mpsc::Sender<LspEvent>>,
     /// Diagnostics per document (keyed by path string).
@@ -505,12 +527,25 @@ struct App<B: Backend> {
     /// Diagnostic spans per document index (resolved to char offsets).
     diagnostic_spans: HashMap<usize, Vec<DiagnosticSpan>>,
     /// Next LSP request ID.
-    #[allow(dead_code)]
     lsp_request_id: u64,
     /// Active hover float, if any.
     hover_float: Option<HoverFloat>,
     /// Active completion state, if any.
     completion: Option<CompletionState>,
+    /// Per-doc: `(quiet-period start, Document::rev() at that point)` for the
+    /// `didChange` debounce — reset whenever `rev` advances again, flushed once
+    /// `rev` has been stable for the debounce window (see `maybe_flush_lsp_change`).
+    lsp_pending_change: HashMap<usize, (std::time::Instant, u64)>,
+    /// Per-doc `Document::rev()` already sent via the last `didChange`.
+    lsp_sent_rev: HashMap<usize, u64>,
+    /// Active `<space>rn` rename prompt, if any.
+    lsp_rename_prompt: Option<LspRenamePrompt>,
+    /// Backing data for the last document-symbol picker (`PickerKind::LspSymbol`
+    /// items carry an index into this).
+    lsp_symbols: Vec<onda_lsp::LspSymbol>,
+    /// Backing data for the last code-action picker (`PickerKind::LspCodeAction`
+    /// items carry an index into this).
+    lsp_code_actions: Vec<onda_lsp::LspCodeAction>,
 
     // ── Terminal ──────────────────────────────────────────────────────────────
     /// Active terminal panes (one per terminal window).
@@ -565,7 +600,10 @@ struct App<B: Backend> {
     sidebar_resizing: bool,
 
     // ── Soft wrap ─────────────────────────────────────────────────────────────
-    #[allow(dead_code)]
+    /// `:set wrap`/`:set nowrap`. Character-boundary wrapping only (no
+    /// word-boundary wrap yet — BACKLOG). Plugin decorations and debugger
+    /// gutter markers are not yet wrap-aware; they assume the unwrapped 1:1
+    /// doc-line-to-screen-row mapping, same as before this option existed.
     soft_wrap: bool,
 
     #[cfg(feature = "bench")]
@@ -757,6 +795,99 @@ impl<B: Backend> App<B> {
         self.request_syntax_parse_for_doc(doc_idx);
     }
 
+    // ── LSP lifecycle ────────────────────────────────────────────────────────
+
+    /// Kick off LSP for a newly-opened buffer: spawn (or reuse) the language
+    /// server for its workspace root + extension, then send `didOpen`. Both are
+    /// `async fn` on `LspManager`, so this just clones the shared handle and
+    /// spawns a detached task — the main thread never blocks on it (rule 2).
+    /// A no-op for unsaved buffers (no path → no extension to route on) or when
+    /// no LSP manager is running (bench/tests).
+    fn ensure_lsp_for_doc(&mut self, doc_idx: usize) {
+        let Some(mgr) = self.lsp_manager.clone() else {
+            return;
+        };
+        let Some(doc) = self.docs.get(doc_idx) else {
+            return;
+        };
+        let Some(path) = doc.path().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        let Some(ext) = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let text = doc.rope().to_string();
+
+        tokio::spawn(async move {
+            let root = lsp_workspace_root(&path);
+            let mut mgr = mgr.lock().await;
+            if mgr.ensure_server(root.clone(), &ext).await.is_ok() {
+                mgr.did_open(&path, &text, &root).await;
+            }
+        });
+    }
+
+    /// Debounced `didChange`: called once per frame (event or idle tick). Fires
+    /// only after the focused doc's `rev()` has been stable for the debounce
+    /// window — not on every keystroke — matching DESIGN.md's "디바운스된 증분
+    /// didChange" intent (full-document sync today; incremental sync would need
+    /// ChangeSet→LSP-range translation, tracked as a BACKLOG follow-up).
+    fn maybe_flush_lsp_change(&mut self) {
+        if self.lsp_manager.is_none() {
+            return;
+        }
+        const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+        let doc_idx = self.focused_win().doc_idx;
+        let Some(doc) = self.docs.get(doc_idx) else {
+            return;
+        };
+        let rev = doc.rev();
+        if self.lsp_sent_rev.get(&doc_idx).copied() == Some(rev) {
+            return; // nothing new since the last send
+        }
+        let now = std::time::Instant::now();
+        match self.lsp_pending_change.get_mut(&doc_idx) {
+            Some((since, pending_rev)) if *pending_rev == rev => {
+                if now.duration_since(*since) < DEBOUNCE {
+                    return; // still within the quiet-period window
+                }
+            }
+            _ => {
+                // First time we've seen this rev, or it advanced again since we
+                // started waiting — (re)start the quiet-period timer.
+                self.lsp_pending_change.insert(doc_idx, (now, rev));
+                return;
+            }
+        }
+        self.lsp_pending_change.remove(&doc_idx);
+        self.lsp_sent_rev.insert(doc_idx, rev);
+        self.send_lsp_did_change(doc_idx, rev);
+    }
+
+    fn send_lsp_did_change(&mut self, doc_idx: usize, rev: u64) {
+        let Some(mgr) = self.lsp_manager.clone() else {
+            return;
+        };
+        let Some(doc) = self.docs.get(doc_idx) else {
+            return;
+        };
+        let Some(path) = doc.path().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        let text = doc.rope().to_string();
+        let version = rev as i64;
+
+        tokio::spawn(async move {
+            let root = lsp_workspace_root(&path);
+            let mut mgr = mgr.lock().await;
+            mgr.did_change(&path, &text, version, &root).await;
+        });
+    }
+
     /// Resolve the window's syntax highlights into theme-styled char spans for the
     /// visible region only (byte→char converted, last-writer-wins on overlap → a
     /// sorted, non-overlapping list the renderer can stream).
@@ -846,18 +977,21 @@ impl<B: Backend> App<B> {
             return;
         }
         let doc = &self.docs[doc_idx];
-        // Sample the first chunk for sniffing + widths (bounded for big files).
-        let sample_lines: Vec<String> = (0..doc.len_lines().min(500))
+        let total = doc.len_lines();
+        let clean_line = |l: usize| -> String {
+            let s = doc.line_to_char(l);
+            let len = doc.line_len_no_eol(l);
+            onda_data::csv::clean_line(&doc.rope().slice(s..s + len).to_string()).to_string()
+        };
+        // Sniff dialect from a small sample; compute layout from all lines so that
+        // column widths reflect the actual longest value in each column.
+        let sniff_lines: Vec<String> = (0..total.min(500)).map(&clean_line).collect();
+        let dialect = onda_data::sniff(&sniff_lines.join("\n"));
+        let rows: Vec<Vec<String>> = (0..total)
             .map(|l| {
-                let s = doc.line_to_char(l);
-                let len = doc.line_len_no_eol(l);
-                onda_data::csv::clean_line(&doc.rope().slice(s..s + len).to_string()).to_string()
+                let line = clean_line(l);
+                onda_data::parse_fields(&line, dialect.delimiter, dialect.quote)
             })
-            .collect();
-        let dialect = onda_data::sniff(&sample_lines.join("\n"));
-        let rows: Vec<Vec<String>> = sample_lines
-            .iter()
-            .map(|l| onda_data::parse_fields(l, dialect.delimiter, dialect.quote))
             .collect();
         let layout = onda_data::column_layout(&rows);
         self.table_docs.insert(doc_idx, dialect);
@@ -2086,6 +2220,196 @@ impl<B: Backend> App<B> {
         (files, total)
     }
 
+    // ── LSP requests (W36) ───────────────────────────────────────────────────
+
+    /// Common preamble for a cursor-position LSP request: the shared manager
+    /// handle, the focused doc's path, and the cursor's LSP position. `None`
+    /// when there's no manager running or the buffer is unsaved (no path to
+    /// route a request against).
+    fn lsp_request_context(
+        &mut self,
+    ) -> Option<(
+        std::sync::Arc<tokio::sync::Mutex<LspManager>>,
+        PathBuf,
+        lsp_types::Position,
+    )> {
+        let mgr = self.lsp_manager.clone()?;
+        let doc = self.doc();
+        let path = doc.path()?.to_path_buf();
+        let head = self.selection().primary().head;
+        let (line, col) = lsp_edit::char_to_lsp_pos(doc.rope(), head);
+        let position = lsp_types::Position {
+            line: line as u32,
+            character: col as u32,
+        };
+        Some((mgr, path, position))
+    }
+
+    /// Allocate the next LSP request id (correlated back via `LspEvent::*.request_id`).
+    fn next_lsp_request_id(&mut self) -> u64 {
+        let id = self.lsp_request_id;
+        self.lsp_request_id += 1;
+        id
+    }
+
+    fn lsp_hover(&mut self) {
+        let Some((mgr, path, position)) = self.lsp_request_context() else {
+            return;
+        };
+        let request_id = self.next_lsp_request_id();
+        tokio::spawn(async move {
+            let root = lsp_workspace_root(&path);
+            let mut mgr = mgr.lock().await;
+            if let Some(client) = mgr.client_for_mut(&root) {
+                let _ = client.hover(&path, position, request_id).await;
+            }
+        });
+    }
+
+    fn lsp_goto_definition(&mut self) {
+        let Some((mgr, path, position)) = self.lsp_request_context() else {
+            return;
+        };
+        let request_id = self.next_lsp_request_id();
+        tokio::spawn(async move {
+            let root = lsp_workspace_root(&path);
+            let mut mgr = mgr.lock().await;
+            if let Some(client) = mgr.client_for_mut(&root) {
+                let _ = client.definition(&path, position, request_id).await;
+            }
+        });
+    }
+
+    fn lsp_references(&mut self) {
+        let Some((mgr, path, position)) = self.lsp_request_context() else {
+            return;
+        };
+        let request_id = self.next_lsp_request_id();
+        tokio::spawn(async move {
+            let root = lsp_workspace_root(&path);
+            let mut mgr = mgr.lock().await;
+            if let Some(client) = mgr.client_for_mut(&root) {
+                let _ = client.references(&path, position, request_id).await;
+            }
+        });
+    }
+
+    /// `<space>rn` — open the rename-input prompt (captures path/position now;
+    /// the actual request fires from `lsp_rename_commit` on Enter).
+    fn lsp_rename_start(&mut self) {
+        let Some((_, path, position)) = self.lsp_request_context() else {
+            self.message = Message::Error("LSP: no server for this buffer".into());
+            return;
+        };
+        self.lsp_rename_prompt = Some(LspRenamePrompt {
+            input: String::new(),
+            path,
+            position,
+        });
+        self.message = Message::Info("New name: ".into());
+    }
+
+    fn lsp_rename_commit(&mut self) {
+        let Some(prompt) = self.lsp_rename_prompt.take() else {
+            return;
+        };
+        if prompt.input.is_empty() {
+            self.message = Message::Info("Rename cancelled (empty name)".into());
+            return;
+        }
+        let Some(mgr) = self.lsp_manager.clone() else {
+            return;
+        };
+        let request_id = self.next_lsp_request_id();
+        let path = prompt.path;
+        let position = prompt.position;
+        let new_name = prompt.input;
+        tokio::spawn(async move {
+            let root = lsp_workspace_root(&path);
+            let mut mgr = mgr.lock().await;
+            if let Some(client) = mgr.client_for_mut(&root) {
+                let _ = client.rename(&path, position, new_name, request_id).await;
+            }
+        });
+    }
+
+    /// Keys while the rename prompt has focus. Always consumes the key.
+    fn handle_lsp_rename_prompt_key(&mut self, key: &Key) {
+        match key {
+            Key::Esc => {
+                self.lsp_rename_prompt = None;
+                self.message = Message::None;
+            }
+            Key::Enter => self.lsp_rename_commit(),
+            Key::Backspace => {
+                if let Some(p) = self.lsp_rename_prompt.as_mut() {
+                    p.input.pop();
+                    self.message = Message::Info(format!("New name: {}", p.input));
+                }
+            }
+            Key::Char(c, _) => {
+                if let Some(p) = self.lsp_rename_prompt.as_mut() {
+                    p.input.push(*c);
+                    self.message = Message::Info(format!("New name: {}", p.input));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `<space>F` / `:Format` — request formatting for the focused buffer.
+    fn lsp_format(&mut self) {
+        let Some((mgr, path, _)) = self.lsp_request_context() else {
+            self.message = Message::Info("LSP Format: not yet connected".into());
+            return;
+        };
+        let request_id = self.next_lsp_request_id();
+        tokio::spawn(async move {
+            let root = lsp_workspace_root(&path);
+            let mut mgr = mgr.lock().await;
+            if let Some(client) = mgr.client_for_mut(&root) {
+                let _ = client.formatting(&path, request_id).await;
+            }
+        });
+        self.message = Message::Info("LSP: format requested (async)".into());
+    }
+
+    /// `<space>ds` — request document symbols; opens `PickerKind::LspSymbol`
+    /// once `LspEvent::SymbolResult` arrives (handled in `handle_lsp_event`).
+    fn lsp_document_symbol(&mut self) {
+        let Some((mgr, path, _)) = self.lsp_request_context() else {
+            return;
+        };
+        let request_id = self.next_lsp_request_id();
+        tokio::spawn(async move {
+            let root = lsp_workspace_root(&path);
+            let mut mgr = mgr.lock().await;
+            if let Some(client) = mgr.client_for_mut(&root) {
+                let _ = client.document_symbol(&path, request_id).await;
+            }
+        });
+    }
+
+    /// `<space>ca` — request code actions at the cursor (zero-width range);
+    /// opens `PickerKind::LspCodeAction` once `LspEvent::CodeActionResult` arrives.
+    fn lsp_code_action(&mut self) {
+        let Some((mgr, path, position)) = self.lsp_request_context() else {
+            return;
+        };
+        let request_id = self.next_lsp_request_id();
+        let range = lsp_types::Range {
+            start: position,
+            end: position,
+        };
+        tokio::spawn(async move {
+            let root = lsp_workspace_root(&path);
+            let mut mgr = mgr.lock().await;
+            if let Some(client) = mgr.client_for_mut(&root) {
+                let _ = client.code_action(&path, range, request_id).await;
+            }
+        });
+    }
+
     // ── Source control (W38) ─────────────────────────────────────────────────
 
     /// Repo root for SCM operations (the working directory).
@@ -2337,6 +2661,7 @@ impl<B: Backend> App<B> {
                 *self.selection_mut() = Selection::point(0);
                 self.message = Message::Info(format!("Opened: {}", path.display()));
                 self.try_spawn_syntax_worker_for_doc(doc_idx);
+                self.ensure_lsp_for_doc(doc_idx);
             }
             Err(e) => self.message = Message::Error(format!("E: {e}")),
         }
@@ -2783,13 +3108,28 @@ impl<B: Backend> App<B> {
         let picker_data: Option<(String, String, Vec<(String, bool)>, u16, u16)> =
             self.picker.as_ref().and_then(|p| {
                 if p.is_visible() {
+                    let pw = (width * 2 / 3).max(40).min(width);
+                    let ph = 20u16.min(height.saturating_sub(4));
+                    // `render_picker` only ever draws the first `visible` rows it's
+                    // handed (see its own `max_items` there) — it does no scrolling of
+                    // its own. Window the items around the selection here so the
+                    // highlighted row (and anything past the first page) stays visible
+                    // as the selection moves down.
+                    let visible = (ph as usize).saturating_sub(3);
+                    let total = p.filtered_count();
+                    let sel = p.selected_index();
+                    let offset = if visible == 0 || total <= visible {
+                        0
+                    } else {
+                        sel.saturating_sub(visible - 1).min(total - visible)
+                    };
                     let items: Vec<(String, bool)> = p
                         .filtered_items()
                         .enumerate()
-                        .map(|(i, item)| (item.display.clone(), i == p.selected_index()))
+                        .skip(offset)
+                        .take(visible)
+                        .map(|(i, item)| (item.display.clone(), i == sel))
                         .collect();
-                    let pw = (width * 2 / 3).max(40).min(width);
-                    let ph = 20u16.min(height.saturating_sub(4));
                     Some((p.title().to_string(), p.query().to_string(), items, pw, ph))
                 } else {
                     None
@@ -2968,6 +3308,7 @@ impl<B: Backend> App<B> {
                         hl_spans,
                         matches,
                         theme,
+                        self.soft_wrap,
                     );
                 } else {
                     DocumentView::render_with_diagnostics(
@@ -2982,6 +3323,7 @@ impl<B: Backend> App<B> {
                         matches,
                         diag_spans,
                         theme,
+                        self.soft_wrap,
                     );
                 }
 
@@ -3162,11 +3504,49 @@ impl<B: Backend> App<B> {
         let doc = self.doc();
         let win = self.focused_win();
         let head = win.selection.primary().head;
+        let line = doc.char_to_line(head);
+        let screen_row = rect.y + line.saturating_sub(win.viewport.offset_line) as u16;
+
+        // Table view renders an aligned virtual layout (padded columns, " │ "
+        // separators, no line-number gutter) instead of the raw line text, so the
+        // cursor's screen column must follow that layout rather than the raw
+        // display column — otherwise it lands wherever the raw text would have put
+        // it, which is almost never the cell the user is actually in.
+        if let (Some(dialect), Some(layout)) = (
+            self.table_docs.get(&win.doc_idx),
+            self.table_layout.get(&win.doc_idx),
+        ) {
+            let line_start = doc.line_to_char(line);
+            let local_col = head - line_start;
+            let len = doc.line_len_no_eol(line);
+            let raw = doc.rope().slice(line_start..line_start + len).to_string();
+            let cleaned = onda_data::csv::clean_line(&raw);
+            let screen_col = rect.x + table_cell_screen_col(cleaned, *dialect, layout, local_col);
+            return (
+                screen_col.min(width.saturating_sub(1)),
+                screen_row.min(height.saturating_sub(3)),
+            );
+        }
+
+        // With soft wrap on, the cursor's row/col must follow the same wrapped
+        // row layout the renderer used, not the raw 1:1 doc-line mapping.
+        if self.soft_wrap {
+            let text_width = rect.width.saturating_sub(win.viewport.line_nr_width) as usize;
+            let rows =
+                onda_render::build_row_layout(doc, &win.viewport, rect.height, text_width, true);
+            if let Some((row_idx, col)) = onda_render::locate_in_layout(&rows, doc, head) {
+                let screen_row = rect.y + row_idx as u16;
+                let screen_col = rect.x + col as u16 + win.viewport.line_nr_width;
+                return (
+                    screen_col.min(width.saturating_sub(1)),
+                    screen_row.min(height.saturating_sub(3)),
+                );
+            }
+        }
+
         // Use display columns (wide/CJK glyphs = 2 cells) so the cursor lands on the
         // right cell when wide characters precede it on the line.
-        let (line, col) = doc.char_to_display_col(head);
-
-        let screen_row = rect.y + line.saturating_sub(win.viewport.offset_line) as u16;
+        let (_, col) = doc.char_to_display_col(head);
         let screen_col = rect.x
             + (col.saturating_sub(win.viewport.offset_col) as u16)
                 .saturating_add(win.viewport.line_nr_width);
@@ -3407,6 +3787,12 @@ impl<B: Backend> App<B> {
         // Record key for macros (before routing to mode-specific handler)
         self.macros.record_key(&key);
 
+        // Route to the LSP rename prompt when active (captures all input).
+        if self.lsp_rename_prompt.is_some() {
+            self.handle_lsp_rename_prompt_key(&key);
+            return Ok(());
+        }
+
         // Route to picker if visible
         if self
             .picker
@@ -3531,6 +3917,7 @@ impl<B: Backend> App<B> {
                                     *self.selection_mut() = Selection::point(0);
                                     self.message = Message::Info(format!("Opened: {value}"));
                                     self.try_spawn_syntax_worker_for_doc(doc_idx);
+                                    self.ensure_lsp_for_doc(doc_idx);
                                 }
                                 Err(e) => {
                                     self.message = Message::Error(format!("E: {e}"));
@@ -3548,6 +3935,43 @@ impl<B: Backend> App<B> {
                         PickerKind::KeyRef => {} // reference only
                         PickerKind::PluginPick(handle) => {
                             self.run_plugin_callback(handle, vec![value]);
+                        }
+                        PickerKind::LspSymbol => {
+                            if let Some(sym) = value
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|i| self.lsp_symbols.get(i))
+                                .cloned()
+                            {
+                                if let Some(path) = self.doc().path().map(|p| p.to_path_buf()) {
+                                    self.jump_to_location(
+                                        path,
+                                        sym.range.start.line as usize,
+                                        sym.range.start.character as usize,
+                                    );
+                                }
+                            }
+                        }
+                        PickerKind::LspCodeAction => {
+                            if let Some(action) = value
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|i| self.lsp_code_actions.get(i))
+                                .cloned()
+                            {
+                                match action.edit {
+                                    Some(edit) => {
+                                        let (files, total) = self.apply_workspace_edit(edit);
+                                        self.message = Message::Info(format!(
+                                            "{total} edit(s) across {files} file(s)"
+                                        ));
+                                    }
+                                    None => {
+                                        self.message =
+                                            Message::Info("No edit to apply for this action".into())
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -3814,13 +4238,7 @@ impl<B: Backend> App<B> {
             ExCommand::Terminal => {
                 self.open_terminal_pane()?;
             }
-            ExCommand::Format => {
-                if self.lsp_manager.is_some() {
-                    self.message = Message::Info("LSP: format requested (async)".into());
-                } else {
-                    self.message = Message::Info("LSP Format: not yet connected".into());
-                }
-            }
+            ExCommand::Format => self.lsp_format(),
             ExCommand::LspNext => {
                 let doc_idx = self.focused_win().doc_idx;
                 let cur = self.selection().primary().head;
@@ -3850,6 +4268,11 @@ impl<B: Backend> App<B> {
                         self.message = Message::Info("No previous diagnostics".into());
                     }
                 }
+            }
+            ExCommand::Zz => {
+                let line = self.doc().char_to_line(self.selection().primary().head);
+                let h = self.compositor.buf.current().height().saturating_sub(2) as usize;
+                self.viewport_mut().center_on(line, h);
             }
             ExCommand::Messages => {
                 let history = self.message_history.join("\n");
@@ -4004,6 +4427,7 @@ impl<B: Backend> App<B> {
                             *self.selection_mut() = Selection::point(0);
                             *self.viewport_mut() = Viewport::new();
                             self.try_spawn_syntax_worker_for_doc(doc_idx);
+                            self.ensure_lsp_for_doc(doc_idx);
                         }
                         Err(e) => {
                             self.message = Message::Error(format!("E: {e}"));
@@ -4035,6 +4459,7 @@ impl<B: Backend> App<B> {
                         Ok(doc) => {
                             let idx = self.docs.len();
                             self.docs.push(doc);
+                            self.ensure_lsp_for_doc(idx);
                             idx
                         }
                         Err(e) => {
@@ -4058,6 +4483,7 @@ impl<B: Backend> App<B> {
                         Ok(doc) => {
                             let idx = self.docs.len();
                             self.docs.push(doc);
+                            self.ensure_lsp_for_doc(idx);
                             idx
                         }
                         Err(e) => {
@@ -4083,6 +4509,10 @@ impl<B: Backend> App<B> {
                     if let Some(v) = value.as_deref().and_then(|s| s.parse::<usize>().ok()) {
                         self.viewport_mut().scrolloff = v;
                     }
+                } else if key == "wrap" {
+                    self.soft_wrap = true;
+                } else if key == "nowrap" {
+                    self.soft_wrap = false;
                 } else if self.config.editor.scrolloff != 5 {
                     // Apply scrolloff from loaded config to current viewport
                     let so = self.config.editor.scrolloff;
@@ -4145,8 +4575,99 @@ impl<B: Backend> App<B> {
                     }
                 }
             }
+            ExCommand::Global { pattern, cmd } => {
+                self.run_global_command(&pattern, &cmd);
+            }
         }
         Ok(())
+    }
+
+    /// `:g/pattern/cmd` — run `cmd` on every line matching `pattern`. Only an
+    /// `s///` sub-command is supported today.
+    fn run_global_command(&mut self, pattern: &str, cmd: &str) {
+        let smartcase = false;
+        let mut search = SearchState::new();
+        search.set_pattern(pattern, smartcase);
+        let Some(regex) = search.regex.clone() else {
+            self.message = Message::Error(format!("E486: Pattern not found: {pattern}"));
+            return;
+        };
+
+        let (sub_pattern, sub_replacement, sub_global) = match ExCommand::parse(cmd) {
+            Ok(ExCommand::Substitute {
+                pattern,
+                replacement,
+                flags_global,
+                ..
+            }) => (pattern, replacement, flags_global),
+            _ => {
+                self.message =
+                    Message::Error(":g only supports an s/pat/rep/ sub-command".to_string());
+                return;
+            }
+        };
+        let mut sub_search = SearchState::new();
+        sub_search.set_pattern(&sub_pattern, smartcase);
+        let Some(sub_regex) = sub_search.regex.clone() else {
+            self.message = Message::Error(format!("E486: Pattern not found: {sub_pattern}"));
+            return;
+        };
+
+        // Collect matching lines up front — substituting while iterating would
+        // shift downstream line offsets and corrupt later matches.
+        let total_lines = self.doc().len_lines();
+        let mut matching_lines = Vec::new();
+        for line in 0..total_lines {
+            let text = self.doc().rope().line(line).to_string();
+            if regex.is_match(text.trim_end_matches('\n')) {
+                matching_lines.push(line);
+            }
+        }
+        if matching_lines.is_empty() {
+            self.message = Message::Error(format!("Pattern not found: {pattern}"));
+            return;
+        }
+
+        let mut applied = 0usize;
+        self.undo().begin_group();
+        for line in matching_lines {
+            // A prior substitution on this pass could in principle change the
+            // line count (e.g. a replacement containing a literal newline);
+            // guard against operating on a now out-of-range line.
+            if line >= self.doc().len_lines() {
+                continue;
+            }
+            let line_start = self.doc().line_to_char(line);
+            let line_end = line_start + self.doc().line_len_no_eol(line);
+            let rope = self.doc().rope().clone();
+            let result = onda_modal::substitute(
+                &rope,
+                &sub_regex,
+                &sub_replacement,
+                sub_global,
+                line_start,
+                line_end,
+            );
+            if let Some((new_text, _count)) = result {
+                let len = self.doc().len_chars();
+                let cs = onda_core::transaction::ChangeSetBuilder::new(len)
+                    .retain(line_start)
+                    .delete(line_end - line_start)
+                    .insert(&new_text)
+                    .retain(len - line_end)
+                    .build();
+                let tx = Transaction::new(cs);
+                let sel_before = self.selection().clone();
+                if let Ok(inv) = self.doc_mut().apply(&tx) {
+                    let sel_after = self.selection().clone();
+                    self.undo().push(tx, inv, sel_before, sel_after);
+                    applied += 1;
+                }
+            }
+        }
+        self.undo().end_group();
+        self.update_search_matches();
+        self.message = Message::Info(format!("{applied} substitution(s)"));
     }
 
     fn handle_normal_key(&mut self, key: Key) -> Result<()> {
@@ -4186,6 +4707,23 @@ impl<B: Backend> App<B> {
             let (_, h) = self.backend.size();
             h.saturating_sub(2) as usize
         };
+
+        // Bare `q` stops an in-progress macro recording (vim: `q{c}...q`). The
+        // keymap's own `q` handler can't express this: it always arms a *new*
+        // pending register selection (so `q{c}` and the stop share one entry
+        // point), which would otherwise misread the very next keystroke as
+        // "start recording into register X". Intercept the stop here instead,
+        // and drop the terminating `q` itself from the recording (it was already
+        // pushed into the macro buffer by `record_key` before routing reached
+        // this point).
+        if key == Key::char('q')
+            && self.macros.is_recording().is_some()
+            && !self.keymap_state.has_pending()
+        {
+            self.macros.discard_last_recorded_key();
+            self.execute_action(Action::StopRecordMacro, 1, viewport_height)?;
+            return Ok(());
+        }
 
         let result = self.keymap_state.process(&key, self.mode, &self.keymap);
         match result {
@@ -4293,6 +4831,15 @@ impl<B: Backend> App<B> {
 
             // ── Motion ───────────────────────────────────────────────────────
             Action::Move(motion) => {
+                // vim jumplist: record the pre-jump position before "large" motions so
+                // `<C-o>`/`<C-i>` (JumpOlder/JumpNewer, which only *read* `self.jumps`)
+                // have something to navigate.
+                if matches!(motion, Motion::DocumentStart | Motion::DocumentEnd) {
+                    let doc_id = self.current_doc_id();
+                    let pos = self.selection().primary().head;
+                    self.jumps
+                        .push(onda_modal::jumplist::JumpPos::new(doc_id, pos));
+                }
                 let rope = self.doc().rope().clone();
                 let (new_sel, new_goal) = motion.apply_to_selection(
                     &rope,
@@ -4344,7 +4891,10 @@ impl<B: Backend> App<B> {
                 let lo = primary.head.min(motion_head);
                 let hi = primary.head.max(motion_head);
 
-                if motion.is_linewise() {
+                // vim forces `<`/`>` to be linewise regardless of the motion's own
+                // type (e.g. `>w` still shifts whole lines, not a partial span).
+                let force_linewise = matches!(op, Operator::Indent | Operator::Dedent);
+                if motion.is_linewise() || force_linewise {
                     // `dj`/`dk`/`dG`/`dgg`: operate on whole lines spanning the cursor
                     // line through the motion's target line.
                     let op_sel = Selection::new(vec![onda_core::Range::new(lo, hi)], 0);
@@ -4371,7 +4921,8 @@ impl<B: Backend> App<B> {
                 let range = self.resolve_textobj(&rope, pos, textobj);
                 if let Some(r) = range {
                     let op_sel = Selection::new(vec![r], 0);
-                    self.apply_operator(op, &op_sel, false)?;
+                    let linewise = matches!(op, Operator::Indent | Operator::Dedent);
+                    self.apply_operator(op, &op_sel, linewise)?;
                 } else if Self::is_ts_textobj(textobj) {
                     self.message = Message::Info("no tree-sitter text object here".to_string());
                 }
@@ -4410,7 +4961,9 @@ impl<B: Backend> App<B> {
             Action::OperatorSelection(op) => {
                 let sel = self.selection().clone();
                 // Visual-line operates on whole lines; charwise/block on the range.
-                let linewise = self.mode == Mode::VisualLine;
+                // `<`/`>` are always linewise, regardless of the visual submode.
+                let linewise = self.mode == Mode::VisualLine
+                    || matches!(op, Operator::Indent | Operator::Dedent);
                 self.apply_operator(op, &sel, linewise)?;
                 self.mode = Mode::Normal;
             }
@@ -4445,6 +4998,30 @@ impl<B: Backend> App<B> {
                 }
                 self.update_search_matches();
             }
+            Action::ToggleCaseChar => {
+                // `~` toggles `count` chars and advances the cursor past them
+                // (clamped to the line, vim-style) — same clamp as `l`.
+                let tx =
+                    onda_modal::operator::toggle_case_chars(self.doc(), self.selection(), count);
+                if !tx.changes.is_empty() {
+                    let sel_before = self.selection().clone();
+                    let inv = self.doc_mut().apply(&tx)?;
+                    let rope = self.doc().rope().clone();
+                    let (new_sel, _) = Motion::Right.apply_to_selection(
+                        &rope,
+                        self.selection(),
+                        count,
+                        None,
+                        viewport_height,
+                    );
+                    *self.selection_mut() = new_sel;
+                    let sel_after = self.selection().clone();
+                    self.undo().push(tx, inv, sel_before, sel_after);
+                }
+                self.update_search_matches();
+            }
+            Action::IncrementNumber => self.apply_number_delta(count as i64)?,
+            Action::DecrementNumber => self.apply_number_delta(-(count as i64))?,
             Action::ChangeToEnd => {
                 let rope = self.doc().rope().clone();
                 let (end_sel, _) = Motion::LineEnd.apply_to_selection(
@@ -4590,6 +5167,9 @@ impl<B: Backend> App<B> {
             Action::JumpToMark(c) => {
                 let doc_id = self.current_doc_id();
                 if let Some(pos) = self.marks.get(doc_id, c) {
+                    let current = self.selection().primary().head;
+                    self.jumps
+                        .push(onda_modal::jumplist::JumpPos::new(doc_id, current));
                     let len = self.doc().len_chars();
                     *self.selection_mut() = Selection::point(pos.min(len.saturating_sub(1)));
                 }
@@ -4597,6 +5177,9 @@ impl<B: Backend> App<B> {
             Action::JumpToMarkLine(c) => {
                 let doc_id = self.current_doc_id();
                 if let Some(pos) = self.marks.get(doc_id, c) {
+                    let current = self.selection().primary().head;
+                    self.jumps
+                        .push(onda_modal::jumplist::JumpPos::new(doc_id, current));
                     let doc = self.doc();
                     let line = doc.char_to_line(pos);
                     let line_start = doc.line_to_char(line);
@@ -4874,6 +5457,15 @@ impl<B: Backend> App<B> {
             | Action::PrevBuffer => {}
 
             Action::PendingOperator(_) => {} // handled by KeymapState
+
+            // ── LSP (W36) ───────────────────────────────────────────────────────
+            Action::LspHover => self.lsp_hover(),
+            Action::LspGotoDefinition => self.lsp_goto_definition(),
+            Action::LspReferences => self.lsp_references(),
+            Action::LspRenameStart => self.lsp_rename_start(),
+            Action::LspFormat => self.lsp_format(),
+            Action::LspDocumentSymbol => self.lsp_document_symbol(),
+            Action::LspCodeAction => self.lsp_code_action(),
         }
 
         // Reset goal_col unless a vertical motion just set it
@@ -5004,23 +5596,43 @@ impl<B: Backend> App<B> {
         self.registers.get(name).cloned()
     }
 
+    /// `Ctrl-a`/`Ctrl-x` — adjust the nearest number on the cursor's line by `delta`.
+    fn apply_number_delta(&mut self, delta: i64) -> Result<()> {
+        let (tx, new_head) =
+            onda_modal::operator::increment_number(self.doc(), self.selection(), delta);
+        if !tx.changes.is_empty() {
+            let sel_before = self.selection().clone();
+            let inv = self.doc_mut().apply(&tx)?;
+            if let Some(head) = new_head {
+                *self.selection_mut() = Selection::point(head);
+            }
+            let sel_after = self.selection().clone();
+            self.undo().push(tx, inv, sel_before, sel_after);
+        }
+        self.update_search_matches();
+        Ok(())
+    }
+
     // ── Operator apply ────────────────────────────────────────────────────────
 
     fn apply_operator(&mut self, op: Operator, sel: &Selection, linewise: bool) -> Result<()> {
-        let (tx, reg) = if linewise {
-            onda_modal::operator::delete_lines(self.doc(), sel)
-        } else {
-            onda_modal::operator::delete(self.doc(), sel)
-        };
-
         match op {
             Operator::Yank => {
+                let (_, reg) = if linewise {
+                    onda_modal::operator::delete_lines(self.doc(), sel)
+                } else {
+                    onda_modal::operator::delete(self.doc(), sel)
+                };
                 let reg_name = self.pending_register.take().unwrap_or('"');
                 self.registers.set(reg_name, reg.clone());
                 self.registers.set('"', reg);
-                return Ok(());
             }
             Operator::Delete | Operator::Change => {
+                let (tx, reg) = if linewise {
+                    onda_modal::operator::delete_lines(self.doc(), sel)
+                } else {
+                    onda_modal::operator::delete(self.doc(), sel)
+                };
                 let reg_name = self.pending_register.take().unwrap_or('"');
                 self.registers.set(reg_name, reg.clone());
                 self.registers.set('"', reg);
@@ -5038,6 +5650,47 @@ impl<B: Backend> App<B> {
                 if op == Operator::Change {
                     self.mode = Mode::Insert;
                     self.undo().begin_group();
+                }
+                self.update_search_matches();
+            }
+            Operator::Indent | Operator::Dedent => {
+                let dedent = op == Operator::Dedent;
+                let unit = if self.config.editor.expand_tab {
+                    " ".repeat(self.config.editor.tab_width)
+                } else {
+                    "\t".to_string()
+                };
+                let tx = onda_modal::operator::indent_lines(self.doc(), sel, dedent, &unit);
+                if !tx.changes.is_empty() {
+                    let sel_before = self.selection().clone();
+                    let inv = self.doc_mut().apply(&tx)?;
+                    let new_pos = tx
+                        .changes
+                        .map_pos(sel.primary().head, onda_core::Assoc::After);
+                    let new_pos = new_pos.min(self.doc().len_chars().saturating_sub(1));
+                    *self.selection_mut() = Selection::point(new_pos);
+                    let sel_after = self.selection().clone();
+                    self.undo().push(tx, inv, sel_before, sel_after);
+                }
+                self.update_search_matches();
+            }
+            Operator::Lowercase | Operator::Uppercase | Operator::ToggleCase => {
+                let mode = match op {
+                    Operator::Lowercase => onda_modal::operator::CaseMode::Lower,
+                    Operator::Uppercase => onda_modal::operator::CaseMode::Upper,
+                    _ => onda_modal::operator::CaseMode::Toggle,
+                };
+                let tx = onda_modal::operator::change_case(self.doc(), sel, mode, linewise);
+                if !tx.changes.is_empty() {
+                    let sel_before = self.selection().clone();
+                    let inv = self.doc_mut().apply(&tx)?;
+                    let new_pos = tx
+                        .changes
+                        .map_pos(sel.primary().from(), onda_core::Assoc::After);
+                    let new_pos = new_pos.min(self.doc().len_chars().saturating_sub(1));
+                    *self.selection_mut() = Selection::point(new_pos);
+                    let sel_after = self.selection().clone();
+                    self.undo().push(tx, inv, sel_before, sel_after);
                 }
                 self.update_search_matches();
             }
@@ -5440,6 +6093,7 @@ impl<B: Backend> App<B> {
                     *self.viewport_mut() = Viewport::new();
                     self.message = Message::Info(format!("Loaded: {name}"));
                     self.try_spawn_syntax_worker_for_doc(doc_idx);
+                    self.ensure_lsp_for_doc(doc_idx);
                 }
                 BgMessage::FileError { path, error } => {
                     self.message = Message::Error(format!("{}: {error}", path.display()));
@@ -5638,6 +6292,30 @@ impl<B: Backend> App<B> {
                 let n = self.apply_lsp_edits(doc_idx, &edits);
                 self.message = Message::Info(format!("Format: {n} edit(s) applied"));
             }
+            LspEvent::SymbolResult {
+                request_id: _,
+                symbols,
+            } => {
+                if symbols.is_empty() {
+                    self.message = Message::Info("No symbols found".into());
+                } else {
+                    self.picker = Some(build_symbol_picker(&symbols));
+                    self.picker_kind = PickerKind::LspSymbol;
+                    self.lsp_symbols = symbols;
+                }
+            }
+            LspEvent::CodeActionResult {
+                request_id: _,
+                actions,
+            } => {
+                if actions.is_empty() {
+                    self.message = Message::Info("No code actions available".into());
+                } else {
+                    self.picker = Some(build_code_action_picker(&actions));
+                    self.picker_kind = PickerKind::LspCodeAction;
+                    self.lsp_code_actions = actions;
+                }
+            }
             LspEvent::ServerError {
                 root: _root,
                 message,
@@ -5660,6 +6338,8 @@ impl<B: Backend> App<B> {
                 Ok(doc) => {
                     let idx = self.docs.len();
                     self.docs.push(doc);
+                    self.try_spawn_syntax_worker_for_doc(idx);
+                    self.ensure_lsp_for_doc(idx);
                     idx
                 }
                 Err(e) => {
@@ -5695,6 +6375,9 @@ impl<B: Backend> App<B> {
             }
 
             self.drain_bg_channel();
+            // Checked every tick (not just on keypress) so the debounced flush
+            // still fires once the quiet period elapses during idle polling.
+            self.maybe_flush_lsp_change();
             // On idle (no input this tick), fire plugin cursor-hold/buffer-change
             // once, so plugins react without being polled every frame.
             if !had_event && !self.plugin_idle_fired {
@@ -5920,6 +6603,24 @@ fn load_file_async(path: PathBuf, tx: mpsc::SyncSender<BgMessage>) {
     });
 }
 
+/// Guess an LSP workspace root for `path`: walk up its ancestor directories
+/// looking for a project marker (`Cargo.toml`, `go.mod`, `.git`), falling back
+/// to the process's current directory if none is found. Runs off the main
+/// thread (called from within a spawned async task) since it does blocking
+/// filesystem stats.
+fn lsp_workspace_root(path: &std::path::Path) -> PathBuf {
+    let start = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    for dir in start.ancestors() {
+        if dir.join("Cargo.toml").exists()
+            || dir.join("go.mod").exists()
+            || dir.join(".git").exists()
+        {
+            return dir.to_path_buf();
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
 // ── App constructors ──────────────────────────────────────────────────────────
 
 fn make_app<B: Backend>(
@@ -6016,6 +6717,11 @@ fn make_app<B: Backend>(
         lsp_request_id: 1,
         hover_float: None,
         completion: None,
+        lsp_pending_change: HashMap::new(),
+        lsp_sent_rev: HashMap::new(),
+        lsp_rename_prompt: None,
+        lsp_symbols: Vec::new(),
+        lsp_code_actions: Vec::new(),
         terminal_panes: Vec::new(),
         next_pane_id: 0,
         window_to_pane: HashMap::new(),
@@ -6133,6 +6839,28 @@ fn run_editor(paths: Vec<PathBuf>) -> Result<()> {
 
     // Spawn the syntax worker for the initial (CLI-opened) document.
     app.try_spawn_syntax_worker_for_doc(0);
+
+    // LSP: bridge tokio LspEvent → BgMessage::Lsp, same shape as the DAP bridge
+    // in `dap_run`. The manager itself is cheap/sync to construct (no I/O until
+    // `ensure_server` spawns an actual server), so it's built here rather than
+    // lazily — `App::ensure_lsp_for_doc` (task-tracked as W36 doc-open wiring)
+    // reads `self.lsp_manager` unconditionally once a buffer needs it.
+    {
+        let (lsp_tx, mut lsp_rx) = tokio_mpsc::channel::<LspEvent>(256);
+        let bridge_tx = bg_tx.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = lsp_rx.recv().await {
+                if bridge_tx.try_send(BgMessage::Lsp(ev)).is_err() {
+                    break;
+                }
+            }
+        });
+        app.lsp_manager = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            LspManager::new(lsp_tx.clone()),
+        )));
+        app.lsp_event_tx = Some(lsp_tx);
+    }
+    app.ensure_lsp_for_doc(0);
 
     // Show config warning if any
     if let Some(warn) = config_result.warning {
@@ -6317,6 +7045,53 @@ fn build_command_palette(plugin_cmds: &[String]) -> onda_modal::picker::Picker {
             format!("plugin:{name}"),
         ));
     }
+    p.open(items);
+    p
+}
+
+/// Short icon for a document-symbol kind, mirroring `completion_kind_icon`'s style.
+fn symbol_kind_icon(kind: lsp_types::SymbolKind) -> &'static str {
+    match kind {
+        lsp_types::SymbolKind::FUNCTION | lsp_types::SymbolKind::METHOD => "fn ",
+        lsp_types::SymbolKind::STRUCT | lsp_types::SymbolKind::CLASS => "st ",
+        lsp_types::SymbolKind::INTERFACE => "if ",
+        lsp_types::SymbolKind::ENUM => "en ",
+        lsp_types::SymbolKind::MODULE | lsp_types::SymbolKind::NAMESPACE => "md ",
+        lsp_types::SymbolKind::VARIABLE | lsp_types::SymbolKind::FIELD => "va ",
+        lsp_types::SymbolKind::CONSTANT => "co ",
+        _ => "   ",
+    }
+}
+
+/// Build the `<space>ds` document-symbol picker. Item `value` is the symbol's
+/// index into `App::lsp_symbols` (not its text — display strings aren't unique).
+fn build_symbol_picker(symbols: &[onda_lsp::LspSymbol]) -> onda_modal::picker::Picker {
+    use onda_modal::picker::{Picker, PickerItem};
+    let mut p = Picker::new("Document Symbols");
+    let items: Vec<PickerItem> = symbols
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            PickerItem::new(
+                format!("{}{}", symbol_kind_icon(s.kind), s.name),
+                i.to_string(),
+            )
+        })
+        .collect();
+    p.open(items);
+    p
+}
+
+/// Build the `<space>ca` code-action picker. Item `value` is the action's
+/// index into `App::lsp_code_actions`.
+fn build_code_action_picker(actions: &[onda_lsp::LspCodeAction]) -> onda_modal::picker::Picker {
+    use onda_modal::picker::{Picker, PickerItem};
+    let mut p = Picker::new("Code Actions");
+    let items: Vec<PickerItem> = actions
+        .iter()
+        .enumerate()
+        .map(|(i, a)| PickerItem::new(a.title.clone(), i.to_string()))
+        .collect();
     p.open(items);
     p
 }
@@ -6710,6 +7485,36 @@ fn build_preview_graphic(
     })
 }
 
+/// Screen-column offset (from the row's left edge) of `local_col` — a raw char
+/// offset within `cleaned_line` — under the aligned layout `render_table` draws
+/// (padded column widths joined by `" │ "`, no line-number gutter). Keeps the
+/// terminal cursor on the same cell the table view actually renders it in.
+fn table_cell_screen_col(
+    cleaned_line: &str,
+    dialect: onda_data::Dialect,
+    layout: &onda_data::ColumnLayout,
+    local_col: usize,
+) -> u16 {
+    let spans = onda_data::csv::field_spans(cleaned_line, dialect.delimiter, dialect.quote);
+    let fields = onda_data::parse_fields(cleaned_line, dialect.delimiter, dialect.quote);
+    let idx = onda_data::csv::cell_index_at(&spans, local_col).unwrap_or(0);
+
+    let mut col: usize = layout.widths.iter().take(idx).map(|w| w + 3).sum();
+
+    if let (Some((inner_start, inner_end)), Some(value)) = (
+        onda_data::csv::cell_inner(&spans, idx, cleaned_line, dialect.quote),
+        fields.get(idx),
+    ) {
+        let offset_chars = local_col.clamp(inner_start, inner_end.max(inner_start)) - inner_start;
+        let value_chars: Vec<char> = value.chars().collect();
+        let prefix: String = value_chars[..offset_chars.min(value_chars.len())]
+            .iter()
+            .collect();
+        col += UnicodeWidthStr::width(prefix.as_str());
+    }
+    col as u16
+}
+
 /// Render a CSV/TSV document as an aligned virtual table (view-only; rope untouched).
 /// Header row is pinned at the top; columns are padded to their cached widths with
 /// `│` separators and per-column rainbow tinting; ragged rows are flagged.
@@ -6761,8 +7566,14 @@ fn render_table(
                 if ragged {
                     style = ragged_style;
                 }
-                let padded = format!("{cell:<width$}", width = *width);
-                col = grid.write_str(col, row, &padded, style);
+                // Pad to column display width, not char count (they differ for wide unicode).
+                let cell_display_w = UnicodeWidthStr::width(cell);
+                let padding = width.saturating_sub(cell_display_w);
+                col = grid.write_str(col, row, cell, style);
+                if padding > 0 {
+                    let pad_str = " ".repeat(padding);
+                    col = grid.write_str(col, row, &pad_str, style);
+                }
                 if c + 1 < layout.widths.len() && col < rect.x + rect.width {
                     col = grid.write_str(col, row, " │ ", theme.line_nr());
                 }
@@ -6960,6 +7771,70 @@ fn main() -> Result<()> {
         .collect();
 
     run_editor(paths)
+}
+
+#[cfg(test)]
+mod table_cursor_tests {
+    use super::*;
+
+    fn dialect() -> onda_data::Dialect {
+        onda_data::Dialect {
+            delimiter: ',',
+            quote: '"',
+            has_header: true,
+        }
+    }
+
+    #[test]
+    fn cursor_in_first_column() {
+        let line = "id,name,city";
+        let layout = onda_data::column_layout(&[vec!["id".into(), "name".into(), "city".into()]]);
+        // Cursor at raw offset 1 ('d' in "id") → 1 char into column 0.
+        assert_eq!(table_cell_screen_col(line, dialect(), &layout, 1), 1);
+    }
+
+    #[test]
+    fn cursor_in_second_column_after_separator() {
+        let line = "id,name,city";
+        let layout = onda_data::column_layout(&[vec!["id".into(), "name".into(), "city".into()]]);
+        // Column 0 width 2 + " │ " (3) = 5, then 2 chars into "name".
+        assert_eq!(table_cell_screen_col(line, dialect(), &layout, 5), 5 + 2);
+    }
+
+    #[test]
+    fn cursor_after_wide_cjk_cell_in_earlier_column() {
+        let rows = vec![
+            vec!["id".to_string(), "name".to_string()],
+            vec!["1".to_string(), "李雷".to_string()],
+        ];
+        let layout = onda_data::column_layout(&rows);
+        // Column 0 ("id"/"1") has display width 2; cursor at start of column 1.
+        let line = "1,x";
+        assert_eq!(
+            table_cell_screen_col(line, dialect(), &layout, 2),
+            2 + 3 // width(col0) + " │ " separator, at the very start of col 1
+        );
+    }
+
+    #[test]
+    fn cursor_inside_quoted_field_maps_to_decoded_value() {
+        // Chars: x(0) ,(1) "(2) a(3) ,(4) b(5) "(6) ,(7) y(8).
+        let line = r#"x,"a,b",y"#;
+        let layout = onda_data::column_layout(&[vec!["x".into(), "a,b".into(), "y".into()]]);
+        let col0_width = layout.widths[0];
+
+        // Raw offset 3: cursor right after the opening quote, before 'a' — start of
+        // the decoded value, not counting the quote.
+        assert_eq!(
+            table_cell_screen_col(line, dialect(), &layout, 3),
+            (col0_width + 3) as u16
+        );
+        // Raw offset 4: cursor between 'a' and ',' — one char into the decoded value.
+        assert_eq!(
+            table_cell_screen_col(line, dialect(), &layout, 4),
+            (col0_width + 3 + 1) as u16
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7335,6 +8210,129 @@ mod edit_integration_tests {
     }
 
     #[test]
+    fn shift_right_indents_line() {
+        let mut app = app_with("foo\nbar\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, ">>");
+        assert_eq!(body(&app), "    foo\nbar\n"); // default tab_width = 4
+    }
+
+    #[test]
+    fn shift_left_dedents_line() {
+        let mut app = app_with("    foo\nbar\n");
+        *app.selection_mut() = Selection::point(4); // on "foo"
+        keys(&mut app, "<<");
+        assert_eq!(body(&app), "foo\nbar\n");
+    }
+
+    #[test]
+    fn count_2_shift_right_indents_two_lines() {
+        let mut app = app_with("one\ntwo\nthree\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "2>>");
+        assert_eq!(body(&app), "    one\n    two\nthree\n");
+    }
+
+    #[test]
+    fn shift_right_motion_indents_spanned_lines() {
+        let mut app = app_with("one\ntwo\nthree\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, ">j"); // indent current + next line
+        assert_eq!(body(&app), "    one\n    two\nthree\n");
+    }
+
+    #[test]
+    fn visual_line_shift_right_indents_selection() {
+        let mut app = app_with("one\ntwo\nthree\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "Vj>"); // visual-line select 2 lines, indent
+        assert_eq!(body(&app), "    one\n    two\nthree\n");
+    }
+
+    #[test]
+    fn tilde_toggles_case_and_advances() {
+        let mut app = app_with("abc\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "~");
+        assert_eq!(body(&app), "Abc\n");
+        assert_eq!(head(&app), 1);
+    }
+
+    #[test]
+    fn count_tilde_toggles_multiple_chars() {
+        let mut app = app_with("abcde\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "3~");
+        assert_eq!(body(&app), "ABCde\n");
+        assert_eq!(head(&app), 3);
+    }
+
+    #[test]
+    fn guw_lowercases_word() {
+        let mut app = app_with("FOO bar\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "guw");
+        assert_eq!(body(&app), "foo bar\n");
+    }
+
+    #[test]
+    fn g_upper_w_uppercases_word() {
+        let mut app = app_with("foo bar\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "gUw");
+        assert_eq!(body(&app), "FOO bar\n");
+    }
+
+    #[test]
+    fn g_tilde_w_toggles_word() {
+        let mut app = app_with("Foo bar\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "g~w");
+        assert_eq!(body(&app), "fOO bar\n");
+    }
+
+    #[test]
+    fn guu_lowercases_whole_line() {
+        let mut app = app_with("FOO\nBAR\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "guu");
+        assert_eq!(body(&app), "foo\nBAR\n");
+    }
+
+    #[test]
+    fn g_tilde_iw_toggles_text_object() {
+        let mut app = app_with("Foo bar\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "g~iw");
+        assert_eq!(body(&app), "fOO bar\n");
+    }
+
+    #[test]
+    fn ctrl_a_increments_number_under_cursor() {
+        let mut app = app_with("val 41\n");
+        *app.selection_mut() = Selection::point(4); // '4'
+        app.handle_key(Key::ctrl('a')).unwrap();
+        assert_eq!(body(&app), "val 42\n");
+    }
+
+    #[test]
+    fn ctrl_x_decrements_number_under_cursor() {
+        let mut app = app_with("val 41\n");
+        *app.selection_mut() = Selection::point(4);
+        app.handle_key(Key::ctrl('x')).unwrap();
+        assert_eq!(body(&app), "val 40\n");
+    }
+
+    #[test]
+    fn count_5_ctrl_a_adds_five() {
+        let mut app = app_with("val 41\n");
+        *app.selection_mut() = Selection::point(4);
+        keys(&mut app, "5");
+        app.handle_key(Key::ctrl('a')).unwrap();
+        assert_eq!(body(&app), "val 46\n");
+    }
+
+    #[test]
     fn capital_d_deletes_to_end_of_line() {
         let mut app = app_with("hello world\n");
         *app.selection_mut() = Selection::point(5); // at the space
@@ -7592,7 +8590,10 @@ mod edit_integration_tests {
         assert!(app.sidebar_focused);
         // `<space>p` → command palette (picker) while sidebar is focused.
         keys(&mut app, " p");
-        assert!(app.picker.is_some(), "command palette should open from sidebar");
+        assert!(
+            app.picker.is_some(),
+            "command palette should open from sidebar"
+        );
         // Close the picker.
         app.handle_key(Key::Esc).unwrap();
     }
@@ -8303,5 +9304,1146 @@ mod search_substitute_tests {
         assert_eq!(body(&app), "XXX\n");
         keys(&mut app, "u");
         assert_eq!(body(&app), "aaa\n");
+    }
+
+    // ── Global ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn global_substitutes_only_matching_lines() {
+        let mut app = app_with("foo\nbar\nfoo\nbaz\n");
+        run_cmd(&mut app, "g/foo/s/foo/XXX/");
+        assert_eq!(body(&app), "XXX\nbar\nXXX\nbaz\n");
+    }
+
+    #[test]
+    fn global_with_inner_global_flag_replaces_all_occurrences_per_line() {
+        let mut app = app_with("aa bb aa\ncc\n");
+        run_cmd(&mut app, "g/aa/s/aa/X/g");
+        assert_eq!(body(&app), "X bb X\ncc\n");
+    }
+
+    #[test]
+    fn global_no_match_leaves_buffer_unchanged() {
+        let mut app = app_with("foo\nbar\n");
+        run_cmd(&mut app, "g/zzz/s/foo/X/");
+        assert_eq!(body(&app), "foo\nbar\n");
+    }
+
+    #[test]
+    fn global_is_undoable_as_one_step() {
+        let mut app = app_with("foo\nbar\nfoo\n");
+        run_cmd(&mut app, "g/foo/s/foo/X/");
+        assert_eq!(body(&app), "X\nbar\nX\n");
+        keys(&mut app, "u"); // one undo restores both lines
+        assert_eq!(body(&app), "foo\nbar\nfoo\n");
+    }
+
+    #[test]
+    fn global_alternate_delimiter() {
+        let mut app = app_with("a/b\nc\n");
+        run_cmd(&mut app, "g#a/b#s#a/b#X#");
+        assert_eq!(body(&app), "X\nc\n");
+    }
+}
+
+#[cfg(test)]
+mod keybinding_coverage_tests {
+    use super::*;
+
+    fn app_with(text: &str) -> App<NullBackend> {
+        let (bg_tx, bg_rx) = mpsc::sync_channel(64);
+        let backend = NullBackend::new(120, 40);
+        let (w, h) = backend.size();
+        let compositor = Compositor::new(w, h);
+        let mut doc = Document::new_empty();
+        let cs = onda_core::transaction::ChangeSetBuilder::new(0)
+            .insert(text)
+            .build();
+        doc.apply(&Transaction::new(cs)).unwrap();
+        make_app(
+            doc,
+            backend,
+            compositor,
+            bg_tx,
+            bg_rx,
+            Config::default(),
+            false,
+        )
+    }
+    fn body(app: &App<NullBackend>) -> String {
+        app.doc().rope().to_string()
+    }
+    fn head(app: &App<NullBackend>) -> usize {
+        app.selection().primary().head
+    }
+    fn keys(app: &mut App<NullBackend>, s: &str) {
+        for c in s.chars() {
+            app.handle_key(Key::char(c)).unwrap();
+        }
+    }
+    fn run_cmd(app: &mut App<NullBackend>, cmd: &str) {
+        app.handle_key(Key::char(':')).unwrap();
+        for c in cmd.chars() {
+            app.handle_key(Key::char(c)).unwrap();
+        }
+        app.handle_key(Key::Enter).unwrap();
+    }
+
+    // ── Marks (m{c} / `{c} / '{c}) ────────────────────────────────────────────
+
+    #[test]
+    fn mark_set_and_jump_exact() {
+        let mut app = app_with("one\ntwo\nthree\n");
+        *app.selection_mut() = Selection::point(5); // 'w' of "two"
+        keys(&mut app, "ma"); // set mark a
+        keys(&mut app, "gg"); // jump away
+        assert_eq!(head(&app), 0);
+        keys(&mut app, "`a"); // jump back to the exact position
+        assert_eq!(head(&app), 5);
+    }
+
+    #[test]
+    fn mark_jump_line_goes_to_first_char() {
+        let mut app = app_with("one\ntwo\nthree\n");
+        *app.selection_mut() = Selection::point(5); // col 1 of "two"
+        keys(&mut app, "ma");
+        keys(&mut app, "gg");
+        keys(&mut app, "'a"); // line-wise jump → start of the marked line
+        assert_eq!(head(&app), 4);
+    }
+
+    // ── Macros (q{c} … q, @{c}, @@) ──────────────────────────────────────────
+
+    #[test]
+    fn bare_q_stops_recording_and_excludes_itself() {
+        let mut app = app_with("aaa\nbbb\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "qa"); // start recording into register 'a'
+        assert_eq!(app.macros.is_recording(), Some('a'));
+        keys(&mut app, "x"); // recorded: "aa\nbbb\n"
+        keys(&mut app, "q"); // bare `q` stops recording (vim semantics)
+        assert_eq!(
+            app.macros.is_recording(),
+            None,
+            "bare q must stop an active recording"
+        );
+        assert_eq!(body(&app), "aa\nbbb\n");
+        // The macro must contain only `x`, not the terminating `q`: playing it
+        // back should delete exactly one more char, not attempt to record again.
+        *app.selection_mut() = Selection::point(4); // on "bbb"
+        keys(&mut app, "@a");
+        assert_eq!(body(&app), "aa\nbb\n");
+        assert_eq!(app.macros.is_recording(), None);
+    }
+
+    #[test]
+    fn macro_record_and_replay_at_last_register() {
+        let mut app = app_with("aaa\nbbb\nccc\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "qa");
+        keys(&mut app, "x");
+        keys(&mut app, "q");
+        assert_eq!(body(&app), "aa\nbbb\nccc\n");
+        *app.selection_mut() = Selection::point(4); // "bbb"
+        keys(&mut app, "@a");
+        assert_eq!(body(&app), "aa\nbb\nccc\n");
+        *app.selection_mut() = Selection::point(8); // "ccc"
+        keys(&mut app, "@@"); // replay last-used register
+        assert_eq!(body(&app), "aa\nbb\ncc\n");
+    }
+
+    // ── Registers ("{c}) ─────────────────────────────────────────────────────
+
+    #[test]
+    fn named_register_yank_and_paste() {
+        let mut app = app_with("foo\nbar\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "\"ayy"); // yank line "foo\n" into register a
+        keys(&mut app, "j"); // move to "bar"
+        keys(&mut app, "\"ap"); // paste register a after "bar"
+        assert_eq!(body(&app), "foo\nbar\nfoo\n");
+    }
+
+    // ── Find / till (f/t/F/T) ────────────────────────────────────────────────
+
+    #[test]
+    fn find_and_till_char_motions() {
+        let mut app = app_with("abcdef\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "fd"); // find 'd' forward
+        assert_eq!(head(&app), 3);
+        keys(&mut app, "0");
+        keys(&mut app, "td"); // till 'd' forward (stops one short)
+        assert_eq!(head(&app), 2);
+        keys(&mut app, "$"); // end of line, on 'f'
+        keys(&mut app, "Fb"); // find 'b' backward
+        assert_eq!(head(&app), 1);
+    }
+
+    #[test]
+    fn operator_with_find_motion() {
+        let mut app = app_with("abcdef\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "dtd"); // delete up to (not including) 'd'
+        assert_eq!(body(&app), "def\n");
+    }
+
+    // ── WORD motions (W/B/E) and paragraph motions ({/}) ────────────────────
+
+    #[test]
+    fn big_word_motions() {
+        let mut app = app_with("foo-bar baz\n");
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "W"); // WORD forward: whitespace-delimited → "baz"
+        assert_eq!(head(&app), 8);
+        keys(&mut app, "B");
+        assert_eq!(head(&app), 0);
+    }
+
+    #[test]
+    fn paragraph_motions() {
+        let mut app = app_with("a\nb\n\nc\nd\n");
+        *app.selection_mut() = Selection::point(0);
+        // NOTE: unlike vim (which lands ON the blank separator line), onda's
+        // `}` skips past it to the first line of the next paragraph. Documented
+        // here as the current, actual behavior rather than vim parity.
+        keys(&mut app, "}"); // forward, past the blank line, to "c"
+        assert_eq!(app.doc().char_to_line(head(&app)), 3);
+        // Backward isn't symmetric with forward here: it lands on the *last*
+        // line of the previous paragraph ("b"), not that paragraph's first
+        // line — also a deviation from vim, documented as observed behavior.
+        keys(&mut app, "{");
+        assert_eq!(app.doc().char_to_line(head(&app)), 1);
+    }
+
+    // ── Half-page scroll (C-d / C-u) ─────────────────────────────────────────
+
+    #[test]
+    fn half_page_down_and_up_move_cursor() {
+        let text: String = (0..100).map(|i| format!("line{i}\n")).collect();
+        let mut app = app_with(&text);
+        *app.selection_mut() = Selection::point(0);
+        app.handle_key(Key::ctrl('d')).unwrap();
+        let after_down = app.doc().char_to_line(head(&app));
+        assert!(after_down > 0, "C-d should move the cursor down");
+        app.handle_key(Key::ctrl('u')).unwrap();
+        let after_up = app.doc().char_to_line(head(&app));
+        assert!(after_up < after_down, "C-u should move the cursor back up");
+    }
+
+    // ── Window focus / splits (C-w, :sp, :vsp) ───────────────────────────────
+
+    #[test]
+    fn split_then_focus_next_switches_window() {
+        let mut app = app_with("x\n");
+        assert_eq!(app.windows.len(), 1);
+        run_cmd(&mut app, "sp");
+        assert_eq!(app.windows.len(), 2, ":sp should create a second window");
+        let before = app.focused_window;
+        app.handle_key(Key::ctrl('w')).unwrap();
+        assert_ne!(
+            app.focused_window, before,
+            "C-w should move focus to the other window"
+        );
+    }
+
+    // ── Jump list (C-o / C-i) ────────────────────────────────────────────────
+
+    #[test]
+    fn jumplist_older_returns_to_previous_position() {
+        let mut app = app_with(&(0..50).map(|i| format!("line{i}\n")).collect::<String>());
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "G"); // a "large" jump: document end
+        let after_g = head(&app);
+        assert_ne!(after_g, 0, "G should have moved the cursor");
+        app.handle_key(Key::ctrl('o')).unwrap(); // jump older: back to before G
+        assert_eq!(
+            head(&app),
+            0,
+            "C-o should return to the position before the last jump"
+        );
+        app.handle_key(Key::ctrl('i')).unwrap(); // jump newer: forward again
+        assert_eq!(
+            head(&app),
+            after_g,
+            "C-i should return to the position after the last jump"
+        );
+    }
+
+    // ── Insert mode: CR / Backspace / Delete ─────────────────────────────────
+
+    #[test]
+    fn insert_enter_starts_new_line_at_column_zero() {
+        let mut app = app_with("");
+        keys(&mut app, "i");
+        keys(&mut app, "ab");
+        app.handle_key(Key::Enter).unwrap();
+        assert_eq!(body(&app), "ab\n");
+        assert_eq!(head(&app), 3); // start of the (empty) new line
+        keys(&mut app, "cd");
+        app.handle_key(Key::Esc).unwrap();
+        assert_eq!(body(&app), "ab\ncd");
+    }
+
+    #[test]
+    fn insert_backspace_at_column_zero_joins_lines() {
+        let mut app = app_with("ab\ncd\n");
+        *app.selection_mut() = Selection::point(3); // start of "cd"
+        keys(&mut app, "i");
+        app.handle_key(Key::Backspace).unwrap();
+        assert_eq!(body(&app), "abcd\n");
+        assert_eq!(head(&app), 2); // between 'b' and 'c'
+    }
+
+    #[test]
+    fn insert_delete_at_line_end_joins_next_line() {
+        let mut app = app_with("ab\ncd\n");
+        *app.selection_mut() = Selection::point(2); // right before the newline
+        keys(&mut app, "i");
+        app.handle_key(Key::Delete).unwrap();
+        assert_eq!(body(&app), "abcd\n");
+        assert_eq!(head(&app), 2);
+    }
+
+    // ── Command-line mode: Tab/S-Tab completion ──────────────────────────────
+
+    #[test]
+    fn command_line_tab_completes_command_name() {
+        let mut app = app_with("x\n");
+        keys(&mut app, ":th");
+        app.handle_key(Key::Tab).unwrap();
+        assert_eq!(app.command_line.as_str(), "theme");
+        assert!(app.cmd_completion.is_some());
+        // A completion popup is open: <CR> accepts it (stays in Command mode).
+        app.handle_key(Key::Enter).unwrap();
+        assert_eq!(app.mode, Mode::Command);
+        assert_eq!(app.command_line.as_str(), "theme");
+    }
+
+    #[test]
+    fn command_line_esc_dismisses_completion_before_leaving() {
+        let mut app = app_with("x\n");
+        keys(&mut app, ":th");
+        app.handle_key(Key::Tab).unwrap();
+        assert!(app.cmd_completion.is_some());
+        app.handle_key(Key::Esc).unwrap(); // first Esc: dismiss the popup only
+        assert_eq!(app.mode, Mode::Command);
+        assert!(app.cmd_completion.is_none());
+        app.handle_key(Key::Esc).unwrap(); // second Esc: cancel the command line
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    // ── IDE sidebar: numeric view jump, resize, close ────────────────────────
+
+    #[test]
+    fn sidebar_numeric_view_jump_and_close() {
+        let mut app = app_with("x\n");
+        keys(&mut app, " e"); // open + focus, default Explorer
+        keys(&mut app, "4");
+        assert_eq!(app.sidebar_view, SidebarView::Run);
+        keys(&mut app, "5");
+        assert_eq!(app.sidebar_view, SidebarView::Agent);
+        keys(&mut app, "1");
+        assert_eq!(app.sidebar_view, SidebarView::Explorer);
+        keys(&mut app, "q"); // close the sidebar
+        assert!(!app.sidebar_open);
+        assert!(!app.sidebar_focused);
+    }
+
+    #[test]
+    fn sidebar_resize_keys_grow_and_shrink() {
+        let mut app = app_with("x\n");
+        keys(&mut app, " e");
+        let start = app.sidebar_width;
+        keys(&mut app, ">");
+        assert_eq!(app.sidebar_width, (start + 4).min(80));
+        keys(&mut app, "L");
+        assert_eq!(app.sidebar_width, (start + 8).min(80));
+        keys(&mut app, "<");
+        assert_eq!(app.sidebar_width, (start + 4).min(80));
+        keys(&mut app, "H");
+        assert_eq!(app.sidebar_width, start);
+    }
+
+    // ── DAP function keys (F5/F9/F10/F11/F12) ────────────────────────────────
+
+    #[test]
+    fn f9_toggles_breakpoint_on_saved_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.rs");
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+        let mut app = app_with("");
+        app.open_path_in_buffer(&path);
+        app.handle_key(Key::F(9)).unwrap();
+        assert_eq!(app.breakpoints.get(&path).map(|v| v.len()), Some(1));
+        app.handle_key(Key::F(9)).unwrap(); // toggle off
+        assert_eq!(app.breakpoints.get(&path).map(|v| v.len()), Some(0));
+    }
+
+    #[test]
+    fn dap_control_keys_dispatch_without_active_session() {
+        let mut app = app_with("x\n");
+        for f in [5u8, 10, 11, 12] {
+            app.message = Message::None;
+            app.handle_key(Key::F(f)).unwrap();
+            assert!(
+                matches!(&app.message, Message::Info(m) if m.contains("no active debug session")),
+                "F{f} should reach dap_control and report no session, got {:?}",
+                app.message
+            );
+        }
+    }
+
+    // ── Diff review (:agent-review) ──────────────────────────────────────────
+
+    fn hunk(base_start: usize, base_len: usize, replacement: &[&str]) -> onda_agent::Hunk {
+        onda_agent::Hunk {
+            base_start,
+            base_len,
+            replacement: replacement.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn review_with_two_hunks(app: &mut App<NullBackend>, path: &std::path::Path) {
+        app.review = Some(ReviewState {
+            path: path.to_path_buf(),
+            base: "one\ntwo\n".to_string(),
+            hunks: vec![hunk(0, 1, &["ONE"]), hunk(1, 1, &["TWO"])],
+            accept: vec![true, true],
+            cursor: 0,
+            remaining: vec![],
+        });
+    }
+
+    #[test]
+    fn diff_review_navigate_and_toggle_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut app = app_with("");
+        review_with_two_hunks(&mut app, &path);
+        keys(&mut app, "j"); // move to hunk 1
+        assert_eq!(app.review.as_ref().unwrap().cursor, 1);
+        keys(&mut app, "r"); // reject hunk 1
+        assert!(!app.review.as_ref().unwrap().accept[1]);
+        keys(&mut app, "k"); // back to hunk 0
+        assert_eq!(app.review.as_ref().unwrap().cursor, 0);
+        keys(&mut app, "R"); // reject all
+        assert_eq!(app.review.as_ref().unwrap().accept, vec![false, false]);
+        keys(&mut app, "A"); // accept all
+        assert_eq!(app.review.as_ref().unwrap().accept, vec![true, true]);
+    }
+
+    #[test]
+    fn diff_review_apply_writes_accepted_hunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut app = app_with("");
+        review_with_two_hunks(&mut app, &path);
+        keys(&mut app, "j"); // hunk 1
+        keys(&mut app, "r"); // reject hunk 1, keep hunk 0 accepted
+        app.handle_key(Key::Enter).unwrap(); // apply accepted hunks
+        assert!(app.review.is_none(), "review closes after applying");
+        assert_eq!(body(&app), "ONE\ntwo\n");
+    }
+
+    #[test]
+    fn diff_review_q_cancels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut app = app_with("");
+        review_with_two_hunks(&mut app, &path);
+        keys(&mut app, "q");
+        assert!(app.review.is_none());
+        // File on disk is untouched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+    }
+
+    // ── Ex-commands (`:`) ─────────────────────────────────────────────────────
+
+    #[test]
+    fn ex_commands_are_all_recognized() {
+        // `:terminal`/`:term` spawn a real PTY process and are excluded here — their
+        // parsing is already covered by onda_modal::command's own unit tests.
+        let mut app = app_with("line1\nline2\nline3\n");
+        for cmd in [
+            "noh",
+            "nohlsearch",
+            "ls",
+            "buffers",
+            "zz",
+            "messages",
+            "mes",
+            "theme",
+            "table",
+            "fields",
+            "agent",
+            "agent-export",
+            "agent-review",
+            "DapRun",
+            "DapStop",
+            "DapStack",
+            "DapVars",
+            "DapBreakpoint",
+            "DapEval 1+1",
+            "session save",
+            "session restore",
+            "Format",
+            "lnext",
+            "lprev",
+            "GrammarFetch",
+            "grammars",
+            "bn",
+            "bp",
+        ] {
+            app.message = Message::None;
+            run_cmd(&mut app, cmd);
+            assert_eq!(
+                app.mode,
+                Mode::Normal,
+                "`:{cmd}` should return to Normal mode"
+            );
+            if let Message::Error(e) = &app.message {
+                assert!(
+                    !e.contains("unknown command"),
+                    "`:{cmd}` was not recognized: {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zz_centers_viewport_on_cursor_line() {
+        let text: String = (0..200).map(|i| format!("line{i}\n")).collect();
+        let mut app = app_with(&text);
+        *app.selection_mut() = Selection::point(0);
+        keys(&mut app, "G"); // jump to the last line
+        let line = app.doc().char_to_line(head(&app));
+        run_cmd(&mut app, "zz");
+        let h = app.compositor.buf.current().height().saturating_sub(2) as usize;
+        assert_eq!(app.focused_win().viewport.offset_line, line - h / 2);
+    }
+
+    #[test]
+    fn noh_clears_search_highlight() {
+        let mut app = app_with("foo bar foo\n");
+        keys(&mut app, "/"); // enter search-forward input
+        keys(&mut app, "foo");
+        app.handle_key(Key::Enter).unwrap(); // commit: populates search state + matches
+        assert!(app.search.regex.is_some());
+        assert!(!app.search_matches.is_empty());
+        run_cmd(&mut app, "noh");
+        assert!(app.search.regex.is_none());
+        assert!(app.search_matches.is_empty());
+    }
+
+    #[test]
+    fn split_and_vsplit_ex_commands_create_windows() {
+        let mut app = app_with("x\n");
+        run_cmd(&mut app, "sp");
+        assert_eq!(app.windows.len(), 2);
+        run_cmd(&mut app, "vsp");
+        assert_eq!(app.windows.len(), 3);
+    }
+
+    #[test]
+    fn buffer_next_prev_cycle() {
+        let mut app = app_with("one\n");
+        app.docs.push(Document::new_empty());
+        assert_eq!(app.focused_win().doc_idx, 0);
+        run_cmd(&mut app, "bn");
+        assert_eq!(app.focused_win().doc_idx, 1);
+        run_cmd(&mut app, "bp");
+        assert_eq!(app.focused_win().doc_idx, 0);
+    }
+
+    // ── Command palette scrolling ─────────────────────────────────────────────
+
+    /// Render a frame and return the picker's visible rows as trimmed strings,
+    /// alongside the row index (if any) painted with the "selected" style.
+    fn render_picker_rows(app: &mut App<NullBackend>) -> (Vec<String>, Option<u16>) {
+        app.render_frame().unwrap();
+        let selected_style = app.theme.menu_selected();
+        let grid = app.compositor.buf.current();
+        let (w, h) = (grid.width(), grid.height());
+        let mut rows = Vec::new();
+        let mut selected_row = None;
+        for row in 0..h {
+            let mut line = String::new();
+            let mut row_is_selected = false;
+            for col in 0..w {
+                if let Some(cell) = grid.get(col, row) {
+                    line.push_str(&cell.grapheme);
+                    if cell.style == selected_style {
+                        row_is_selected = true;
+                    }
+                }
+            }
+            if row_is_selected {
+                selected_row = Some(row);
+            }
+            rows.push(line.trim_end().to_string());
+        }
+        (rows, selected_row)
+    }
+
+    #[test]
+    fn command_palette_scrolls_past_first_page() {
+        let mut app = app_with("x\n");
+        keys(&mut app, " p"); // open the command palette
+        let total = app.picker.as_ref().unwrap().filtered_count();
+        assert!(
+            total > 17,
+            "test assumes the palette has more entries than fit on one page, got {total}"
+        );
+
+        // First page: the selected row (item 0) must be visible.
+        let (_, sel_row) = render_picker_rows(&mut app);
+        assert!(
+            sel_row.is_some(),
+            "the selection highlight should be visible on the first page"
+        );
+
+        // Walk all the way to the last item, past the first page's fold.
+        for _ in 0..total - 1 {
+            app.handle_key(Key::char('j')).unwrap();
+        }
+        assert_eq!(app.picker.as_ref().unwrap().selected_index(), total - 1);
+
+        let (rows, sel_row) = render_picker_rows(&mut app);
+        assert!(
+            sel_row.is_some(),
+            "the selection highlight must stay visible when scrolled past the fold \
+             (this is the bug: it used to disappear)"
+        );
+        let last_item = app
+            .picker
+            .as_ref()
+            .unwrap()
+            .selected_item()
+            .unwrap()
+            .display
+            .clone();
+        let last_item_head: String = last_item.chars().take(20).collect();
+        assert!(
+            rows.iter().any(|r| r.contains(last_item_head.trim())),
+            "the last item ({last_item:?}) should be rendered once scrolled to; rows: {rows:#?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod soft_wrap_tests {
+    use super::*;
+
+    fn app_with_size(text: &str, width: u16, height: u16) -> App<NullBackend> {
+        let (bg_tx, bg_rx) = mpsc::sync_channel(64);
+        let backend = NullBackend::new(width, height);
+        let (w, h) = backend.size();
+        let compositor = Compositor::new(w, h);
+        let mut doc = Document::new_empty();
+        let cs = onda_core::transaction::ChangeSetBuilder::new(0)
+            .insert(text)
+            .build();
+        doc.apply(&Transaction::new(cs)).unwrap();
+        make_app(
+            doc,
+            backend,
+            compositor,
+            bg_tx,
+            bg_rx,
+            Config::default(),
+            false,
+        )
+    }
+
+    fn run_cmd(app: &mut App<NullBackend>, cmd: &str) {
+        app.handle_key(Key::char(':')).unwrap();
+        for c in cmd.chars() {
+            app.handle_key(Key::char(c)).unwrap();
+        }
+        app.handle_key(Key::Enter).unwrap();
+    }
+
+    #[test]
+    fn set_wrap_and_nowrap_toggle_the_flag() {
+        let mut app = app_with_size("hello\n", 20, 10);
+        assert!(!app.soft_wrap);
+        run_cmd(&mut app, "set wrap");
+        assert!(app.soft_wrap);
+        run_cmd(&mut app, "set nowrap");
+        assert!(!app.soft_wrap);
+    }
+
+    #[test]
+    fn cursor_moves_to_a_later_row_on_a_wrapped_long_line() {
+        let long_line = "a".repeat(200);
+        let mut app = app_with_size(&format!("{long_line}\n"), 20, 10);
+        run_cmd(&mut app, "set wrap");
+        *app.selection_mut() = Selection::point(100);
+        app.render_frame().unwrap();
+        assert!(
+            app.compositor.cursor_row > 0,
+            "cursor should have wrapped onto a later screen row"
+        );
+    }
+
+    #[test]
+    fn without_wrap_cursor_stays_on_row_zero_for_same_line() {
+        // Regression: soft_wrap defaults to off, so a long line must not wrap —
+        // the cursor stays on row 0 no matter how far into the line it is.
+        let long_line = "a".repeat(200);
+        let mut app = app_with_size(&format!("{long_line}\n"), 20, 10);
+        *app.selection_mut() = Selection::point(100);
+        app.render_frame().unwrap();
+        assert_eq!(app.compositor.cursor_row, 0);
+    }
+
+    #[test]
+    fn wrapped_text_renders_across_multiple_rows() {
+        let mut app = app_with_size("abcdefghijklmnopqrstuvwxyz\n", 10, 5);
+        run_cmd(&mut app, "set wrap");
+        app.render_frame().unwrap();
+        let grid = app.compositor.buf.current();
+        let row0: String = (0..grid.width())
+            .filter_map(|c| grid.get(c, 0).map(|x| x.grapheme.clone()))
+            .collect();
+        let row1: String = (0..grid.width())
+            .filter_map(|c| grid.get(c, 1).map(|x| x.grapheme.clone()))
+            .collect();
+        assert!(
+            row0.contains('a'),
+            "row0 should start the line, got {row0:?}"
+        );
+        assert!(
+            row1.contains('g'),
+            "row1 should hold the wrapped continuation, got {row1:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lsp_lifecycle_tests {
+    use super::*;
+
+    fn app_with(text: &str) -> App<NullBackend> {
+        let (bg_tx, bg_rx) = mpsc::sync_channel(64);
+        let backend = NullBackend::new(120, 40);
+        let (w, h) = backend.size();
+        let compositor = Compositor::new(w, h);
+        let mut doc = Document::new_empty();
+        let cs = onda_core::transaction::ChangeSetBuilder::new(0)
+            .insert(text)
+            .build();
+        doc.apply(&Transaction::new(cs)).unwrap();
+        make_app(
+            doc,
+            backend,
+            compositor,
+            bg_tx,
+            bg_rx,
+            Config::default(),
+            false,
+        )
+    }
+
+    fn body(app: &App<NullBackend>) -> String {
+        app.doc().rope().to_string()
+    }
+
+    // ── lsp_workspace_root (pure — no LSP manager needed) ─────────────────────
+
+    #[test]
+    fn workspace_root_finds_cargo_toml_in_an_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let sub = dir.path().join("src").join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("lib.rs");
+        std::fs::write(&file, "").unwrap();
+
+        let root = lsp_workspace_root(&file);
+        // Canonicalize both sides — tempdir() paths may contain symlinks (e.g.
+        // macOS /var -> /private/var) that ancestor-walking preserves verbatim.
+        assert_eq!(
+            root.canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn workspace_root_prefers_closest_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".git"), "").unwrap(); // outer marker
+        let inner = dir.path().join("crates").join("onda-core");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("Cargo.toml"), "[package]\n").unwrap();
+        let file = inner.join("src.rs");
+        std::fs::write(&file, "").unwrap();
+
+        let root = lsp_workspace_root(&file);
+        assert_eq!(
+            root.canonicalize().unwrap(),
+            inner.canonicalize().unwrap(),
+            "should stop at the nearest marker, not walk past it to the outer .git"
+        );
+    }
+
+    #[test]
+    fn workspace_root_falls_back_to_cwd_when_no_marker_found() {
+        let dir = tempfile::tempdir().unwrap(); // no markers anywhere under it
+        let file = dir.path().join("orphan.rs");
+        std::fs::write(&file, "").unwrap();
+
+        let root = lsp_workspace_root(&file);
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(root.canonicalize().unwrap(), cwd.canonicalize().unwrap());
+    }
+
+    // ── Lifecycle hooks are safe no-ops without a running LspManager ──────────
+    // (the only state reachable in tests/bench — a real server needs a live
+    // process per docs/KNOWN_ISSUES.md, so it isn't E2E-tested here.)
+
+    #[test]
+    fn ensure_lsp_for_doc_noop_without_manager() {
+        let mut app = app_with("fn main() {}\n");
+        assert!(app.lsp_manager.is_none());
+        app.ensure_lsp_for_doc(0); // must not panic
+    }
+
+    #[test]
+    fn ensure_lsp_for_doc_noop_on_unsaved_buffer() {
+        // Even with a manager present, an unsaved buffer (no path) has nothing
+        // to route on — must not panic reaching for a nonexistent extension.
+        let (tx, _rx) = tokio_mpsc::channel(1);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = app_with("fn main() {}\n");
+        app.lsp_manager = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            LspManager::new(tx),
+        )));
+        app.ensure_lsp_for_doc(0);
+    }
+
+    #[test]
+    fn maybe_flush_lsp_change_noop_without_manager() {
+        let mut app = app_with("fn main() {}\n");
+        app.maybe_flush_lsp_change(); // must not panic, no manager to flush to
+        assert!(app.lsp_pending_change.is_empty());
+    }
+
+    #[test]
+    fn maybe_flush_lsp_change_does_not_fire_before_debounce_window() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (tx, _rx) = tokio_mpsc::channel(1);
+        let mut app = app_with("fn main() {}\n");
+        app.lsp_manager = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            LspManager::new(tx),
+        )));
+        let doc_idx = app.focused_win().doc_idx;
+        // Bump rev by applying a no-op-shaped edit.
+        keys(&mut app, "x");
+        app.maybe_flush_lsp_change();
+        // Immediately after the edit we're still inside the debounce window —
+        // nothing should be recorded as "sent" yet.
+        assert!(!app.lsp_sent_rev.contains_key(&doc_idx));
+        assert!(app.lsp_pending_change.contains_key(&doc_idx));
+    }
+
+    fn keys(app: &mut App<NullBackend>, s: &str) {
+        for c in s.chars() {
+            app.handle_key(Key::char(c)).unwrap();
+        }
+    }
+
+    /// A saved-file app (needed since LSP requests route on `doc.path()`) with
+    /// a working (no real server) manager wired in.
+    fn app_with_file(dir: &tempfile::TempDir, text: &str) -> App<NullBackend> {
+        let rt_marker = tokio::runtime::Handle::try_current();
+        assert!(rt_marker.is_ok(), "caller must enter a tokio runtime first");
+        let path = dir.path().join("main.rs");
+        std::fs::write(&path, text).unwrap();
+        let (bg_tx, bg_rx) = mpsc::sync_channel(64);
+        let backend = NullBackend::new(120, 40);
+        let (w, h) = backend.size();
+        let compositor = Compositor::new(w, h);
+        let doc = Document::open(&path).unwrap();
+        let mut app = make_app(
+            doc,
+            backend,
+            compositor,
+            bg_tx,
+            bg_rx,
+            Config::default(),
+            false,
+        );
+        let (tx, _rx) = tokio_mpsc::channel(1);
+        app.lsp_manager = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            LspManager::new(tx),
+        )));
+        app
+    }
+
+    // ── Request-triggering keys/commands (W36) ────────────────────────────────
+    // No real server is running in these tests, so `client_for_mut` always
+    // returns `None` inside the spawned task and the request is silently
+    // skipped — these tests only verify the *triggering* side doesn't panic
+    // and, for the rename prompt, that its own state machine is correct.
+
+    #[test]
+    fn hover_goto_definition_references_do_not_panic_without_a_server() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_file(&dir, "fn main() {}\n");
+        *app.selection_mut() = Selection::point(3);
+        app.handle_key(Key::char('K')).unwrap();
+        keys(&mut app, "gd");
+        keys(&mut app, "gr");
+    }
+
+    #[test]
+    fn format_key_and_command_do_not_panic_without_a_server() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_file(&dir, "fn main(){}\n");
+        keys(&mut app, " F");
+        app.execute_ex_command(ExCommand::Format).unwrap();
+    }
+
+    #[test]
+    fn space_rn_opens_rename_prompt_on_a_saved_buffer() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_file(&dir, "fn main() {}\n");
+        keys(&mut app, " rn");
+        assert!(app.lsp_rename_prompt.is_some());
+    }
+
+    #[test]
+    fn rename_start_on_unsaved_buffer_shows_error_no_prompt() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut app = app_with("fn main() {}\n"); // no path
+        keys(&mut app, " rn");
+        assert!(app.lsp_rename_prompt.is_none());
+        assert!(matches!(app.message, Message::Error(_)));
+    }
+
+    #[test]
+    fn rename_prompt_captures_typed_name_and_esc_cancels() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_file(&dir, "fn main() {}\n");
+        keys(&mut app, " rn");
+        keys(&mut app, "new_name");
+        assert_eq!(
+            app.lsp_rename_prompt.as_ref().map(|p| p.input.as_str()),
+            Some("new_name")
+        );
+        app.handle_key(Key::Esc).unwrap();
+        assert!(app.lsp_rename_prompt.is_none());
+    }
+
+    #[test]
+    fn rename_prompt_backspace_edits_input() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_file(&dir, "fn main() {}\n");
+        keys(&mut app, " rn");
+        keys(&mut app, "abc");
+        app.handle_key(Key::Backspace).unwrap();
+        assert_eq!(
+            app.lsp_rename_prompt.as_ref().map(|p| p.input.as_str()),
+            Some("ab")
+        );
+    }
+
+    #[test]
+    fn rename_prompt_enter_with_empty_input_cancels() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_file(&dir, "fn main() {}\n");
+        keys(&mut app, " rn");
+        app.handle_key(Key::Enter).unwrap();
+        assert!(app.lsp_rename_prompt.is_none());
+        assert!(matches!(app.message, Message::Info(_)));
+    }
+
+    #[test]
+    fn rename_prompt_enter_with_name_fires_request_and_clears_prompt() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_file(&dir, "fn main() {}\n");
+        keys(&mut app, " rn");
+        keys(&mut app, "renamed");
+        app.handle_key(Key::Enter).unwrap();
+        assert!(app.lsp_rename_prompt.is_none());
+    }
+
+    // ── Document-symbol / code-action pickers (W36) ───────────────────────────
+
+    fn lsp_range(sl: u32, sc: u32, el: u32, ec: u32) -> lsp_types::Range {
+        lsp_types::Range {
+            start: lsp_types::Position {
+                line: sl,
+                character: sc,
+            },
+            end: lsp_types::Position {
+                line: el,
+                character: ec,
+            },
+        }
+    }
+
+    #[test]
+    fn symbol_result_opens_picker_with_items() {
+        let mut app = app_with("fn a() {}\nfn b() {}\n");
+        let symbols = vec![
+            onda_lsp::LspSymbol {
+                name: "a".into(),
+                kind: onda_lsp::SymbolKind::FUNCTION,
+                range: lsp_range(0, 3, 0, 4),
+            },
+            onda_lsp::LspSymbol {
+                name: "b".into(),
+                kind: onda_lsp::SymbolKind::FUNCTION,
+                range: lsp_range(1, 3, 1, 4),
+            },
+        ];
+        app.handle_lsp_event(LspEvent::SymbolResult {
+            request_id: 1,
+            symbols,
+        });
+        assert_eq!(app.picker_kind, PickerKind::LspSymbol);
+        assert!(app.picker.as_ref().unwrap().is_visible());
+        assert_eq!(app.picker.as_ref().unwrap().filtered_count(), 2);
+        assert_eq!(app.lsp_symbols.len(), 2);
+    }
+
+    #[test]
+    fn symbol_result_empty_shows_message_no_picker() {
+        let mut app = app_with("x\n");
+        app.handle_lsp_event(LspEvent::SymbolResult {
+            request_id: 1,
+            symbols: vec![],
+        });
+        assert!(app.picker.is_none());
+        assert!(matches!(app.message, Message::Info(_)));
+    }
+
+    #[test]
+    fn selecting_symbol_jumps_cursor_to_its_line() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_file(&dir, "fn a() {}\nfn b() {}\n");
+        let symbols = vec![
+            onda_lsp::LspSymbol {
+                name: "a".into(),
+                kind: onda_lsp::SymbolKind::FUNCTION,
+                range: lsp_range(0, 3, 0, 4),
+            },
+            onda_lsp::LspSymbol {
+                name: "b".into(),
+                kind: onda_lsp::SymbolKind::FUNCTION,
+                range: lsp_range(1, 3, 1, 4),
+            },
+        ];
+        app.handle_lsp_event(LspEvent::SymbolResult {
+            request_id: 1,
+            symbols,
+        });
+        app.handle_key(Key::Enter).unwrap(); // first item ("a") is selected by default
+        let doc = app.doc();
+        let head = app.selection().primary().head;
+        assert_eq!(doc.char_to_line(head), 0);
+        assert_eq!(head - doc.line_to_char(0), 3); // column 3, per range.start
+    }
+
+    #[test]
+    fn code_action_result_opens_picker_with_items() {
+        let mut app = app_with("fn a() {}\n");
+        let actions = vec![onda_lsp::LspCodeAction {
+            title: "Add semicolon".into(),
+            edit: None,
+        }];
+        app.handle_lsp_event(LspEvent::CodeActionResult {
+            request_id: 1,
+            actions,
+        });
+        assert_eq!(app.picker_kind, PickerKind::LspCodeAction);
+        assert_eq!(app.picker.as_ref().unwrap().filtered_count(), 1);
+    }
+
+    #[test]
+    fn code_action_result_empty_shows_message_no_picker() {
+        let mut app = app_with("x\n");
+        app.handle_lsp_event(LspEvent::CodeActionResult {
+            request_id: 1,
+            actions: vec![],
+        });
+        assert!(app.picker.is_none());
+        assert!(matches!(app.message, Message::Info(_)));
+    }
+
+    #[test]
+    // `lsp_types::Uri` has interior mutability (it's the crate's own key type for
+    // `WorkspaceEdit::changes`) — unavoidable when constructing a real value.
+    #[allow(clippy::mutable_key_type)]
+    fn selecting_code_action_with_edit_applies_it() {
+        use std::str::FromStr;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_file(&dir, "hello\n");
+        let path = app.doc().path().unwrap().to_path_buf();
+        let uri = lsp_types::Uri::from_str(&format!("file://{}", path.display())).unwrap();
+        let mut changes = std::collections::HashMap::new();
+        changes.insert(
+            uri,
+            vec![lsp_types::TextEdit {
+                range: lsp_range(0, 0, 0, 1),
+                new_text: "H".to_string(),
+            }],
+        );
+        let actions = vec![onda_lsp::LspCodeAction {
+            title: "Capitalize".into(),
+            edit: Some(lsp_types::WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+        }];
+        app.handle_lsp_event(LspEvent::CodeActionResult {
+            request_id: 1,
+            actions,
+        });
+        app.handle_key(Key::Enter).unwrap();
+        assert_eq!(app.doc().rope().to_string(), "Hello\n");
+    }
+
+    #[test]
+    fn selecting_code_action_without_edit_shows_message() {
+        let mut app = app_with("hello\n");
+        let actions = vec![onda_lsp::LspCodeAction {
+            title: "Command-only action".into(),
+            edit: None,
+        }];
+        app.handle_lsp_event(LspEvent::CodeActionResult {
+            request_id: 1,
+            actions,
+        });
+        app.handle_key(Key::Enter).unwrap();
+        assert_eq!(body(&app), "hello\n"); // unchanged
+        assert!(matches!(app.message, Message::Info(_)));
     }
 }

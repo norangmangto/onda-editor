@@ -41,6 +41,7 @@ fn bench_theme_switch(c: &mut Criterion) {
                 &[],
                 &[],
                 &theme,
+                false,
             );
             black_box(grid.width())
         })

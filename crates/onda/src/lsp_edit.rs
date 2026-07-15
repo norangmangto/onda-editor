@@ -35,6 +35,20 @@ pub fn lsp_pos_to_char(rope: &Rope, line: usize, utf16_col: usize) -> usize {
     line_start + char_off
 }
 
+/// Convert a char offset to an LSP `(line, utf16_col)` position — the inverse
+/// of [`lsp_pos_to_char`]. An out-of-range offset clamps to the document end.
+pub fn char_to_lsp_pos(rope: &Rope, char_idx: usize) -> (usize, usize) {
+    let char_idx = char_idx.min(rope.len_chars());
+    let line = rope.char_to_line(char_idx);
+    let line_start = rope.line_to_char(line);
+    let utf16_col: usize = rope
+        .slice(line_start..char_idx)
+        .chars()
+        .map(|c| c.len_utf16())
+        .sum();
+    (line, utf16_col)
+}
+
 /// Convert an LSP range (`(start_line, start_col)`, `(end_line, end_col)`) to a
 /// `(start_char, end_char)` pair.
 pub fn lsp_range_to_chars(
@@ -113,6 +127,33 @@ mod tests {
         let r = rope("ab\n");
         assert_eq!(lsp_pos_to_char(&r, 9, 0), r.len_chars());
         assert_eq!(lsp_pos_to_char(&r, 0, 99), 2); // clamps to line end (before \n)
+    }
+
+    #[test]
+    fn char_to_lsp_pos_ascii() {
+        let r = rope("hello\nworld\n");
+        assert_eq!(char_to_lsp_pos(&r, 0), (0, 0));
+        assert_eq!(char_to_lsp_pos(&r, 3), (0, 3));
+        assert_eq!(char_to_lsp_pos(&r, 8), (1, 2)); // "wo|rld"
+    }
+
+    #[test]
+    fn char_to_lsp_pos_utf16_astral_roundtrip() {
+        let r = rope("a😀b\n");
+        for char_idx in 0..=3 {
+            let (line, col) = char_to_lsp_pos(&r, char_idx);
+            assert_eq!(
+                lsp_pos_to_char(&r, line, col),
+                char_idx,
+                "roundtrip failed for char_idx {char_idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn char_to_lsp_pos_clamps_past_end() {
+        let r = rope("ab\n");
+        assert_eq!(char_to_lsp_pos(&r, 999), char_to_lsp_pos(&r, r.len_chars()));
     }
 
     fn apply(rope: &Rope, edits: &[(usize, usize, String)]) -> String {

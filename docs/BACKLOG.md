@@ -57,15 +57,24 @@ Items from Phase 0 not yet addressed:
   indefinitely — revisit when crossterm adds first-class support.
 - **Async progressive file loading** (true streaming): T4.2 has basic async loading;
   true progressive streaming deferred to Phase 3.
-- **LSP integration**: deferred to Phase 2 (W10, T10.x).
+- **LSP integration**: `onda-lsp` (W10 core: transport/lifecycle/document-sync/
+  request-manager/server-registry) landed in Phase 2. Binary wiring (spawn on startup,
+  `ensure_server`+`did_open` on file open, debounced `did_change`, and
+  hover/definition/references/rename/format/document-symbol/code-action bound to keys
+  and commands) landed later (Phase 6 W36) — see `docs/KNOWN_ISSUES.md` Fixed section.
+  Remaining gaps (incremental sync, command-only code actions, config-driven server
+  list, signature help/rename-preview/breadcrumb) are tracked in `docs/KNOWN_ISSUES.md`.
 - **Plugin system**: deferred to Phase 2 (W13, T13.x) for Lua foundation.
 
 ## Phase 1 deferrals
 
 Items identified during Phase 1 that were explicitly deferred:
 
-- **Soft/word wrap**: no soft wrap through Phase 1. Horizontal scroll only (T8.3 decision
-  recorded in `docs/DESIGN.md` changelog). Scheduled for T12.2 (Phase 2).
+- **Soft/word wrap**: implemented (`:set wrap`/`:set nowrap`) — character-boundary
+  wrapping via `onda_render::{build_row_layout, locate_in_layout}`, wired through
+  rendering, diagnostics overlay, and cursor placement. Word-boundary (greedy) wrap,
+  and wrap-awareness for plugin decorations/debugger gutter markers, are tracked in
+  `docs/KNOWN_ISSUES.md`.
 - **dylib grammar loading hardening**: T5.1 loads grammars via `libloading` but the
   fresh-machine build experience is rough (no auto-fetch on first open). Partial fix in
   T12.4 (Phase 2 grammar auto-fetch); full prebuilt artifact bundling deferred to Phase 5.

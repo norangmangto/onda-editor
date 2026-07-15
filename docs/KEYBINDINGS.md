@@ -28,6 +28,7 @@ these interactively — until then, this file is the reference.
 | `<PageDown>` `<PageUp>` | half-page down / up |
 | `f{c}` `t{c}` | find / till char forward |
 | `F{c}` `T{c}` | find / till char backward |
+| `%` | jump to the matching `()[]{}` (first bracket at-or-after the cursor on the line) |
 
 ### Editing
 | Key | Action |
@@ -40,13 +41,16 @@ these interactively — until then, this file is the reference.
 | `p` `P` | paste after / before |
 | `J` | join line below |
 | `r{c}` | replace char under cursor with `{c}` |
+| `~` | toggle case of char(s) under cursor (accepts a count) and advance |
+| `<C-a>` `<C-x>` | increment / decrement the nearest number on the line (accepts a count) |
 | `.` | repeat last change (operators + insert) |
 | `u` `<C-r>` | undo / redo |
 | `g-` `g+` | undo-tree older / newer state |
 
 ### Operators (`{op}{motion}` or `{op}{text-object}`)
-`d` delete · `c` change · `y` yank. Double the operator for line-wise (`dd`, `cc`, `yy`).
-Counts apply (`2dd`, `3dw`).
+`d` delete · `c` change · `y` yank · `>` indent · `<` dedent · `gu` lowercase ·
+`gU` uppercase · `g~` toggle case. Double the operator for line-wise (`dd`, `cc`,
+`yy`, `>>`, `<<`, `guu`, `gUU`, `g~~`). Counts apply (`2dd`, `3dw`, `3>>`).
 
 | Example | Effect |
 |---|---|
@@ -55,6 +59,9 @@ Counts apply (`2dd`, `3dw`).
 | `cw` | change word (acts like `ce` on a non-blank) |
 | `yy` `dd` `cc` | yank / delete / change line |
 | `d{textobj}` | operate on a text object (below) |
+| `>>` `<<` | indent / dedent the current line by one shiftwidth |
+| `>j` `>{textobj}` | indent — always line-wise, regardless of the motion's own type |
+| `guw` `gUiw` `g~ap` | lowercase / uppercase / toggle-case over a motion or text object |
 
 ### Text objects (after an operator, or in visual mode)
 Prefix `i` = inner, `a` = around/outer.
@@ -100,6 +107,21 @@ Prefix `i` = inner, `a` = around/outer.
 | `<space>e` | toggle the IDE sidebar (open+focus if closed; close if open) |
 | `<space>p` | command palette (fuzzy) |
 | `<F1>` | keybinding reference (searchable) |
+
+### LSP
+| Key | Action |
+|---|---|
+| `K` | hover info at the cursor |
+| `gd` | go to definition |
+| `gr` | find references (not vim-standard — `gr` is vim's single-char virtual-replace, which onda doesn't implement; matches the coc.nvim/nvim-lspconfig convention instead) |
+| `<space>rn` | start a rename prompt at the cursor (`<CR>` commits, `<Esc>` cancels) |
+| `<space>F` | format the buffer (also `:Format`) |
+| `<space>ds` | document-symbol picker; `<CR>` jumps to the selected symbol |
+| `<space>ca` | code-action picker at the cursor; `<CR>` applies the selected action's edit (command-only actions with no edit are not yet supported) |
+
+Requires a running language server for the buffer's filetype (`rust-analyzer` for
+`.rs`, `gopls` for `.go` today — root auto-detected by walking up for `Cargo.toml`/
+`go.mod`/`.git`). Diagnostic navigation is `:lnext`/`:lprev` (no keybinding yet).
 
 ### Debugger (DAP) function keys
 | Key | Action |
@@ -271,10 +293,12 @@ PDF rasterizer. Preview buffers reject `:w` (they have no text content to save).
 | `:ls` / `:buffers` | list buffers |
 | `:noh` / `:nohlsearch` | clear search highlight |
 | `:[%]s/pat/rep/[g]` | substitute (current line or whole file with `%`) |
+| `:g/pat/cmd` | run `cmd` on every line matching `pat` (whole buffer; only an `s///` sub-command is supported) |
 | `:zz` | center the cursor line |
 | `:messages` / `:mes` | message history |
 | `:theme [name]` | show / switch theme |
 | `:Format` | LSP format the buffer |
+| `:set wrap` / `:set nowrap` | toggle soft (character-boundary) wrap for long lines |
 | `:GrammarFetch` / `:grammars` | fetch tree-sitter grammars |
 | `:terminal` / `:term` | open a terminal pane |
 | `:session save/restore [name]` | persist / restore session |

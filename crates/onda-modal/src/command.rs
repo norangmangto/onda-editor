@@ -39,6 +39,13 @@ pub enum ExCommand {
         flags_global: bool,
         flags_case_insensitive: bool,
     },
+    /// `:g/pattern/cmd` — run `cmd` (an ex command, e.g. `s/.../.../`) on every
+    /// line matching `pattern`. Always scans the whole buffer (vim's `:g` has no
+    /// implicit current-line-only default the way `:s` does).
+    Global {
+        pattern: String,
+        cmd: String,
+    },
     // ── Phase 2 commands ──────────────────────────────────────────────────────
     /// `:terminal` — open a terminal pane.
     Terminal,
@@ -82,6 +89,8 @@ pub enum ExCommand {
     Table,
     /// `:fields` — show the JSONL field schema overlay for the current buffer.
     Fields,
+    /// `:zz` — center the viewport on the cursor line.
+    Zz,
 }
 
 impl ExCommand {
@@ -143,6 +152,25 @@ impl ExCommand {
             }
         }
 
+        // Check for global: g/pattern/cmd
+        {
+            if let Some(after_g) = input.strip_prefix('g') {
+                if let Some(delim) = after_g.chars().next() {
+                    // Same "punctuation delimiter" guard as `:s`, so this doesn't
+                    // swallow `grammars`/`GrammarFetch`/other future `g...` commands.
+                    if !delim.is_alphabetic() && !delim.is_whitespace() {
+                        let parts: Vec<&str> =
+                            after_g[delim.len_utf8()..].splitn(2, delim).collect();
+                        if parts.len() == 2 {
+                            let pattern = parts[0].to_string();
+                            let cmd = parts[1].trim().to_string();
+                            return Ok(ExCommand::Global { pattern, cmd });
+                        }
+                    }
+                }
+            }
+        }
+
         match input {
             "w" => Ok(ExCommand::Write(None)),
             "q" => Ok(ExCommand::Quit { force: false }),
@@ -182,6 +210,7 @@ impl ExCommand {
             }
             "table" | "csv" => Ok(ExCommand::Table),
             "fields" => Ok(ExCommand::Fields),
+            "zz" => Ok(ExCommand::Zz),
             "theme" => Ok(ExCommand::Theme(None)),
             s if s.starts_with("theme ") => {
                 let name = s[6..].trim().to_string();
@@ -355,7 +384,50 @@ mod tests {
 
     #[test]
     fn parse_unknown() {
-        assert!(ExCommand::parse("zz").is_err());
+        assert!(ExCommand::parse("notacommand").is_err());
+    }
+
+    #[test]
+    fn parse_zz() {
+        assert_eq!(ExCommand::parse("zz").unwrap(), ExCommand::Zz);
+    }
+
+    #[test]
+    fn parse_global_substitute() {
+        assert_eq!(
+            ExCommand::parse("g/foo/s/foo/bar/g").unwrap(),
+            ExCommand::Global {
+                pattern: "foo".to_string(),
+                cmd: "s/foo/bar/g".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_global_does_not_swallow_grammars() {
+        assert_eq!(
+            ExCommand::parse("grammars").unwrap(),
+            ExCommand::GrammarFetch
+        );
+    }
+
+    #[test]
+    fn parse_global_does_not_swallow_capital_grammar_fetch() {
+        assert_eq!(
+            ExCommand::parse("GrammarFetch").unwrap(),
+            ExCommand::GrammarFetch
+        );
+    }
+
+    #[test]
+    fn parse_global_alternate_delimiter() {
+        assert_eq!(
+            ExCommand::parse("g#TODO#s#TODO#DONE#").unwrap(),
+            ExCommand::Global {
+                pattern: "TODO".to_string(),
+                cmd: "s#TODO#DONE#".to_string(),
+            }
+        );
     }
 
     #[test]

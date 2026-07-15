@@ -122,6 +122,27 @@ pub enum Action {
     PasteAfter,
     PasteBefore,
     JoinLine,
+    /// `~` — toggle the case of the char(s) under the cursor and advance.
+    ToggleCaseChar,
+    /// `Ctrl-a`/`Ctrl-x` — increment/decrement the nearest number on the line.
+    IncrementNumber,
+    DecrementNumber,
+
+    // LSP (Phase 6 W36 wiring)
+    /// `K` — hover info at the cursor.
+    LspHover,
+    /// `gd` — go to definition.
+    LspGotoDefinition,
+    /// `gr` — find references.
+    LspReferences,
+    /// `<space>rn` — start a rename prompt at the cursor.
+    LspRenameStart,
+    /// `<space>F` — format the buffer (also `:Format`).
+    LspFormat,
+    /// `<space>ds` — document symbol picker.
+    LspDocumentSymbol,
+    /// `<space>ca` — code action picker at the cursor.
+    LspCodeAction,
 
     // Undo/redo
     Undo,
@@ -246,6 +267,7 @@ impl Keymap {
         leaf!(Key::PageDown, Action::Move(Motion::HalfPageDown));
         leaf!(Key::PageUp, Action::Move(Motion::HalfPageUp));
         leaf!(Key::char('G'), Action::Move(Motion::DocumentEnd));
+        leaf!(Key::char('%'), Action::Move(Motion::MatchingBracket));
 
         // 'g' prefix → 'gg', 'g-', 'g+'
         {
@@ -256,6 +278,25 @@ impl Keymap {
             );
             g.insert(Key::char('-'), KeymapNode::Leaf(Action::UndoOlder));
             g.insert(Key::char('+'), KeymapNode::Leaf(Action::UndoNewer));
+            // Case operators: gu{motion}/gU{motion}/g~{motion} (+ guu/gUU/g~~
+            // doubling, handled by the is_double check in `process`).
+            g.insert(
+                Key::char('u'),
+                KeymapNode::Leaf(Action::PendingOperator(Operator::Lowercase)),
+            );
+            g.insert(
+                Key::char('U'),
+                KeymapNode::Leaf(Action::PendingOperator(Operator::Uppercase)),
+            );
+            g.insert(
+                Key::char('~'),
+                KeymapNode::Leaf(Action::PendingOperator(Operator::ToggleCase)),
+            );
+            // LSP: gd go-to-definition, gr references (not vim-standard — `gr`
+            // is vim's single-char virtual-replace, which onda doesn't
+            // implement — but matches the coc.nvim/nvim-lspconfig convention).
+            g.insert(Key::char('d'), KeymapNode::Leaf(Action::LspGotoDefinition));
+            g.insert(Key::char('r'), KeymapNode::Leaf(Action::LspReferences));
             m.insert(Key::char('g'), KeymapNode::Node(g));
         }
 
@@ -266,6 +307,19 @@ impl Keymap {
             sp.insert(Key::char('b'), KeymapNode::Leaf(Action::OpenBufferPicker));
             sp.insert(Key::char('e'), KeymapNode::Leaf(Action::ToggleSidebar));
             sp.insert(Key::char('p'), KeymapNode::Leaf(Action::OpenCommandPalette));
+            sp.insert(Key::char('F'), KeymapNode::Leaf(Action::LspFormat));
+            // <space>rn — rename (mirrors the common LSP-config convention).
+            let mut rename: HashMap<Key, KeymapNode> = HashMap::new();
+            rename.insert(Key::char('n'), KeymapNode::Leaf(Action::LspRenameStart));
+            sp.insert(Key::char('r'), KeymapNode::Node(rename));
+            // <space>ds — document symbol picker.
+            let mut doc_symbol: HashMap<Key, KeymapNode> = HashMap::new();
+            doc_symbol.insert(Key::char('s'), KeymapNode::Leaf(Action::LspDocumentSymbol));
+            sp.insert(Key::char('d'), KeymapNode::Node(doc_symbol));
+            // <space>ca — code action picker.
+            let mut code_action: HashMap<Key, KeymapNode> = HashMap::new();
+            code_action.insert(Key::char('a'), KeymapNode::Leaf(Action::LspCodeAction));
+            sp.insert(Key::char('c'), KeymapNode::Node(code_action));
             m.insert(Key::char(' '), KeymapNode::Node(sp));
         }
 
@@ -274,6 +328,8 @@ impl Keymap {
         leaf!(Key::char('d'), Action::PendingOperator(Operator::Delete));
         leaf!(Key::char('c'), Action::PendingOperator(Operator::Change));
         leaf!(Key::char('y'), Action::PendingOperator(Operator::Yank));
+        leaf!(Key::char('>'), Action::PendingOperator(Operator::Indent));
+        leaf!(Key::char('<'), Action::PendingOperator(Operator::Dedent));
 
         // Immediate edits
         leaf!(Key::char('x'), Action::DeleteChar);
@@ -283,6 +339,10 @@ impl Keymap {
         leaf!(Key::char('p'), Action::PasteAfter);
         leaf!(Key::char('P'), Action::PasteBefore);
         leaf!(Key::char('J'), Action::JoinLine);
+        leaf!(Key::char('~'), Action::ToggleCaseChar);
+        leaf!(Key::ctrl('a'), Action::IncrementNumber);
+        leaf!(Key::ctrl('x'), Action::DecrementNumber);
+        leaf!(Key::char('K'), Action::LspHover);
 
         // Undo/redo
         leaf!(Key::char('u'), Action::Undo);
@@ -321,6 +381,8 @@ impl Keymap {
             ('d', Operator::Delete),
             ('c', Operator::Change),
             ('y', Operator::Yank),
+            ('>', Operator::Indent),
+            ('<', Operator::Dedent),
         ] {
             m.insert(
                 Key::char(ch),
@@ -708,6 +770,11 @@ impl KeymapState {
                 (Operator::Delete, Key::Char('d', _))
                     | (Operator::Change, Key::Char('c', _))
                     | (Operator::Yank, Key::Char('y', _))
+                    | (Operator::Indent, Key::Char('>', _))
+                    | (Operator::Dedent, Key::Char('<', _))
+                    | (Operator::Lowercase, Key::Char('u', _))
+                    | (Operator::Uppercase, Key::Char('U', _))
+                    | (Operator::ToggleCase, Key::Char('~', _))
             );
             if is_double {
                 self.pending_operator = None;
@@ -732,56 +799,64 @@ impl KeymapState {
             return PendingResult::NoMatch;
         }
 
-        // f/t/F/T and other single-char pending keys in motion context
-        match key {
-            Key::Char('f', _) => {
-                self.pending_find = Some(FindKind::Find);
-                return PendingResult::NeedMore;
+        // f/t/F/T and other single-char pending keys in motion context.
+        // Guarded on `pending_keys.is_empty()`: once a multi-key trie sequence
+        // is already in progress (e.g. the `g` or `<space>` prefix), the trie
+        // owns the next key — otherwise e.g. `gr` or `<space>f` would get
+        // hijacked here (as a *fresh* `r`-replace / `f`-find-char) before ever
+        // reaching the trie continuation that actually defines them. Regression:
+        // this used to make `<space>f` (file picker) and `gr` unreachable.
+        if self.pending_keys.is_empty() {
+            match key {
+                Key::Char('f', _) => {
+                    self.pending_find = Some(FindKind::Find);
+                    return PendingResult::NeedMore;
+                }
+                Key::Char('t', _) => {
+                    self.pending_find = Some(FindKind::Till);
+                    return PendingResult::NeedMore;
+                }
+                Key::Char('F', _) => {
+                    self.pending_find = Some(FindKind::FindBack);
+                    return PendingResult::NeedMore;
+                }
+                Key::Char('T', _) => {
+                    self.pending_find = Some(FindKind::TillBack);
+                    return PendingResult::NeedMore;
+                }
+                // Plain `r` starts a replace; Ctrl-r must fall through to the keymap
+                // (Redo), so don't swallow modified variants here.
+                Key::Char('r', m) if !m.contains(KeyMod::CTRL) => {
+                    self.pending_replace = true;
+                    return PendingResult::NeedMore;
+                }
+                Key::Char('q', _) => {
+                    self.pending_macro_reg = true;
+                    return PendingResult::NeedMore;
+                }
+                Key::Char('@', _) => {
+                    // '@' alone → need next char: either '@' (PlayLastMacro) or register char
+                    self.pending_play_reg = true;
+                    return PendingResult::NeedMore;
+                }
+                Key::Char('"', _) => {
+                    self.pending_set_reg = true;
+                    return PendingResult::NeedMore;
+                }
+                Key::Char('m', _) => {
+                    self.pending_mark_set = true;
+                    return PendingResult::NeedMore;
+                }
+                Key::Char('`', _) => {
+                    self.pending_mark_jump = true;
+                    return PendingResult::NeedMore;
+                }
+                Key::Char('\'', _) => {
+                    self.pending_mark_jump_line = true;
+                    return PendingResult::NeedMore;
+                }
+                _ => {}
             }
-            Key::Char('t', _) => {
-                self.pending_find = Some(FindKind::Till);
-                return PendingResult::NeedMore;
-            }
-            Key::Char('F', _) => {
-                self.pending_find = Some(FindKind::FindBack);
-                return PendingResult::NeedMore;
-            }
-            Key::Char('T', _) => {
-                self.pending_find = Some(FindKind::TillBack);
-                return PendingResult::NeedMore;
-            }
-            // Plain `r` starts a replace; Ctrl-r must fall through to the keymap
-            // (Redo), so don't swallow modified variants here.
-            Key::Char('r', m) if !m.contains(KeyMod::CTRL) => {
-                self.pending_replace = true;
-                return PendingResult::NeedMore;
-            }
-            Key::Char('q', _) => {
-                self.pending_macro_reg = true;
-                return PendingResult::NeedMore;
-            }
-            Key::Char('@', _) => {
-                // '@' alone → need next char: either '@' (PlayLastMacro) or register char
-                self.pending_play_reg = true;
-                return PendingResult::NeedMore;
-            }
-            Key::Char('"', _) => {
-                self.pending_set_reg = true;
-                return PendingResult::NeedMore;
-            }
-            Key::Char('m', _) => {
-                self.pending_mark_set = true;
-                return PendingResult::NeedMore;
-            }
-            Key::Char('`', _) => {
-                self.pending_mark_jump = true;
-                return PendingResult::NeedMore;
-            }
-            Key::Char('\'', _) => {
-                self.pending_mark_jump_line = true;
-                return PendingResult::NeedMore;
-            }
-            _ => {}
         }
 
         // Trie lookup
@@ -877,6 +952,7 @@ fn key_to_motion(key: &Key) -> Option<Motion> {
         Key::Char('{', _) => Some(Motion::ParagraphBackward),
         Key::Char('}', _) => Some(Motion::ParagraphForward),
         Key::Char('G', _) => Some(Motion::DocumentEnd),
+        Key::Char('%', _) => Some(Motion::MatchingBracket),
         _ => None,
     }
 }
@@ -1058,6 +1134,272 @@ mod tests {
         assert!(matches!(
             st.process(&Key::char('a'), Mode::Visual, &km),
             PendingResult::Action(Action::SelectTextObj(TextObj::InnerArgument), 1)
+        ));
+    }
+
+    #[test]
+    fn shift_right_doubled_indents_line() {
+        let (mut st, km) = state();
+        assert!(matches!(
+            st.process(&Key::char('>'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('>'), Mode::Normal, &km),
+            PendingResult::Action(Action::OperatorLine(Operator::Indent), 1)
+        ));
+    }
+
+    #[test]
+    fn shift_left_doubled_dedents_line() {
+        let (mut st, km) = state();
+        assert!(matches!(
+            st.process(&Key::char('<'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('<'), Mode::Normal, &km),
+            PendingResult::Action(Action::OperatorLine(Operator::Dedent), 1)
+        ));
+    }
+
+    #[test]
+    fn shift_right_with_count_and_motion() {
+        // `3>j` → indent operator over a motion, count preserved.
+        let (mut st, km) = state();
+        st.process(&Key::char('3'), Mode::Normal, &km);
+        assert!(matches!(
+            st.process(&Key::char('>'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('j'), Mode::Normal, &km),
+            PendingResult::Action(
+                Action::ApplyOperatorMotion(Operator::Indent, Motion::Down),
+                3
+            )
+        ));
+    }
+
+    #[test]
+    fn visual_shift_right_applies_to_selection() {
+        let (mut st, km) = state();
+        assert!(matches!(
+            st.process(&Key::char('>'), Mode::Visual, &km),
+            PendingResult::Action(Action::OperatorSelection(Operator::Indent), 1)
+        ));
+    }
+
+    #[test]
+    fn visual_shift_left_applies_to_selection() {
+        let (mut st, km) = state();
+        assert!(matches!(
+            st.process(&Key::char('<'), Mode::Visual, &km),
+            PendingResult::Action(Action::OperatorSelection(Operator::Dedent), 1)
+        ));
+    }
+
+    #[test]
+    fn space_f_opens_file_picker() {
+        // Regression: the single-char pending-key block (f/t/r/q/@/"/m/`/')
+        // used to run unconditionally, hijacking the 2nd key of *any* multi-key
+        // sequence — so `<space>f` never reached the space-prefix trie node and
+        // instead silently armed a find-char pending state.
+        let (mut st, km) = state();
+        st.process(&Key::char(' '), Mode::Normal, &km);
+        assert!(matches!(
+            st.process(&Key::char('f'), Mode::Normal, &km),
+            PendingResult::Action(Action::OpenFilePicker, 1)
+        ));
+    }
+
+    #[test]
+    fn capital_k_triggers_hover() {
+        let (mut st, km) = state();
+        assert!(matches!(
+            st.process(&Key::char('K'), Mode::Normal, &km),
+            PendingResult::Action(Action::LspHover, 1)
+        ));
+    }
+
+    #[test]
+    fn gd_goes_to_definition() {
+        let (mut st, km) = state();
+        st.process(&Key::char('g'), Mode::Normal, &km);
+        assert!(matches!(
+            st.process(&Key::char('d'), Mode::Normal, &km),
+            PendingResult::Action(Action::LspGotoDefinition, 1)
+        ));
+    }
+
+    #[test]
+    fn gr_finds_references() {
+        let (mut st, km) = state();
+        st.process(&Key::char('g'), Mode::Normal, &km);
+        assert!(matches!(
+            st.process(&Key::char('r'), Mode::Normal, &km),
+            PendingResult::Action(Action::LspReferences, 1)
+        ));
+    }
+
+    #[test]
+    fn space_rn_starts_rename() {
+        let (mut st, km) = state();
+        st.process(&Key::char(' '), Mode::Normal, &km);
+        st.process(&Key::char('r'), Mode::Normal, &km);
+        assert!(matches!(
+            st.process(&Key::char('n'), Mode::Normal, &km),
+            PendingResult::Action(Action::LspRenameStart, 1)
+        ));
+    }
+
+    #[test]
+    fn space_capital_f_formats() {
+        let (mut st, km) = state();
+        st.process(&Key::char(' '), Mode::Normal, &km);
+        assert!(matches!(
+            st.process(&Key::char('F'), Mode::Normal, &km),
+            PendingResult::Action(Action::LspFormat, 1)
+        ));
+    }
+
+    #[test]
+    fn space_ds_opens_document_symbol_picker() {
+        let (mut st, km) = state();
+        st.process(&Key::char(' '), Mode::Normal, &km);
+        st.process(&Key::char('d'), Mode::Normal, &km);
+        assert!(matches!(
+            st.process(&Key::char('s'), Mode::Normal, &km),
+            PendingResult::Action(Action::LspDocumentSymbol, 1)
+        ));
+    }
+
+    #[test]
+    fn space_ca_opens_code_action_picker() {
+        let (mut st, km) = state();
+        st.process(&Key::char(' '), Mode::Normal, &km);
+        st.process(&Key::char('c'), Mode::Normal, &km);
+        assert!(matches!(
+            st.process(&Key::char('a'), Mode::Normal, &km),
+            PendingResult::Action(Action::LspCodeAction, 1)
+        ));
+    }
+
+    #[test]
+    fn ctrl_a_increments_number() {
+        let (mut st, km) = state();
+        assert!(matches!(
+            st.process(&Key::ctrl('a'), Mode::Normal, &km),
+            PendingResult::Action(Action::IncrementNumber, 1)
+        ));
+    }
+
+    #[test]
+    fn ctrl_x_decrements_number() {
+        let (mut st, km) = state();
+        assert!(matches!(
+            st.process(&Key::ctrl('x'), Mode::Normal, &km),
+            PendingResult::Action(Action::DecrementNumber, 1)
+        ));
+    }
+
+    #[test]
+    fn count_5_ctrl_a_preserves_count() {
+        let (mut st, km) = state();
+        st.process(&Key::char('5'), Mode::Normal, &km);
+        assert!(matches!(
+            st.process(&Key::ctrl('a'), Mode::Normal, &km),
+            PendingResult::Action(Action::IncrementNumber, 5)
+        ));
+    }
+
+    #[test]
+    fn tilde_toggles_case_immediately() {
+        let (mut st, km) = state();
+        assert!(matches!(
+            st.process(&Key::char('~'), Mode::Normal, &km),
+            PendingResult::Action(Action::ToggleCaseChar, 1)
+        ));
+    }
+
+    #[test]
+    fn guw_lowercases_word() {
+        let (mut st, km) = state();
+        assert!(matches!(
+            st.process(&Key::char('g'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('u'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('w'), Mode::Normal, &km),
+            PendingResult::Action(
+                Action::ApplyOperatorMotion(Operator::Lowercase, Motion::WordForward),
+                1
+            )
+        ));
+    }
+
+    #[test]
+    fn guu_doubled_lowercases_line() {
+        let (mut st, km) = state();
+        st.process(&Key::char('g'), Mode::Normal, &km);
+        assert!(matches!(
+            st.process(&Key::char('u'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('u'), Mode::Normal, &km),
+            PendingResult::Action(Action::OperatorLine(Operator::Lowercase), 1)
+        ));
+    }
+
+    #[test]
+    fn g_upper_upper_doubled_uppercases_line() {
+        let (mut st, km) = state();
+        st.process(&Key::char('g'), Mode::Normal, &km);
+        assert!(matches!(
+            st.process(&Key::char('U'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('U'), Mode::Normal, &km),
+            PendingResult::Action(Action::OperatorLine(Operator::Uppercase), 1)
+        ));
+    }
+
+    #[test]
+    fn g_tilde_tilde_doubled_toggles_line() {
+        let (mut st, km) = state();
+        st.process(&Key::char('g'), Mode::Normal, &km);
+        assert!(matches!(
+            st.process(&Key::char('~'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('~'), Mode::Normal, &km),
+            PendingResult::Action(Action::OperatorLine(Operator::ToggleCase), 1)
+        ));
+    }
+
+    #[test]
+    fn g_tilde_textobj_inner_word() {
+        // `g~iw` — case-toggle operator over a text object.
+        let (mut st, km) = state();
+        st.process(&Key::char('g'), Mode::Normal, &km);
+        st.process(&Key::char('~'), Mode::Normal, &km);
+        assert!(matches!(
+            st.process(&Key::char('i'), Mode::Normal, &km),
+            PendingResult::NeedMore
+        ));
+        assert!(matches!(
+            st.process(&Key::char('w'), Mode::Normal, &km),
+            PendingResult::Action(
+                Action::ApplyOperatorTextObj(Operator::ToggleCase, TextObj::InnerWord),
+                1
+            )
         ));
     }
 }

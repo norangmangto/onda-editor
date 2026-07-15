@@ -32,6 +32,7 @@ pub enum Motion {
     ParagraphBackward,  // {
     HalfPageDown,       // Ctrl-d
     HalfPageUp,         // Ctrl-u
+    MatchingBracket,    // %
 }
 
 impl Motion {
@@ -47,6 +48,7 @@ impl Motion {
                 | Motion::LineEnd
                 | Motion::FindChar(_)
                 | Motion::TillChar(_)
+                | Motion::MatchingBracket
         )
     }
 
@@ -115,6 +117,7 @@ impl Motion {
                 goal_col,
                 viewport_height,
             ),
+            Motion::MatchingBracket => (matching_bracket(rope, range), None),
         }
     }
 
@@ -418,6 +421,73 @@ fn find_char(
     }
 }
 
+/// Bracket pairs recognized by `%`.
+const BRACKET_PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+
+/// `%` — jump to the bracket matching the first `()[]{}` at-or-after the cursor
+/// on the current line, depth-counting through nested pairs. No-op if the line
+/// has no bracket or the match is unbalanced.
+fn matching_bracket(rope: &Rope, range: Range) -> Range {
+    let pos = range.head;
+    let len = rope.len_chars();
+    if pos >= len {
+        return range;
+    }
+    let line = rope.char_to_line(pos);
+    let line_end = line_end_char(rope, line);
+
+    let mut start = None;
+    let mut i = pos;
+    while i <= line_end && i < len {
+        let c = rope.char(i);
+        if BRACKET_PAIRS.iter().any(|(o, cl)| *o == c || *cl == c) {
+            start = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let Some(start) = start else {
+        return range;
+    };
+    let start_char = rope.char(start);
+
+    if let Some((open, close)) = BRACKET_PAIRS.iter().find(|(o, _)| *o == start_char) {
+        let mut depth = 0i32;
+        let mut j = start;
+        while j < len {
+            let c = rope.char(j);
+            if c == *open {
+                depth += 1;
+            } else if c == *close {
+                depth -= 1;
+                if depth == 0 {
+                    return Range::point(j);
+                }
+            }
+            j += 1;
+        }
+        range
+    } else if let Some((open, close)) = BRACKET_PAIRS.iter().find(|(_, cl)| *cl == start_char) {
+        let mut depth = 0i32;
+        let mut j = start as isize;
+        while j >= 0 {
+            let c = rope.char(j as usize);
+            if c == *close {
+                depth += 1;
+            } else if c == *open {
+                depth -= 1;
+                if depth == 0 {
+                    return Range::point(j as usize);
+                }
+            }
+            j -= 1;
+        }
+        range
+    } else {
+        range
+    }
+}
+
 fn paragraph_forward(rope: &Rope, range: Range, count: usize) -> Range {
     let mut line = rope.char_to_line(range.head);
     let total_lines = rope.len_lines();
@@ -578,5 +648,65 @@ mod tests {
                 .head,
             2
         );
+    }
+
+    #[test]
+    fn matching_bracket_forward_paren() {
+        let r = rope("foo(bar)\n");
+        // cursor on 'f' (before the paren) → % finds '(' then its ')'
+        let result = Motion::MatchingBracket.apply(&r, pt(0), 1, None, 10);
+        assert_eq!(result.0.head, 7); // ')'
+    }
+
+    #[test]
+    fn matching_bracket_backward_paren() {
+        let r = rope("foo(bar)\n");
+        let result = Motion::MatchingBracket.apply(&r, pt(7), 1, None, 10); // on ')'
+        assert_eq!(result.0.head, 3); // '('
+    }
+
+    #[test]
+    fn matching_bracket_nested() {
+        let r = rope("a(b[c]d)e\n");
+        // on outer '(' at 1 → matches outer ')' at 7, not the inner ']'
+        let result = Motion::MatchingBracket.apply(&r, pt(1), 1, None, 10);
+        assert_eq!(result.0.head, 7);
+        // on inner '[' at 3 → matches inner ']' at 5
+        let result = Motion::MatchingBracket.apply(&r, pt(3), 1, None, 10);
+        assert_eq!(result.0.head, 5);
+    }
+
+    #[test]
+    fn matching_bracket_braces_and_brackets() {
+        let r = rope("{ [1, 2] }\n");
+        assert_eq!(
+            Motion::MatchingBracket.apply(&r, pt(0), 1, None, 10).0.head,
+            9
+        );
+        assert_eq!(
+            Motion::MatchingBracket.apply(&r, pt(2), 1, None, 10).0.head,
+            7
+        );
+    }
+
+    #[test]
+    fn matching_bracket_scans_forward_on_line() {
+        let r = rope("x = (1 + 2)\n");
+        // cursor at 0 ('x'), no bracket until col 4 → still finds it.
+        let result = Motion::MatchingBracket.apply(&r, pt(0), 1, None, 10);
+        assert_eq!(result.0.head, 10); // ')'
+    }
+
+    #[test]
+    fn matching_bracket_no_bracket_on_line_is_noop() {
+        let r = rope("no brackets here\n");
+        let result = Motion::MatchingBracket.apply(&r, pt(3), 1, None, 10);
+        assert_eq!(result.0.head, 3);
+    }
+
+    #[test]
+    fn matching_bracket_is_inclusive() {
+        assert!(Motion::MatchingBracket.is_inclusive());
+        assert!(!Motion::MatchingBracket.is_linewise());
     }
 }

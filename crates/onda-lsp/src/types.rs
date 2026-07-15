@@ -46,6 +46,27 @@ impl LspDiagnostic {
     }
 }
 
+/// A flattened document symbol. `DocumentSymbolResponse::Nested` (hierarchical
+/// `DocumentSymbol` with `children`) is flattened into a single list — good
+/// enough for a jump-to-symbol picker, which doesn't need the tree structure.
+#[derive(Debug, Clone)]
+pub struct LspSymbol {
+    pub name: String,
+    pub kind: lsp_types::SymbolKind,
+    /// The range to jump to (`DocumentSymbol::selection_range` /
+    /// `SymbolInformation::location.range`).
+    pub range: Range,
+}
+
+/// A code action with a directly-applicable edit. `CodeActionOrCommand::Command`
+/// (a server-side command with no `edit`) is filtered out before this type is
+/// constructed — executing arbitrary server commands is a BACKLOG follow-up.
+#[derive(Debug, Clone)]
+pub struct LspCodeAction {
+    pub title: String,
+    pub edit: Option<lsp_types::WorkspaceEdit>,
+}
+
 /// Events emitted from the LSP background worker to the main loop.
 #[derive(Debug, Clone)]
 pub enum LspEvent {
@@ -85,6 +106,16 @@ pub enum LspEvent {
     FormattingResult {
         request_id: u64,
         edits: Vec<lsp_types::TextEdit>,
+    },
+    /// Document symbol response arrived.
+    SymbolResult {
+        request_id: u64,
+        symbols: Vec<LspSymbol>,
+    },
+    /// Code action response arrived.
+    CodeActionResult {
+        request_id: u64,
+        actions: Vec<LspCodeAction>,
     },
     /// Server died or crashed.
     ServerError { root: PathBuf, message: String },

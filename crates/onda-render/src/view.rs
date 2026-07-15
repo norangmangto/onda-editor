@@ -89,6 +89,11 @@ impl Viewport {
                 cursor_line + self.scrolloff + 1 - viewport_height.min(cursor_line + 1);
         }
     }
+
+    /// Center the viewport vertically on `cursor_line` (vim's `zz`).
+    pub fn center_on(&mut self, cursor_line: usize, viewport_height: usize) {
+        self.offset_line = cursor_line.saturating_sub(viewport_height / 2);
+    }
 }
 
 impl Default for Viewport {
@@ -138,6 +143,137 @@ impl<'a> HlCursor<'a> {
     }
 }
 
+// ── Row layout (soft wrap) ──────────────────────────────────────────────────────
+
+/// One screen row's worth of a document line. Without soft wrap every row is a
+/// whole line (`seg_start = 0`, `seg_len` = the full line, `continuation =
+/// false`) — identical to the pre-wrap 1:1 `doc_line = offset_line + row`
+/// mapping. With soft wrap a long line is split into multiple consecutive
+/// `RowSlice`s; every row after the first for a given line has `continuation
+/// = true` (used to blank the line-number gutter on those rows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowSlice {
+    pub doc_line: usize,
+    /// Char offset into the line where this segment starts.
+    pub seg_start: usize,
+    /// Number of chars in this segment.
+    pub seg_len: usize,
+    pub continuation: bool,
+}
+
+/// Split one line into `(seg_start, seg_len)` segments that each fit within
+/// `text_width` display cells (wide/CJK chars count as 2, matching
+/// `Document::char_to_display_col`). Character-boundary wrapping only — no
+/// word-boundary (greedy) wrapping. Always returns at least one segment, even
+/// for an empty line.
+fn wrap_line_segments(doc: &Document, line: usize, text_width: usize) -> Vec<(usize, usize)> {
+    let line_start = doc.line_to_char(line);
+    let line_len = doc.line_len_no_eol(line);
+    if line_len == 0 || text_width == 0 {
+        return vec![(0, line_len)];
+    }
+    let rope = doc.rope();
+    let line_slice = rope.slice(line_start..line_start + line_len);
+
+    let mut segments = Vec::new();
+    let mut seg_start = 0usize;
+    let mut width_acc = 0usize;
+    let mut count = 0usize;
+    for (i, ch) in line_slice.chars().enumerate() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+        if width_acc + w > text_width && count > 0 {
+            segments.push((seg_start, count));
+            seg_start = i;
+            width_acc = 0;
+            count = 0;
+        }
+        width_acc += w;
+        count += 1;
+    }
+    segments.push((seg_start, count));
+    segments
+}
+
+/// Build the `height`-row layout for the visible window starting at
+/// `viewport.offset_line`. With `soft_wrap` off this is exactly the old 1:1
+/// `doc_line = offset_line + row` mapping; with it on, long lines expand into
+/// multiple rows via [`wrap_line_segments`]. Stops early (fewer than `height`
+/// rows) at end of document — callers render `~` for the remainder, as before.
+pub fn build_row_layout(
+    doc: &Document,
+    viewport: &Viewport,
+    height: u16,
+    text_width: usize,
+    soft_wrap: bool,
+) -> Vec<RowSlice> {
+    let total_lines = doc.len_lines();
+    let mut rows = Vec::with_capacity(height as usize);
+    let mut doc_line = viewport.offset_line;
+    while rows.len() < height as usize && doc_line < total_lines {
+        if soft_wrap {
+            for (idx, (seg_start, seg_len)) in wrap_line_segments(doc, doc_line, text_width)
+                .into_iter()
+                .enumerate()
+            {
+                if rows.len() >= height as usize {
+                    break;
+                }
+                rows.push(RowSlice {
+                    doc_line,
+                    seg_start,
+                    seg_len,
+                    continuation: idx > 0,
+                });
+            }
+        } else {
+            rows.push(RowSlice {
+                doc_line,
+                seg_start: 0,
+                seg_len: doc.line_len_no_eol(doc_line),
+                continuation: false,
+            });
+        }
+        doc_line += 1;
+    }
+    rows
+}
+
+/// Locate `char_idx` within a row layout: returns `(row_index, display_col)`
+/// (display_col accounts for wide/CJK chars, matching the render loop's `col`
+/// advance). A non-final segment of a wrapped line is exclusive of its end
+/// (that position belongs to the *next* row); the line's last segment is
+/// inclusive (matches the unwrapped "cursor after the last char" position).
+pub fn locate_in_layout(
+    rows: &[RowSlice],
+    doc: &Document,
+    char_idx: usize,
+) -> Option<(usize, usize)> {
+    for (i, row) in rows.iter().enumerate() {
+        let line_start = doc.line_to_char(row.doc_line);
+        let seg_char_start = line_start + row.seg_start;
+        let seg_char_end = seg_char_start + row.seg_len;
+        let is_last_segment_of_line = rows
+            .get(i + 1)
+            .map(|n| n.doc_line != row.doc_line)
+            .unwrap_or(true);
+        let in_row = if is_last_segment_of_line {
+            char_idx >= seg_char_start && char_idx <= seg_char_end
+        } else {
+            char_idx >= seg_char_start && char_idx < seg_char_end
+        };
+        if in_row {
+            let col: usize = doc
+                .rope()
+                .slice(seg_char_start..char_idx)
+                .chars()
+                .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
+                .sum();
+            return Some((i, col));
+        }
+    }
+    None
+}
+
 /// Renders the document content into a grid region.
 pub struct DocumentView;
 
@@ -159,17 +295,16 @@ impl DocumentView {
         highlights: &[HlSpan],
         search_matches: &[onda_core::Range],
         theme: &Theme,
+        soft_wrap: bool,
     ) {
         let text_col_start = viewport.line_nr_width;
         let text_width = grid.width().saturating_sub(text_col_start) as usize;
-        let total_lines = doc.len_lines();
         let mut hl = HlCursor::new(highlights);
+        let rows = build_row_layout(doc, viewport, height, text_width, soft_wrap);
 
         for screen_row in 0..height {
-            let doc_line = viewport.offset_line + screen_row as usize;
             let abs_row = row_offset + screen_row;
-
-            if doc_line >= total_lines {
+            let Some(row) = rows.get(screen_row as usize) else {
                 grid.set(
                     0,
                     abs_row,
@@ -177,38 +312,52 @@ impl DocumentView {
                 );
                 grid.fill_rect(1, abs_row, grid.width() - 1, 1, Style::RESET);
                 continue;
-            }
+            };
+            let doc_line = row.doc_line;
 
             if viewport.line_nr_width > 0 {
-                let is_cursor_line = sel
-                    .ranges()
-                    .iter()
-                    .any(|r| doc.char_to_line(r.head) == doc_line);
-                let nr_style = if is_cursor_line {
-                    theme.line_nr_current()
+                if row.continuation {
+                    grid.fill_rect(0, abs_row, viewport.line_nr_width, 1, theme.line_nr());
                 } else {
-                    theme.line_nr()
-                };
-                let nr_str = format!(
-                    "{:>width$} ",
-                    doc_line + 1,
-                    width = (viewport.line_nr_width as usize).saturating_sub(1)
-                );
-                grid.write_str(0, abs_row, &nr_str, nr_style);
+                    let is_cursor_line = sel
+                        .ranges()
+                        .iter()
+                        .any(|r| doc.char_to_line(r.head) == doc_line);
+                    let nr_style = if is_cursor_line {
+                        theme.line_nr_current()
+                    } else {
+                        theme.line_nr()
+                    };
+                    let nr_str = format!(
+                        "{:>width$} ",
+                        doc_line + 1,
+                        width = (viewport.line_nr_width as usize).saturating_sub(1)
+                    );
+                    grid.write_str(0, abs_row, &nr_str, nr_style);
+                }
             }
 
             let line_start_char = doc.line_to_char(doc_line);
-            let line_len = doc.line_len_no_eol(doc_line);
-            let line_rope = doc
-                .rope()
-                .slice(line_start_char..line_start_char + line_len);
-            let line_str: String = line_rope
-                .chars()
-                .skip(viewport.offset_col)
-                .take(text_width)
-                .collect();
+            let seg_start_char = line_start_char + row.seg_start;
+            let line_str: String = if soft_wrap {
+                doc.rope()
+                    .slice(seg_start_char..seg_start_char + row.seg_len)
+                    .to_string()
+            } else {
+                let line_len = doc.line_len_no_eol(doc_line);
+                doc.rope()
+                    .slice(line_start_char..line_start_char + line_len)
+                    .chars()
+                    .skip(viewport.offset_col)
+                    .take(text_width)
+                    .collect()
+            };
 
-            let row_char_start = line_start_char + viewport.offset_col;
+            let row_char_start = if soft_wrap {
+                seg_start_char
+            } else {
+                line_start_char + viewport.offset_col
+            };
             let mut col = text_col_start;
 
             for (i, ch) in line_str.chars().enumerate() {
@@ -374,6 +523,7 @@ impl DocumentView {
         search_matches: &[onda_core::Range],
         diagnostics: &[DiagnosticSpan],
         theme: &Theme,
+        soft_wrap: bool,
     ) {
         // Render base content first
         Self::render_with_highlights(
@@ -387,22 +537,27 @@ impl DocumentView {
             highlights,
             search_matches,
             theme,
+            soft_wrap,
         );
 
-        // Overlay diagnostic underlines
+        // Overlay diagnostic underlines — reuse the identical (deterministic)
+        // row layout so a wrapped line's underline lands on the right sub-row.
         let text_col_start = viewport.line_nr_width;
+        let text_width = grid.width().saturating_sub(text_col_start) as usize;
+        let rows = build_row_layout(doc, viewport, height, text_width, soft_wrap);
         for screen_row in 0..height {
-            let doc_line = viewport.offset_line + screen_row as usize;
             let abs_row = row_offset + screen_row;
-            if doc_line >= doc.len_lines() {
+            let Some(row) = rows.get(screen_row as usize) else {
                 continue;
-            }
-            let line_start = doc.line_to_char(doc_line);
-            let line_len = doc.line_len_no_eol(doc_line);
+            };
+            let doc_line = row.doc_line;
+            let line_start_all = doc.line_to_char(doc_line);
+            let seg_start = line_start_all + row.seg_start;
+            let seg_end = seg_start + row.seg_len;
 
             for span in diagnostics {
-                // Skip spans that don't overlap this line
-                if span.to <= line_start || span.from >= line_start + line_len {
+                // Skip spans that don't overlap this row's segment.
+                if span.to <= seg_start || span.from >= seg_end {
                     continue;
                 }
                 let span_style = match span.severity {
@@ -410,8 +565,8 @@ impl DocumentView {
                     1 => theme.diag_warning(),
                     _ => theme.diag_info(),
                 };
-                // Add gutter sign in the line-number column
-                if viewport.line_nr_width >= 2 {
+                // Add gutter sign in the line-number column (first segment only).
+                if viewport.line_nr_width >= 2 && !row.continuation {
                     let sign = match span.severity {
                         0 => "E",
                         1 => "W",
@@ -424,11 +579,17 @@ impl DocumentView {
                     };
                     grid.write_str(0, abs_row, sign, gutter_style);
                 }
-                // Underline the span columns
-                let col_from = span.from.max(line_start) - line_start;
-                let col_to = (span.to.min(line_start + line_len)) - line_start;
-                let visible_from = col_from.saturating_sub(viewport.offset_col);
-                let visible_to = col_to.saturating_sub(viewport.offset_col);
+                // Underline the span columns within this segment.
+                let col_from = span.from.max(seg_start) - seg_start;
+                let col_to = span.to.min(seg_end) - seg_start;
+                let (visible_from, visible_to) = if soft_wrap {
+                    (col_from, col_to)
+                } else {
+                    (
+                        col_from.saturating_sub(viewport.offset_col),
+                        col_to.saturating_sub(viewport.offset_col),
+                    )
+                };
                 for col_idx in visible_from..visible_to {
                     let screen_col = text_col_start + col_idx as u16;
                     if screen_col >= grid.width() {
@@ -1142,6 +1303,7 @@ mod tests {
             &spans,
             &[],
             &theme,
+            false,
         );
         // Cell at col 0 ('f') carries the keyword fg; col 3 ('m') does not.
         assert_eq!(grid.get(0, 0).unwrap().style.fg, kw.fg);
@@ -1170,6 +1332,7 @@ mod tests {
             &[],
             &[],
             theme,
+            false,
         );
     }
 
@@ -1270,5 +1433,242 @@ mod tests {
             .filter_map(|c| grid.get(c, 1).map(|x| x.grapheme.clone()))
             .collect();
         assert!(row1.contains("hello.rs"), "got {row1:?}");
+    }
+
+    #[test]
+    fn center_on_puts_cursor_line_mid_viewport() {
+        let mut vp = plain_vp();
+        // 40 lines tall, cursor deep in the file: center → offset = line - height/2.
+        vp.center_on(100, 40);
+        assert_eq!(vp.offset_line, 80);
+    }
+
+    #[test]
+    fn center_on_clamps_near_document_start() {
+        let mut vp = plain_vp();
+        // Cursor near the top: centering must not underflow past line 0.
+        vp.center_on(3, 40);
+        assert_eq!(vp.offset_line, 0);
+    }
+
+    // ── Soft wrap ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn row_layout_without_wrap_matches_old_1to1_mapping() {
+        let doc = doc_with("one\ntwo\nthree\n");
+        let vp = plain_vp();
+        let rows = build_row_layout(&doc, &vp, 3, 80, false);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            RowSlice {
+                doc_line: 0,
+                seg_start: 0,
+                seg_len: 3,
+                continuation: false
+            }
+        );
+        assert_eq!(
+            rows[1],
+            RowSlice {
+                doc_line: 1,
+                seg_start: 0,
+                seg_len: 3,
+                continuation: false
+            }
+        );
+        assert_eq!(
+            rows[2],
+            RowSlice {
+                doc_line: 2,
+                seg_start: 0,
+                seg_len: 5,
+                continuation: false
+            }
+        );
+    }
+
+    #[test]
+    fn row_layout_stops_at_end_of_document() {
+        // No trailing newline, so this is exactly 2 lines (a trailing "\n" would
+        // add a real (empty) 3rd line, per how ropey/the renderer already count
+        // lines — not this function's concern).
+        let doc = doc_with("one\ntwo");
+        let vp = plain_vp();
+        let rows = build_row_layout(&doc, &vp, 10, 80, false);
+        assert_eq!(rows.len(), 2); // fewer than height; caller draws `~` for the rest
+    }
+
+    #[test]
+    fn wrap_line_segments_splits_long_line_by_width() {
+        let doc = doc_with("abcdefghij\n");
+        let segs = wrap_line_segments(&doc, 0, 4);
+        assert_eq!(segs, vec![(0, 4), (4, 4), (8, 2)]);
+    }
+
+    #[test]
+    fn wrap_line_segments_short_line_is_one_segment() {
+        let doc = doc_with("abc\n");
+        let segs = wrap_line_segments(&doc, 0, 80);
+        assert_eq!(segs, vec![(0, 3)]);
+    }
+
+    #[test]
+    fn wrap_line_segments_respects_wide_char_display_width() {
+        // "가" is 2 cells wide; a width-4 budget fits exactly 2 of them.
+        let doc = doc_with("가나다\n");
+        let segs = wrap_line_segments(&doc, 0, 4);
+        assert_eq!(segs, vec![(0, 2), (2, 1)]);
+    }
+
+    #[test]
+    fn wrap_line_segments_empty_line() {
+        let doc = doc_with("\nx\n");
+        let segs = wrap_line_segments(&doc, 0, 10);
+        assert_eq!(segs, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn row_layout_with_wrap_expands_long_line_into_continuation_rows() {
+        // No trailing newline after "short", so the doc has exactly 2 lines.
+        let doc = doc_with("abcdefghij\nshort");
+        let vp = plain_vp();
+        let rows = build_row_layout(&doc, &vp, 5, 6, true);
+        // Line 0 (10 chars) wraps into 2 rows at width 6 (6+4); line 1 ("short",
+        // 5 chars) fits in one row. Only 3 rows produced — the doc ends there.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            RowSlice {
+                doc_line: 0,
+                seg_start: 0,
+                seg_len: 6,
+                continuation: false
+            }
+        );
+        assert_eq!(
+            rows[1],
+            RowSlice {
+                doc_line: 0,
+                seg_start: 6,
+                seg_len: 4,
+                continuation: true
+            }
+        );
+        assert_eq!(
+            rows[2],
+            RowSlice {
+                doc_line: 1,
+                seg_start: 0,
+                seg_len: 5,
+                continuation: false
+            }
+        );
+    }
+
+    #[test]
+    fn row_layout_with_wrap_truncates_at_viewport_height() {
+        let doc = doc_with("abcdefghij\n");
+        let vp = plain_vp();
+        // Only 2 rows of screen space: the 3rd wrapped segment doesn't fit.
+        let rows = build_row_layout(&doc, &vp, 2, 4, true);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1].continuation);
+    }
+
+    #[test]
+    fn locate_in_layout_start_of_wrapped_line() {
+        let doc = doc_with("abcdefghij\n");
+        let rows = build_row_layout(&doc, &plain_vp(), 3, 4, true);
+        assert_eq!(locate_in_layout(&rows, &doc, 0), Some((0, 0)));
+        assert_eq!(locate_in_layout(&rows, &doc, 3), Some((0, 3)));
+    }
+
+    #[test]
+    fn locate_in_layout_wrap_boundary_belongs_to_next_row() {
+        // char 4 is the boundary between segment 0 ([0,4)) and segment 1 ([4,8)).
+        // It's not the end of the line, so it must resolve to the *next* row.
+        let doc = doc_with("abcdefghij\n");
+        let rows = build_row_layout(&doc, &plain_vp(), 3, 4, true);
+        assert_eq!(locate_in_layout(&rows, &doc, 4), Some((1, 0)));
+    }
+
+    #[test]
+    fn locate_in_layout_end_of_line_is_inclusive_on_last_segment() {
+        // char 10 (== line_len) is the "cursor after last char" position — it must
+        // stay on the *last* segment (row 2), matching unwrapped EOL behavior.
+        let doc = doc_with("abcdefghij\n");
+        let rows = build_row_layout(&doc, &plain_vp(), 3, 4, true);
+        assert_eq!(locate_in_layout(&rows, &doc, 10), Some((2, 2)));
+    }
+
+    #[test]
+    fn locate_in_layout_second_line_after_wrapped_first() {
+        let doc = doc_with("abcdefghij\nz\n");
+        let rows = build_row_layout(&doc, &plain_vp(), 4, 4, true);
+        // "z" is the first char of doc_line 1, which starts at row 3.
+        assert_eq!(locate_in_layout(&rows, &doc, 11), Some((3, 0)));
+    }
+
+    #[test]
+    fn render_with_soft_wrap_forces_wrap_on_narrow_grid() {
+        let mut grid = Grid::new(4, 3);
+        let doc = doc_with("abcdefgh\n");
+        let sel = Selection::point(100);
+        let vp = plain_vp();
+        let theme = Theme::default_dark();
+        DocumentView::render_with_highlights(
+            &mut grid,
+            &doc,
+            &sel,
+            &vp,
+            ModeIndicator::Normal,
+            0,
+            3,
+            &[],
+            &[],
+            &theme,
+            true,
+        );
+        let row0: String = (0..4)
+            .filter_map(|c| grid.get(c, 0).map(|x| x.grapheme.clone()))
+            .collect();
+        let row1: String = (0..4)
+            .filter_map(|c| grid.get(c, 1).map(|x| x.grapheme.clone()))
+            .collect();
+        assert_eq!(row0, "abcd");
+        assert_eq!(row1, "efgh");
+    }
+
+    #[test]
+    fn render_without_soft_wrap_still_truncates_long_lines() {
+        // Regression: soft_wrap=false must behave exactly as before (truncate,
+        // not wrap) — the second row shows the *next document line*, not overflow.
+        let mut grid = Grid::new(4, 2);
+        let doc = doc_with("abcdefgh\nZZ\n");
+        let sel = Selection::point(100);
+        let vp = plain_vp();
+        let theme = Theme::default_dark();
+        DocumentView::render_with_highlights(
+            &mut grid,
+            &doc,
+            &sel,
+            &vp,
+            ModeIndicator::Normal,
+            0,
+            2,
+            &[],
+            &[],
+            &theme,
+            false,
+        );
+        let row0: String = (0..4)
+            .filter_map(|c| grid.get(c, 0).map(|x| x.grapheme.clone()))
+            .collect();
+        let row1: String = (0..4)
+            .filter_map(|c| grid.get(c, 1).map(|x| x.grapheme.clone()))
+            .collect();
+        assert_eq!(row0, "abcd"); // truncated, not wrapped
+        assert_eq!(row1.trim_end(), "ZZ");
     }
 }

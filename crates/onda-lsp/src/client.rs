@@ -17,7 +17,7 @@ use tokio::time::timeout;
 use tracing::{debug, info};
 
 use crate::transport::{IncomingMessage, Transport, TransportError};
-use crate::types::{LspDiagnostic, LspEvent};
+use crate::types::{LspCodeAction, LspDiagnostic, LspEvent, LspSymbol};
 
 pub type RequestId = u64;
 
@@ -389,6 +389,66 @@ impl LspClient {
         Ok(())
     }
 
+    /// Request document symbols. Result delivered via `LspEvent::SymbolResult`.
+    pub async fn document_symbol(&mut self, path: &Path, request_id: u64) -> Result<(), LspError> {
+        self.require_init()?;
+        let uri = path_to_uri(path);
+        let params = json!({ "textDocument": { "uri": uri } });
+        let rpc_id = {
+            let mut t = self.transport.lock().await;
+            t.send_request("textDocument/documentSymbol", params)
+                .await?
+        };
+        let tx = self.event_tx.clone();
+        let pending = self.pending.clone();
+        tokio::spawn(async move {
+            if let Ok(resp) = collect_response(pending, rpc_id, Duration::from_secs(5)).await {
+                let symbols = parse_document_symbols(&resp);
+                let _ = tx
+                    .send(LspEvent::SymbolResult {
+                        request_id,
+                        symbols,
+                    })
+                    .await;
+            }
+        });
+        Ok(())
+    }
+
+    /// Request code actions for `range`. Result delivered via `LspEvent::CodeActionResult`.
+    pub async fn code_action(
+        &mut self,
+        path: &Path,
+        range: Range,
+        request_id: u64,
+    ) -> Result<(), LspError> {
+        self.require_init()?;
+        let uri = path_to_uri(path);
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "range": range,
+            "context": { "diagnostics": [] }
+        });
+        let rpc_id = {
+            let mut t = self.transport.lock().await;
+            t.send_request("textDocument/codeAction", params).await?
+        };
+        let tx = self.event_tx.clone();
+        let pending = self.pending.clone();
+        tokio::spawn(async move {
+            if let Ok(resp) = collect_response(pending, rpc_id, Duration::from_secs(5)).await {
+                let actions = parse_code_actions(&resp);
+                let _ = tx
+                    .send(LspEvent::CodeActionResult {
+                        request_id,
+                        actions,
+                    })
+                    .await;
+            }
+        });
+        Ok(())
+    }
+
     /// Request document formatting. Result delivered via `LspEvent::FormattingResult`.
     pub async fn formatting(&mut self, path: &Path, request_id: u64) -> Result<(), LspError> {
         self.require_init()?;
@@ -595,6 +655,65 @@ fn parse_completion_items(v: &Value) -> Vec<lsp_types::CompletionItem> {
     serde_json::from_value::<Vec<lsp_types::CompletionItem>>(v.clone()).unwrap_or_default()
 }
 
+fn parse_document_symbols(v: &Value) -> Vec<LspSymbol> {
+    if v.is_null() {
+        return vec![];
+    }
+    let Ok(resp) = serde_json::from_value::<DocumentSymbolResponse>(v.clone()) else {
+        return vec![];
+    };
+    match resp {
+        DocumentSymbolResponse::Flat(infos) => infos
+            .into_iter()
+            .map(|s| LspSymbol {
+                name: s.name,
+                kind: s.kind,
+                range: s.location.range,
+            })
+            .collect(),
+        DocumentSymbolResponse::Nested(symbols) => {
+            let mut out = Vec::new();
+            flatten_document_symbols(&symbols, &mut out);
+            out
+        }
+    }
+}
+
+/// Depth-first flatten of hierarchical `DocumentSymbol`s (children inlined
+/// after their parent) into the picker-friendly `LspSymbol` list.
+fn flatten_document_symbols(symbols: &[DocumentSymbol], out: &mut Vec<LspSymbol>) {
+    for s in symbols {
+        out.push(LspSymbol {
+            name: s.name.clone(),
+            kind: s.kind,
+            range: s.selection_range,
+        });
+        if let Some(children) = &s.children {
+            flatten_document_symbols(children, out);
+        }
+    }
+}
+
+fn parse_code_actions(v: &Value) -> Vec<LspCodeAction> {
+    if v.is_null() {
+        return vec![];
+    }
+    let Ok(list) = serde_json::from_value::<Vec<CodeActionOrCommand>>(v.clone()) else {
+        return vec![];
+    };
+    list.into_iter()
+        .filter_map(|item| match item {
+            CodeActionOrCommand::CodeAction(a) => Some(LspCodeAction {
+                title: a.title,
+                edit: a.edit,
+            }),
+            // Command-only actions have no `edit` to apply — see LspCodeAction's
+            // doc comment (executeCommand support is a BACKLOG follow-up).
+            CodeActionOrCommand::Command(_) => None,
+        })
+        .collect()
+}
+
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
 fn path_to_uri(path: &Path) -> String {
@@ -658,6 +777,87 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod parser_tests {
+    use super::*;
+
+    fn range(sl: u32, sc: u32, el: u32, ec: u32) -> Value {
+        json!({
+            "start": { "line": sl, "character": sc },
+            "end": { "line": el, "character": ec }
+        })
+    }
+
+    #[test]
+    fn document_symbols_null_is_empty() {
+        assert!(parse_document_symbols(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn document_symbols_flat_response() {
+        let v = json!([
+            {
+                "name": "foo",
+                "kind": 12,
+                "location": { "uri": "file:///a.rs", "range": range(0, 0, 0, 3) }
+            }
+        ]);
+        let symbols = parse_document_symbols(&v);
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "foo");
+        assert_eq!(symbols[0].range.start.line, 0);
+    }
+
+    #[test]
+    fn document_symbols_nested_response_flattens_children() {
+        let v = json!([
+            {
+                "name": "Outer",
+                "kind": 5,
+                "range": range(0, 0, 10, 0),
+                "selectionRange": range(0, 6, 0, 11),
+                "children": [
+                    {
+                        "name": "inner_fn",
+                        "kind": 12,
+                        "range": range(1, 0, 2, 0),
+                        "selectionRange": range(1, 4, 1, 12)
+                    }
+                ]
+            }
+        ]);
+        let symbols = parse_document_symbols(&v);
+        assert_eq!(symbols.len(), 2, "parent + flattened child");
+        assert_eq!(symbols[0].name, "Outer");
+        assert_eq!(symbols[1].name, "inner_fn");
+        // Uses selection_range, not the enclosing range.
+        assert_eq!(symbols[1].range.start.character, 4);
+    }
+
+    #[test]
+    fn code_actions_null_is_empty() {
+        assert!(parse_code_actions(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn code_actions_keeps_edit_actions_drops_command_only() {
+        let v = json!([
+            {
+                "title": "Add missing import",
+                "edit": { "changes": {} }
+            },
+            {
+                "title": "Run a server command",
+                "command": "rust-analyzer.someCommand"
+            }
+        ]);
+        let actions = parse_code_actions(&v);
+        assert_eq!(actions.len(), 1, "command-only action must be filtered out");
+        assert_eq!(actions[0].title, "Add missing import");
+        assert!(actions[0].edit.is_some());
+    }
 }
 
 #[cfg(test)]

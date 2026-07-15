@@ -8,6 +8,35 @@ pub enum Operator {
     Delete,
     Change,
     Yank,
+    Indent,
+    Dedent,
+    Lowercase,
+    Uppercase,
+    ToggleCase,
+}
+
+/// How to remap a character's case (`gu`/`gU`/`g~`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseMode {
+    Lower,
+    Upper,
+    Toggle,
+}
+
+fn map_case(c: char, mode: CaseMode) -> String {
+    match mode {
+        CaseMode::Lower => c.to_lowercase().collect(),
+        CaseMode::Upper => c.to_uppercase().collect(),
+        CaseMode::Toggle => {
+            if c.is_uppercase() {
+                c.to_lowercase().collect()
+            } else if c.is_lowercase() {
+                c.to_uppercase().collect()
+            } else {
+                c.to_string()
+            }
+        }
+    }
 }
 
 /// Apply a delete operation to the selection in the document.
@@ -311,6 +340,216 @@ pub fn replace_char(doc: &Document, sel: &Selection, c: char) -> Transaction {
     Transaction::new(builder.build())
 }
 
+/// `~` — toggle the case of `count` characters starting at each cursor, clamped
+/// to the end of the line (vim's `~` does not cross lines).
+pub fn toggle_case_chars(doc: &Document, sel: &Selection, count: usize) -> Transaction {
+    let len = doc.len_chars();
+    let rope = doc.rope();
+    let mut builder = ChangeSetBuilder::new(len);
+    let mut pos = 0usize;
+    for range in sel.ranges() {
+        let start = range.head;
+        if start >= len || start < pos {
+            continue;
+        }
+        let line = doc.char_to_line(start);
+        let line_end = doc.line_to_char(line) + doc.line_len_no_eol(line);
+        let end = (start + count).min(line_end).min(len);
+        if end <= start {
+            continue;
+        }
+        let replacement: String = rope
+            .slice(start..end)
+            .chars()
+            .map(|c| map_case(c, CaseMode::Toggle))
+            .collect();
+        if start > pos {
+            builder = builder.retain(start - pos);
+        }
+        builder = builder.delete(end - start).insert(replacement);
+        pos = end;
+    }
+    if pos < len {
+        builder = builder.retain(len - pos);
+    }
+    Transaction::new(builder.build())
+}
+
+/// `gu{motion}`/`gU{motion}`/`g~{motion}` (+ `guu`/`gUU`/`g~~` linewise doubling)
+/// — remap the case of every character in the targeted range(s). `linewise`
+/// mirrors [`delete`]/[`delete_lines`]: charwise ranges are `[from, to]`
+/// inclusive; linewise expands to the full lines the ranges touch.
+pub fn change_case(doc: &Document, sel: &Selection, mode: CaseMode, linewise: bool) -> Transaction {
+    let len = doc.len_chars();
+    let rope = doc.rope();
+
+    let ranges: Vec<(usize, usize)> = if linewise {
+        let mut lines: Vec<usize> = Vec::new();
+        for range in sel.ranges() {
+            let start_line = doc.char_to_line(range.from());
+            let end_line = doc.char_to_line(range.to());
+            lines.extend(start_line..=end_line);
+        }
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+            .into_iter()
+            .map(|line| {
+                let from = doc.line_to_char(line);
+                let to = if line + 1 < rope.len_lines() {
+                    doc.line_to_char(line + 1)
+                } else {
+                    len
+                };
+                (from, to)
+            })
+            .collect()
+    } else {
+        sel.ranges()
+            .iter()
+            .map(|r| (r.from(), (r.to() + 1).min(len)))
+            .collect()
+    };
+
+    let mut builder = ChangeSetBuilder::new(len);
+    let mut pos = 0usize;
+    for (from, to) in ranges {
+        if from >= to || from < pos {
+            continue;
+        }
+        let replacement: String = rope
+            .slice(from..to)
+            .chars()
+            .map(|c| map_case(c, mode))
+            .collect();
+        if from > pos {
+            builder = builder.retain(from - pos);
+        }
+        builder = builder.delete(to - from).insert(replacement);
+        pos = to;
+    }
+    if pos < len {
+        builder = builder.retain(len - pos);
+    }
+    Transaction::new(builder.build())
+}
+
+/// `Ctrl-a`/`Ctrl-x` — adjust the nearest number on the cursor's line by `delta`
+/// (positive to increment, negative to decrement). vim's rule: use the digit run
+/// the cursor is inside, or the next digit run after the cursor on the same
+/// line; a `-` immediately before the digits is treated as its sign. Returns
+/// `(Transaction, new_cursor_head)` — the transaction is empty and the cursor
+/// `None` if the line has no number at-or-after the cursor.
+pub fn increment_number(
+    doc: &Document,
+    sel: &Selection,
+    delta: i64,
+) -> (Transaction, Option<usize>) {
+    let len = doc.len_chars();
+    let rope = doc.rope();
+    let pos = sel.primary().head;
+    if pos >= len {
+        return (Transaction::new(ChangeSet::new(len)), None);
+    }
+
+    let line = doc.char_to_line(pos);
+    let line_start = doc.line_to_char(line);
+    let line_end = line_start + doc.line_len_no_eol(line);
+    let line_chars: Vec<char> = rope.slice(line_start..line_end).chars().collect();
+    let cursor_col = pos - line_start;
+
+    let mut run: Option<(usize, usize)> = None;
+    let mut i = 0usize;
+    while i < line_chars.len() {
+        if line_chars[i].is_ascii_digit() {
+            let start = i;
+            while i < line_chars.len() && line_chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > cursor_col {
+                run = Some((start, i));
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    let Some((mut start, end)) = run else {
+        return (Transaction::new(ChangeSet::new(len)), None);
+    };
+    if start > 0 && line_chars[start - 1] == '-' {
+        start -= 1;
+    }
+    let digits: String = line_chars[start..end].iter().collect();
+    let Ok(value) = digits.parse::<i64>() else {
+        return (Transaction::new(ChangeSet::new(len)), None);
+    };
+    let new_str = value.saturating_add(delta).to_string();
+
+    let abs_from = line_start + start;
+    let abs_to = line_start + end;
+    let changes = ChangeSetBuilder::new(len)
+        .retain(abs_from)
+        .delete(abs_to - abs_from)
+        .insert(new_str.clone())
+        .retain(len - abs_to)
+        .build();
+    let new_head = abs_from + new_str.chars().count() - 1;
+    (Transaction::new(changes), Some(new_head))
+}
+
+/// Indent (`>>`/`>{motion}`) or dedent (`<<`/`<{motion}`) every line spanned by
+/// `sel` by one `unit` (a shiftwidth's worth of spaces, or a single tab char).
+/// Dedent removes up to `unit`'s char-width of leading whitespace, whatever is
+/// actually there (never more than the line has). Always linewise — vim forces
+/// `<`/`>` to operate on whole lines regardless of the motion's own type.
+pub fn indent_lines(doc: &Document, sel: &Selection, dedent: bool, unit: &str) -> Transaction {
+    let rope = doc.rope();
+    let len = doc.len_chars();
+    let unit_width = unit.chars().count();
+
+    let mut lines: Vec<usize> = Vec::new();
+    for range in sel.ranges() {
+        let start_line = doc.char_to_line(range.from());
+        let end_line = doc.char_to_line(range.to());
+        lines.extend(start_line..=end_line);
+    }
+    lines.sort_unstable();
+    lines.dedup();
+
+    let mut builder = ChangeSetBuilder::new(len);
+    let mut pos = 0usize;
+    for line in lines {
+        let line_start = doc.line_to_char(line);
+        if dedent {
+            let line_str = rope.line(line).to_string();
+            let remove = line_str
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .count()
+                .min(unit_width);
+            if remove == 0 {
+                continue;
+            }
+            if line_start > pos {
+                builder = builder.retain(line_start - pos);
+            }
+            builder = builder.delete(remove);
+            pos = line_start + remove;
+        } else {
+            if line_start > pos {
+                builder = builder.retain(line_start - pos);
+            }
+            builder = builder.insert(unit.to_string());
+            pos = line_start;
+        }
+    }
+    if pos < len {
+        builder = builder.retain(len - pos);
+    }
+    Transaction::new(builder.build())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +660,187 @@ mod tests {
         let (text, cur) = open("first\nsecond\n", 6, true); // start of "second"
         assert_eq!(text, "first\n\nsecond\n");
         assert_eq!(cur, 6);
+    }
+
+    #[test]
+    fn indent_single_line() {
+        let mut d = doc("foo\nbar\n");
+        let sel = Selection::point(0); // on "foo"
+        let tx = indent_lines(&d, &sel, false, "  ");
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "  foo\nbar\n");
+    }
+
+    #[test]
+    fn indent_multiple_lines_from_range_selection() {
+        let mut d = doc("foo\nbar\nbaz\n");
+        // range spans line 0 through line 1
+        let sel = Selection::new(vec![Range::new(0, 5)], 0);
+        let tx = indent_lines(&d, &sel, false, "  ");
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "  foo\n  bar\nbaz\n");
+    }
+
+    #[test]
+    fn dedent_removes_existing_whitespace() {
+        let mut d = doc("    foo\nbar\n");
+        let sel = Selection::point(0);
+        let tx = indent_lines(&d, &sel, true, "  "); // unit width 2
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "  foo\nbar\n");
+    }
+
+    #[test]
+    fn dedent_never_removes_more_than_present() {
+        let mut d = doc(" foo\n"); // only one leading space
+        let sel = Selection::point(0);
+        let tx = indent_lines(&d, &sel, true, "    "); // unit width 4
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "foo\n");
+    }
+
+    #[test]
+    fn dedent_noop_with_no_leading_whitespace() {
+        let mut d = doc("foo\n");
+        let sel = Selection::point(0);
+        let tx = indent_lines(&d, &sel, true, "  ");
+        assert!(tx.changes.is_empty());
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "foo\n");
+    }
+
+    #[test]
+    fn indent_tab_unit() {
+        let mut d = doc("foo\n");
+        let sel = Selection::point(0);
+        let tx = indent_lines(&d, &sel, false, "\t");
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "\tfoo\n");
+    }
+
+    #[test]
+    fn toggle_case_single_char() {
+        let mut d = doc("hello\n");
+        let sel = Selection::point(0);
+        let tx = toggle_case_chars(&d, &sel, 1);
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "Hello\n");
+    }
+
+    #[test]
+    fn toggle_case_count_clamped_to_line() {
+        let mut d = doc("ab\ncd\n");
+        let sel = Selection::point(0);
+        let tx = toggle_case_chars(&d, &sel, 10); // way past line end
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "AB\ncd\n"); // doesn't cross into next line
+    }
+
+    #[test]
+    fn toggle_case_non_alpha_unchanged() {
+        let mut d = doc("a1!\n");
+        let sel = Selection::point(0);
+        let tx = toggle_case_chars(&d, &sel, 3);
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "A1!\n");
+    }
+
+    #[test]
+    fn change_case_lowercase_charwise() {
+        let mut d = doc("FOO bar\n");
+        let sel = Selection::new(vec![Range::new(0, 2)], 0); // "FOO"
+        let tx = change_case(&d, &sel, CaseMode::Lower, false);
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "foo bar\n");
+    }
+
+    #[test]
+    fn change_case_uppercase_charwise() {
+        let mut d = doc("foo bar\n");
+        let sel = Selection::new(vec![Range::new(0, 2)], 0); // "foo"
+        let tx = change_case(&d, &sel, CaseMode::Upper, false);
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "FOO bar\n");
+    }
+
+    #[test]
+    fn change_case_toggle_charwise() {
+        let mut d = doc("Foo Bar\n");
+        let sel = Selection::new(vec![Range::new(0, 6)], 0); // whole line minus \n
+        let tx = change_case(&d, &sel, CaseMode::Toggle, false);
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "fOO bAR\n");
+    }
+
+    #[test]
+    fn increment_cursor_inside_number() {
+        let mut d = doc("val 41 end\n");
+        let sel = Selection::point(5); // '1' of 41
+        let (tx, head) = increment_number(&d, &sel, 1);
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "val 42 end\n");
+        assert_eq!(head, Some(5)); // last digit of "42"
+    }
+
+    #[test]
+    fn decrement_cursor_before_number() {
+        let mut d = doc("count=10\n");
+        let sel = Selection::point(0); // before the number
+        let (tx, head) = increment_number(&d, &sel, -1);
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "count=9\n");
+        assert_eq!(head, Some(6));
+    }
+
+    #[test]
+    fn increment_skips_past_number_before_cursor() {
+        // cursor is after the first number, so `Ctrl-a` targets the *next* one.
+        let mut d = doc("1 and 2\n");
+        let sel = Selection::point(2); // on "and"
+        let (tx, head) = increment_number(&d, &sel, 1);
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "1 and 3\n");
+        assert_eq!(head, Some(6));
+    }
+
+    #[test]
+    fn increment_negative_number_treats_sign() {
+        let mut d = doc("-5\n");
+        let sel = Selection::point(0);
+        let (tx, head) = increment_number(&d, &sel, 1);
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "-4\n");
+        assert_eq!(head, Some(1));
+    }
+
+    #[test]
+    fn increment_no_number_on_line_is_noop() {
+        let mut d = doc("no digits here\n");
+        let sel = Selection::point(0);
+        let (tx, head) = increment_number(&d, &sel, 1);
+        assert!(tx.changes.is_empty());
+        assert_eq!(head, None);
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "no digits here\n");
+    }
+
+    #[test]
+    fn increment_grows_digit_width() {
+        let mut d = doc("99\n");
+        let sel = Selection::point(0);
+        let (tx, head) = increment_number(&d, &sel, 1);
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "100\n");
+        assert_eq!(head, Some(2));
+    }
+
+    #[test]
+    fn change_case_linewise_doubling() {
+        let mut d = doc("Foo\nBar\nBaz\n");
+        // linewise range spanning lines 0-1 (mirrors how OperatorLine builds its range)
+        let sel = Selection::new(vec![Range::new(0, 4)], 0);
+        let tx = change_case(&d, &sel, CaseMode::Upper, true);
+        d.apply(&tx).unwrap();
+        assert_eq!(d.rope().to_string(), "FOO\nBAR\nBaz\n");
     }
 }

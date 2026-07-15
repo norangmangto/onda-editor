@@ -9,22 +9,41 @@ you fix one, remove it here and land a regression test.
 
 ## Open
 
-### 🟠 LSP is not wired into the editor binary
-`onda-lsp` (the crate) is complete and tested, but the `onda` binary never spawns a
-server: `App.lsp_manager` is always `None`, there is no `ensure_server`/`did_open`/
-`did_change` on file open/edit, and no interactive request dispatch (hover, definition,
-format, rename, code action, symbols). Diagnostics/format/rename handlers exist but are
-dormant because no events ever arrive. This blocks the full W36 LSP UX.
-- **Done so far (W36):** a tested, UTF-16-aware edit applier (`lsp_edit`) and wiring so
-  `FormattingResult`/`RenameResult` actually apply edits *when* events flow.
-- **Needed:** spawn `LspManager` in `run_editor`; on file open call
-  `ensure_server` + `did_open`; on edit `did_change` (debounced, with versions); a
-  sync→async request-dispatch + `request_id` correlation; bind hover/definition/
-  references/format/rename/code-action/document-symbol to keys/commands; then build the
-  remaining W36 UX (code-actions menu, document-symbol picker, signature help,
-  rename preview, breadcrumb). Needs a live server (rust-analyzer) to validate, so it
-  won't be E2E-tested in CI.
-- **Where:** `crates/onda/src/main.rs` (LSP lifecycle + dispatch).
+### 🟡 LSP: full-document `didChange` sync only (no incremental)
+`LspClient::did_change` sends the whole buffer text on every debounced flush, not an
+LSP-incremental range edit. DESIGN.md's "디바운스된 증분 didChange" calls for incremental
+sync; onda has the debounce (250ms quiet-period, `App::maybe_flush_lsp_change`) but not
+the incremental part — that needs `ChangeSet` → LSP-range translation. Fine for typical
+file sizes; would matter for very large open buffers with a slow server round-trip.
+- **Where:** `crates/onda-lsp/src/client.rs` `did_change`; `crates/onda/src/main.rs`
+  `send_lsp_did_change`.
+
+### 🟡 LSP: command-only code actions are dropped
+`CodeActionOrCommand::Command` variants (a server-side command with no `edit`) are
+filtered out of the `<space>ca` picker — only edit-based actions apply. Executing
+arbitrary `workspace/executeCommand` requests is unimplemented.
+- **Where:** `crates/onda-lsp/src/client.rs` `parse_code_actions`.
+
+### ⚪ LSP: server list is hardcoded (rust-analyzer + gopls only)
+`LspManager::new` hardcodes its two configs; there's no `languages.toml`-driven,
+per-language server command/args/root-marker config (PHASE7_PLAN.md T41.1/T42.2 already
+plans this — basedpyright/ruff, typescript-language-server, clangd, taplo, etc.).
+- **Where:** `crates/onda-lsp/src/manager.rs`.
+
+### ⚪ LSP: signature help, rename preview, and breadcrumb are unimplemented
+Explicitly called out as "remaining W36 UX" beyond the base wiring; hover/definition/
+references/rename/format/document-symbol/code-action are all wired (W36 core), but
+these three UI affordances aren't started.
+
+### ⚪ Soft wrap: character-boundary only, and some overlays aren't wrap-aware
+`:set wrap` wraps at the display-width boundary, not word boundaries (no greedy
+word-wrap). Plugin decorations (highlights/signs/virtual text) and debugger gutter
+markers still assume the unwrapped 1:1 doc-line-to-screen-row mapping — they'll
+misplace on a wrapped line. The core text/diagnostics/cursor path is wrap-aware
+(`onda_render::{build_row_layout, locate_in_layout}`); these overlays are not yet.
+- **Where:** `crates/onda/src/main.rs` (`draw_plugin_highlights`/`draw_plugin_signs`/
+  `draw_plugin_virt_text` and `draw_dap_markers`, all keyed off
+  `viewport.offset_line + row` directly).
 
 ### ⚪ `onda-contrast` theme is not in the Phase 5 plan
 `runtime/themes/onda-contrast.toml` ships, but `PHASE5_PLAN.md` lists only
@@ -56,3 +75,13 @@ Vim's visual dot has its own "same-size" semantics; revisit if needed.
 - 🟠 `x`/`dd` ignored count; `dw`/`db` over-deleted; visual-line delete charwise —
   fixed.
 - 🟠 `<Enter>`/`o` insert-mode cursor off-by-one — fixed.
+- 🟠 `<space>f` (file picker) and any multi-key sequence ending in `f`/`t`/`r`/`q`/
+  `@`/`"`/`m`/`` ` ``/`'` was unreachable — the single-char pending-key check
+  (f/t/F/T-find, r-replace, q-macro, etc.) ran unconditionally on every keystroke,
+  hijacking the 2nd+ key of an in-progress trie sequence before the trie ever saw it
+  — fixed (guarded on `pending_keys.is_empty()`; also unblocked the new `gr` binding).
+- 🟠 LSP not wired into the editor binary — fixed: `LspManager` spawns at startup
+  (bridged to `BgMessage::Lsp`), every buffer-open path calls `ensure_server`+
+  `did_open`, edits flow through a debounced `did_change`, and
+  hover/definition/references/rename/format/document-symbol/code-action are bound to
+  keys and commands.
