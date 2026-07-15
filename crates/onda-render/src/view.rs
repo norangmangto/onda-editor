@@ -284,6 +284,7 @@ impl DocumentView {
     /// `highlights` are pre-resolved styled char spans (sorted, non-overlapping);
     /// `search_matches` is a slice of char-index ranges shown reversed.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn render_with_highlights(
         grid: &mut Grid,
         doc: &Document,
@@ -292,13 +293,18 @@ impl DocumentView {
         mode: ModeIndicator,
         row_offset: u16,
         height: u16,
+        col_offset: u16,
+        area_width: u16,
         highlights: &[HlSpan],
         search_matches: &[onda_core::Range],
         theme: &Theme,
         soft_wrap: bool,
     ) {
-        let text_col_start = viewport.line_nr_width;
-        let text_width = grid.width().saturating_sub(text_col_start) as usize;
+        // Horizontal window bounds: the editor owns [col_offset, col_end) so it never
+        // paints over left chrome (sidebar) or a neighbouring vertical split.
+        let col_end = col_offset.saturating_add(area_width).min(grid.width());
+        let text_col_start = col_offset + viewport.line_nr_width;
+        let text_width = area_width.saturating_sub(viewport.line_nr_width) as usize;
         let mut hl = HlCursor::new(highlights);
         let rows = build_row_layout(doc, viewport, height, text_width, soft_wrap);
 
@@ -306,18 +312,30 @@ impl DocumentView {
             let abs_row = row_offset + screen_row;
             let Some(row) = rows.get(screen_row as usize) else {
                 grid.set(
-                    0,
+                    col_offset,
                     abs_row,
                     Cell::new("~", Style::default().fg(Color::DarkGray)),
                 );
-                grid.fill_rect(1, abs_row, grid.width() - 1, 1, Style::RESET);
+                grid.fill_rect(
+                    col_offset + 1,
+                    abs_row,
+                    col_end.saturating_sub(col_offset + 1),
+                    1,
+                    Style::RESET,
+                );
                 continue;
             };
             let doc_line = row.doc_line;
 
             if viewport.line_nr_width > 0 {
                 if row.continuation {
-                    grid.fill_rect(0, abs_row, viewport.line_nr_width, 1, theme.line_nr());
+                    grid.fill_rect(
+                        col_offset,
+                        abs_row,
+                        viewport.line_nr_width,
+                        1,
+                        theme.line_nr(),
+                    );
                 } else {
                     let is_cursor_line = sel
                         .ranges()
@@ -333,7 +351,7 @@ impl DocumentView {
                         doc_line + 1,
                         width = (viewport.line_nr_width as usize).saturating_sub(1)
                     );
-                    grid.write_str(0, abs_row, &nr_str, nr_style);
+                    grid.write_str(col_offset, abs_row, &nr_str, nr_style);
                 }
             }
 
@@ -361,7 +379,7 @@ impl DocumentView {
             let mut col = text_col_start;
 
             for (i, ch) in line_str.chars().enumerate() {
-                if col >= grid.width() {
+                if col >= col_end {
                     break;
                 }
                 let char_idx = row_char_start + i;
@@ -395,14 +413,14 @@ impl DocumentView {
                 );
                 // Mark a wide char's trailing column so a later narrow overwrite
                 // redraws it instead of leaving a ghosted right half.
-                if w == 2 && col + 1 < grid.width() {
+                if w == 2 && col + 1 < col_end {
                     grid.set(col + 1, abs_row, Cell::wide_continuation(style));
                 }
                 col += w;
             }
 
-            if col < grid.width() {
-                grid.fill_rect(col, abs_row, grid.width() - col, 1, Style::RESET);
+            if col < col_end {
+                grid.fill_rect(col, abs_row, col_end - col, 1, Style::RESET);
             }
         }
     }
@@ -519,6 +537,8 @@ impl DocumentView {
         mode: ModeIndicator,
         row_offset: u16,
         height: u16,
+        col_offset: u16,
+        area_width: u16,
         highlights: &[HlSpan],
         search_matches: &[onda_core::Range],
         diagnostics: &[DiagnosticSpan],
@@ -534,6 +554,8 @@ impl DocumentView {
             mode,
             row_offset,
             height,
+            col_offset,
+            area_width,
             highlights,
             search_matches,
             theme,
@@ -542,8 +564,9 @@ impl DocumentView {
 
         // Overlay diagnostic underlines — reuse the identical (deterministic)
         // row layout so a wrapped line's underline lands on the right sub-row.
-        let text_col_start = viewport.line_nr_width;
-        let text_width = grid.width().saturating_sub(text_col_start) as usize;
+        let col_end = col_offset.saturating_add(area_width).min(grid.width());
+        let text_col_start = col_offset + viewport.line_nr_width;
+        let text_width = area_width.saturating_sub(viewport.line_nr_width) as usize;
         let rows = build_row_layout(doc, viewport, height, text_width, soft_wrap);
         for screen_row in 0..height {
             let abs_row = row_offset + screen_row;
@@ -577,7 +600,7 @@ impl DocumentView {
                         1 => theme.gutter_warning(),
                         _ => theme.diag_info(),
                     };
-                    grid.write_str(0, abs_row, sign, gutter_style);
+                    grid.write_str(col_offset, abs_row, sign, gutter_style);
                 }
                 // Underline the span columns within this segment.
                 let col_from = span.from.max(seg_start) - seg_start;
@@ -592,7 +615,7 @@ impl DocumentView {
                 };
                 for col_idx in visible_from..visible_to {
                     let screen_col = text_col_start + col_idx as u16;
-                    if screen_col >= grid.width() {
+                    if screen_col >= col_end {
                         break;
                     }
                     if let Some(cell) = grid.get_mut(screen_col, abs_row) {
@@ -1292,6 +1315,7 @@ mod tests {
             end: 2,
             style: kw,
         }];
+        let gw = grid.width();
         DocumentView::render_with_highlights(
             &mut grid,
             &doc,
@@ -1300,6 +1324,8 @@ mod tests {
             ModeIndicator::Normal,
             0,
             4,
+            0,
+            gw,
             &spans,
             &[],
             &theme,
@@ -1321,6 +1347,7 @@ mod tests {
 
     fn render(grid: &mut Grid, doc: &Document, sel: &Selection, theme: &Theme) {
         let h = grid.height();
+        let w = grid.width();
         DocumentView::render_with_highlights(
             grid,
             doc,
@@ -1329,6 +1356,8 @@ mod tests {
             ModeIndicator::Normal,
             0,
             h,
+            0,
+            w,
             &[],
             &[],
             theme,
@@ -1617,6 +1646,7 @@ mod tests {
         let sel = Selection::point(100);
         let vp = plain_vp();
         let theme = Theme::default_dark();
+        let gw = grid.width();
         DocumentView::render_with_highlights(
             &mut grid,
             &doc,
@@ -1625,6 +1655,8 @@ mod tests {
             ModeIndicator::Normal,
             0,
             3,
+            0,
+            gw,
             &[],
             &[],
             &theme,
@@ -1649,6 +1681,7 @@ mod tests {
         let sel = Selection::point(100);
         let vp = plain_vp();
         let theme = Theme::default_dark();
+        let gw = grid.width();
         DocumentView::render_with_highlights(
             &mut grid,
             &doc,
@@ -1657,6 +1690,8 @@ mod tests {
             ModeIndicator::Normal,
             0,
             2,
+            0,
+            gw,
             &[],
             &[],
             &theme,

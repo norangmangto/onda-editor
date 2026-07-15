@@ -3305,6 +3305,8 @@ impl<B: Backend> App<B> {
                         mode_ind,
                         rect.y,
                         rect.height,
+                        rect.x,
+                        rect.width,
                         hl_spans,
                         matches,
                         theme,
@@ -3319,6 +3321,8 @@ impl<B: Backend> App<B> {
                         mode_ind,
                         rect.y,
                         rect.height,
+                        rect.x,
+                        rect.width,
                         hl_spans,
                         matches,
                         diag_spans,
@@ -7951,6 +7955,46 @@ mod insert_newline_tests {
 
     fn body(app: &App<NullBackend>) -> String {
         app.doc().rope().to_string()
+    }
+
+    /// Regression: when the sidebar is open, the editor must render *inside* its
+    /// window rect (offset right by the chrome width) rather than painting over the
+    /// sidebar from column 0. Before the `col_offset` fix, `render_with_highlights`
+    /// ignored `rect.x` and overwrote the whole left strip.
+    #[test]
+    fn sidebar_is_not_overwritten_by_editor() {
+        let mut app = app_with("hello\nworld\n");
+        app.handle_key(Key::char(' ')).unwrap();
+        app.handle_key(Key::char('e')).unwrap(); // open + focus sidebar
+        assert!(app.sidebar_open);
+        let chrome_w = app.left_chrome_width();
+        assert!(chrome_w > 0);
+        app.render_frame().unwrap();
+
+        let grid = app.compositor.buf.current();
+        let row = |r: u16, from: u16, to: u16| -> String {
+            (from..to)
+                .filter_map(|c| grid.get(c, r).map(|x| x.grapheme.clone()))
+                .collect()
+        };
+
+        // Activity bar label 'E' (Explorer) sits at the top-left.
+        assert_eq!(grid.get(0, 0).unwrap().grapheme, "E");
+        // The sidebar header renders in the left chrome strip.
+        assert!(
+            row(0, 0, chrome_w).contains("EXPLORER"),
+            "sidebar header missing from left chrome"
+        );
+        // The editor's content must NOT bleed into the sidebar strip…
+        assert!(
+            !row(0, 0, chrome_w).contains("hello"),
+            "editor text overwrote the sidebar"
+        );
+        // …it renders to the right of the chrome instead (line number + text).
+        assert!(
+            row(0, chrome_w, chrome_w + 12).contains("hello"),
+            "editor content should start after the chrome width"
+        );
     }
 
     /// Regression: <Enter> in insert mode must land the cursor at the *start* of the
